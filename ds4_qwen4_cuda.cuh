@@ -1526,22 +1526,50 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
     x[i] = t;
 }
 
+template<unsigned TYPE>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
-                        const char *wi, unsigned type, unsigned E, unsigned hc,
+                        const char *wi, unsigned E, unsigned hc,
                         unsigned ni, float eps) {
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
     __shared__ float red[32];
+    const unsigned nt = blockDim.x;
+    /* Load a batch of elements before accumulating them, in the original
+     * order and with the same fused multiply-adds as hc_norm_prefill: one
+     * outstanding load per iteration left this kernel waiting on L2. */
     float ss = 0;
-    for (unsigned i = tid; i < E; i += blockDim.x) ss += R[base + i] * R[base + i];
+    for (unsigned i0 = tid; i0 < E; i0 += 8 * nt) {
+        float r[8];
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) r[k] = i0 + k * nt < E ? R[base + i0 + k * nt] : 0;
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(r[k], r[k], ss);
+    }
     const float inv = rsqrtf(block_sum(ss, red) / E + eps);
     float acc[4] = {};
     const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per);
-    for (unsigned i = chunk * per + tid; i < end; i += blockDim.x) {
-        const float v = R[base + i] * inv * gamma[stream * E + i];
-        xn[base + i] = v;
-        for (unsigned j = 0; j < ni; j++) acc[j] += scalar(wi, j * dim + stream * E + i, type) * v;
+    for (unsigned i0 = chunk * per + tid; i0 < end; i0 += 4 * nt) {
+        float r[4], g[4], w[4][4];
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i < end) {
+                r[k] = R[base + i];
+                g[k] = gamma[stream * E + i];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
+            }
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i >= end) break;
+            const float v = r[k] * inv * g[k];
+            xn[base + i] = v;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni) acc[j] = __fmaf_rn(w[k][j], v, acc[j]);
+        }
     }
     for (unsigned j = 0; j < ni; j++) {
         const float v = block_sum(acc[j], red);
@@ -1907,8 +1935,12 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
 #undef QWEN_HC_NORM
         return launched();
     }
-    hc_norm<<<dim3(hc * 8, T), 128, 0, cuda_decode_stream()>>>((float *)xn->ptr,
-        ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
+#define QWEN_HC_NORM(TYPE) hc_norm<TYPE><<<dim3(hc * 8, T), 128, 0, cuda_decode_stream()>>>((float *)xn->ptr, \
+        ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps)
+    if (type == 0) { QWEN_HC_NORM(0); }
+    else if (type == 1) { QWEN_HC_NORM(1); }
+    else { QWEN_HC_NORM(8); }
+#undef QWEN_HC_NORM
     return launched();
 }
 
