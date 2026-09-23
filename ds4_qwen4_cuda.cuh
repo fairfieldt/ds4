@@ -558,7 +558,6 @@ __global__ void router(int *selected, float *weights, const float *logits,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
     const unsigned t = blockIdx.x, tid = threadIdx.x;
     __shared__ float p[512], maxima[256], red[32];
-    __shared__ unsigned ids[256];
     float mx = -FLT_MAX;
     for (unsigned e = tid; e < NE; e += 256) mx = fmaxf(mx, logits[(uint64_t)t * NE + e]);
     maxima[tid] = mx;
@@ -579,31 +578,35 @@ __global__ void router(int *selected, float *weights, const float *logits,
         if (!tid) shared_gate[t] = v;
     }
     __syncthreads();
-    for (unsigned s = 0; s < NS; s++) {
-        float best = -1;
-        unsigned id = UINT_MAX;
-        for (unsigned e = tid; e < NE; e += 256) if (p[e] > best) { best = p[e]; id = e; }
-        maxima[tid] = best; ids[tid] = id;
-        __syncthreads();
-        for (unsigned stride = 128; stride; stride /= 2) {
-            if (tid < stride && (maxima[tid + stride] > maxima[tid] ||
-                (maxima[tid + stride] == maxima[tid] && ids[tid + stride] < ids[tid]))) {
-                maxima[tid] = maxima[tid + stride]; ids[tid] = ids[tid + stride];
+    /* Top-NS by repeated argmax (ties to the lower expert id), done by one
+     * warp from registers: NE <= 512 gives 16 candidates per lane, and each
+     * pick costs one shuffle reduction instead of a block reduction. */
+    if (tid < 32) {
+        float v[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) v[j] = tid + 32 * j < NE ? p[tid + 32 * j] : -1;
+        for (unsigned s = 0; s < NS; s++) {
+            float best = -1;
+            unsigned id = UINT_MAX;
+            #pragma unroll
+            for (unsigned j = 0; j < 16; j++) if (v[j] > best) { best = v[j]; id = tid + 32 * j; }
+            for (unsigned off = 16; off; off /= 2) {
+                const float ob = __shfl_xor_sync(0xffffffff, best, off);
+                const unsigned oi = __shfl_xor_sync(0xffffffff, id, off);
+                if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
             }
-            __syncthreads();
-        }
-        if (!tid) {
             /* Non-finite router logits leave no candidate; keep the expert
-             * index in range rather than writing past p[] and the tables. */
-            unsigned sel = ids[0];
-            float w = maxima[0];
-            if (sel >= NE) { sel = s; w = 0; }
-            selected[(uint64_t)t * NS + s] = sel;
-            weights[(uint64_t)t * NS + s] = w;
-            p[sel] = -1;
+             * index in range rather than handing UINT_MAX to the tables. */
+            if (id >= NE) { id = s; best = 0; }
+            #pragma unroll
+            for (unsigned j = 0; j < 16; j++) if (tid + 32 * j == id) v[j] = -1;
+            if (!tid) {
+                selected[(uint64_t)t * NS + s] = id;
+                weights[(uint64_t)t * NS + s] = best;
+            }
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (tid < NS) {
         float denom = 0;
         for (unsigned s = 0; s < NS; s++) denom += weights[(uint64_t)t * NS + s];
