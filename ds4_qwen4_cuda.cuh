@@ -183,16 +183,38 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
     float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
     for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
-    for (unsigned j = split * per; j < min(n, (split + 1) * per); j++) {
-        const unsigned p = sparse ? (unsigned)sel[(uint64_t)t * stride + j] : j;
-        if (p > pos0 + t) continue;
-        float score = 0;
-        for (unsigned i = 0; i < D / 32; i++) score += qv[i] * __half2float(kc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
-        score = sum(score);
-        const float nm = fmaxf(m, score), correction = expf(m - nm), w = expf(score - nm);
-        denom = denom * correction + w;
-        for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * __half2float(vc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
-        m = nm;
+    /* Fetch K and V a few keys ahead. The keys are consumed in the same
+     * order with the same arithmetic, so the result is unchanged, but the
+     * loads of the next keys overlap the softmax update of this one. */
+    enum { AHEAD = 4 };
+    const unsigned j1 = min(n, (split + 1) * per);
+    for (unsigned jb = split * per; jb < j1; jb += AHEAD) {
+        unsigned pos[AHEAD];
+        __half kr[AHEAD][D / 32], vr[AHEAD][D / 32];
+        #pragma unroll
+        for (unsigned u = 0; u < AHEAD; u++) {
+            pos[u] = jb + u < j1 ? (sparse ? (unsigned)sel[(uint64_t)t * stride + jb + u] : jb + u) : UINT_MAX;
+            if (pos[u] <= pos0 + t) {
+                #pragma unroll
+                for (unsigned i = 0; i < D / 32; i++) {
+                    kr[u][i] = kc[((uint64_t)pos[u] * Hkv + kh) * D + lane + 32 * i];
+                    vr[u][i] = vc[((uint64_t)pos[u] * Hkv + kh) * D + lane + 32 * i];
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned u = 0; u < AHEAD; u++) {
+            if (pos[u] > pos0 + t) continue;
+            float score = 0;
+            #pragma unroll
+            for (unsigned i = 0; i < D / 32; i++) score += qv[i] * __half2float(kr[u][i]);
+            score = sum(score);
+            const float nm = fmaxf(m, score), correction = expf(m - nm), w = expf(score - nm);
+            denom = denom * correction + w;
+            #pragma unroll
+            for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * __half2float(vr[u][i]);
+            m = nm;
+        }
     }
     if (splits == 1) {
         for (unsigned i = 0; i < D / 32; i++) {
