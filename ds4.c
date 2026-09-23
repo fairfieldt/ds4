@@ -58138,6 +58138,20 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     return true;
 }
 
+/* Ask the kernel to start reading a row before it is needed.  Each row sits
+ * in a random 4K page, so queueing a batch first lets the disk serve them in
+ * parallel; a cached row costs one cheap syscall. */
+static void qwen4_ngram_prefetch(const ds4_model *m, uint32_t row) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(__APPLE__)
+    const uint64_t bytes = (uint64_t)m->ngram_tensor->dim[0] * 2u;
+    (void)posix_fadvise(m->ngram_fd, (off_t)(m->ngram_tensor->abs_offset + (uint64_t)row * bytes),
+                        (off_t)bytes, POSIX_FADV_WILLNEED);
+#else
+    (void)m;
+    (void)row;
+#endif
+}
+
 typedef struct { uint32_t row, output; } qwen4_ngram_request;
 typedef struct {
     const ds4_model *model;
@@ -58156,6 +58170,10 @@ static void qwen4_ngram_part(void *context, size_t part) {
     qwen4_ngram_batch *b = context;
     const size_t begin = b->count * part / b->readers, end = b->count * (part+1) / b->readers;
     const size_t width = b->model->ngram_tensor->dim[0];
+    for (size_t i = begin; i < end; i++) {
+        if (i == begin || b->request[i].row != b->request[i-1].row)
+            qwen4_ngram_prefetch(b->model, b->request[i].row);
+    }
     float *previous = NULL;
     for (size_t i = begin; i < end; i++) {
         float *dst = b->out + b->request[i].output * width;
@@ -58197,6 +58215,10 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
     if (count < 2) return count == 0 || qwen4_ngram_row(m, rows[0], out);
 #else
     if (count < 256) {
+        /* Decode reads 16 rows: queue them all so a cold token waits for
+         * about one disk read, not sixteen in a row. */
+        if (count > 1)
+            for (size_t i = 0; i < count; i++) qwen4_ngram_prefetch(m, rows[i]);
         for (size_t i = 0; i < count; i++)
             if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_tensor->dim[0])) return false;
         return true;
