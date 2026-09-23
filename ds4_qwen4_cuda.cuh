@@ -613,7 +613,10 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
 }
 
-template<unsigned TYPE, bool DOWN>
+/* SH is the shared expert's type when known at compile time, or SH_ANY. */
+enum : unsigned { SH_ANY = 255 };
+
+template<unsigned TYPE, bool DOWN, unsigned SH>
 __global__ void moe_mv(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned shared_type, unsigned NE, unsigned NS, unsigned K, unsigned M,
@@ -632,7 +635,16 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     const uint64_t pair = (uint64_t)t * stride + slot;
     const float *xt = x + (DOWN ? pair : t) * K;
     float a = 0, b = 0;
-    if (shared) {
+    if (shared && SH != SH_ANY) {
+        /* Same element order as the generic loop; the known type lets the
+         * loads of several iterations be in flight together. */
+        #pragma unroll 8
+        for (unsigned i = threadIdx.x & 31; i < K; i += 32) {
+            a += value<SH>(sh0 + row * srb, i) * xt[i];
+            if (!DOWN) b += value<SH>(sh1 + row * srb, i) * xt[i];
+        }
+        a = sum(a); b = sum(b);
+    } else if (shared) {
         for (unsigned i = threadIdx.x & 31; i < K; i += 32) {
             a += scalar(sh0 + row * srb, i, shared_type) * xt[i];
             if (!DOWN) b += scalar(sh1 + row * srb, i, shared_type) * xt[i];
@@ -643,6 +655,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         if (e >= 0 && (unsigned)e < NE) {
             const uint64_t off = ((uint64_t)e * M + row) * rb;
             if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
+                #pragma unroll 4
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);
                     const float4 av = value4<TYPE>(w0+off,i,grid_table,sign_table);
@@ -667,15 +680,18 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
+#define QWEN_MOE_SH(TYPE, SH) \
+    if (down) moe_mv<TYPE, true, SH><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
+    else moe_mv<TYPE, false, SH><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb)
 #define QWEN_MOE(TYPE) case TYPE: \
-    if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
-    else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); break
+    if (st == 8) { QWEN_MOE_SH(TYPE, 8); } else { QWEN_MOE_SH(TYPE, SH_ANY); } break
     switch (type) {
     QWEN_MOE(0); QWEN_MOE(1); QWEN_MOE(2); QWEN_MOE(8); QWEN_MOE(10);
     QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(30); QWEN_MOE(39);
     default: return 0;
     }
 #undef QWEN_MOE
+#undef QWEN_MOE_SH
     return launched();
 }
 
@@ -1096,11 +1112,13 @@ __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n
         const uint64_t *grid, const uint8_t *signs) {
     float acc = 0;
     if (TYPE == 1 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
+        #pragma unroll 4
         for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
             const float4 w = value4<TYPE>(row,i,grid,signs), v = *(const float4 *)(x+i);
             acc += w.x*v.x; acc += w.y*v.y; acc += w.z*v.z; acc += w.w*v.w;
         }
     } else {
+        #pragma unroll 8
         for (unsigned i = threadIdx.x & 31; i < n; i += 32) acc += value<TYPE>(row, i, grid, signs) * x[i];
     }
     return sum(acc);
@@ -1152,6 +1170,7 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
+    #pragma unroll 4
     for (unsigned i = lane*4; i < K; i += 128) {
         const char *b = wr+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
