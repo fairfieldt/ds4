@@ -39,6 +39,15 @@ CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
 	fi)
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+# nvcc -arch=native picks plain sm_120/sm_121 on Blackwell, which lacks the
+# block-scaled MMA the vendored MMQ uses. Resolve native to the local compute
+# capability (when all GPUs agree) so it gets the same mapping as sm_120.
+ifeq ($(strip $(CUDA_ARCH)),native)
+CUDA_NATIVE_CC := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' .' | sort -u)
+ifeq ($(words $(CUDA_NATIVE_CC)),1)
+override CUDA_ARCH := sm_$(CUDA_NATIVE_CC)
+endif
+endif
 ifneq ($(strip $(CUDA_ARCH)),)
 ifneq ($(filter sm_120 sm_120a,$(strip $(CUDA_ARCH))),)
 NVCC_ARCH_FLAGS := -gencode arch=compute_120a,code=sm_120a -DDS4_CUDA_HAVE_MXF4=1
