@@ -593,9 +593,14 @@ __global__ void router(int *selected, float *weights, const float *logits,
             __syncthreads();
         }
         if (!tid) {
-            selected[(uint64_t)t * NS + s] = ids[0];
-            weights[(uint64_t)t * NS + s] = maxima[0];
-            p[ids[0]] = -1;
+            /* Non-finite router logits leave no candidate; keep the expert
+             * index in range rather than writing past p[] and the tables. */
+            unsigned sel = ids[0];
+            float w = maxima[0];
+            if (sel >= NE) { sel = s; w = 0; }
+            selected[(uint64_t)t * NS + s] = sel;
+            weights[(uint64_t)t * NS + s] = w;
+            p[sel] = -1;
         }
         __syncthreads();
     }

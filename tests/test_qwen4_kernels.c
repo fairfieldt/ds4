@@ -1082,6 +1082,32 @@ static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
 
 /* ---- router ---- */
 
+#ifndef __APPLE__
+/* Invalid probabilities must not escape as UINT_MAX expert indices or write
+ * outside the router's shared-memory probability array. */
+static void test_router_nonfinite(void) {
+    const uint32_t NE = 512, K = 10, T = 2;
+    float logits[T * NE];
+    int selected[T * K];
+    const uint32_t invalid[] = {0x7fc00000u, 0x7f800000u};
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t e = 0; e < NE; e++)
+            memcpy(&logits[t * NE + e], &invalid[t], sizeof(float));
+    ds4_gpu_tensor *gl = upload(logits, T * NE);
+    ds4_gpu_tensor *gs = upload(NULL, T * K), *gw = upload(NULL, T * K);
+    require_ok(ds4_gpu_qwen4_router_topk_tensor(gs, gw, gl, NULL, NULL, 0,
+        0, 0, 0, NULL, T, NE, K), "non-finite router");
+    require_ok(ds4_gpu_tensor_read(gs, 0, selected, sizeof(selected)),
+               "non-finite router read");
+    for (uint32_t i = 0; i < T * K; i++) {
+        require_ok(selected[i] >= 0 && selected[i] < (int)NE,
+                   "non-finite router expert index");
+    }
+    ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gw);
+    puts("  non-finite router: bounded expert indices");
+}
+#endif
+
 static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     const uint32_t E = 2560;
     double *gate_w;
@@ -3639,6 +3665,9 @@ int main(void) {
     test_ple(&arena, 2560, 3);
     test_ple(&arena, 64, 12);
     printf("router\n");
+#ifndef __APPLE__
+    test_router_nonfinite();
+#endif
     test_router(&arena, 512, 10, 3);
     test_router(&arena, 32, 10, 5);
     printf("attention\n");
