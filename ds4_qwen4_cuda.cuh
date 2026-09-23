@@ -1196,11 +1196,77 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
+/* Decode projections with few output rows (the HC down projections, the
+ * router, the linear-attention gates) cannot fill the GPU at one warp per
+ * row. Split each row's K across the eight warps of a block instead. The
+ * per-row arithmetic is the same for every T, so MTP verify rows keep
+ * matching single-token decode. */
+template<unsigned TYPE, unsigned ROWS>
+__global__ void matvec_split(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    const unsigned row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    __shared__ float part[8][ROWS];
+    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
+    const char *wr = w + (uint64_t)row * stride;
+    float acc[ROWS] = {};
+    #pragma unroll 4
+    for (unsigned g = g0; g < g1; g++) {
+        const unsigned i = g * 128 + lane * 4;
+        if (TYPE == 8) {
+            const char *b = wr + (i / 32) * 34;
+            const float scale = __half2float(*(const __half *)b);
+            const uint16_t *q = (const uint16_t *)(b + 2 + i % 32);
+            const unsigned q01 = q[0], q23 = q[1];
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float4 v = *(const float4 *)(x + (uint64_t)t * K + i);
+                float p = (float)(int8_t)q01 * v.x;
+                p += (float)(int8_t)(q01 >> 8) * v.y;
+                p += (float)(int8_t)q23 * v.z;
+                p += (float)(int8_t)(q23 >> 8) * v.w;
+                acc[t] += p * scale;
+            }
+        } else {
+            const float4 v = value4<TYPE>(wr, i, NULL, NULL);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float4 xv = *(const float4 *)(x + (uint64_t)t * K + i);
+                acc[t] += v.x * xv.x; acc[t] += v.y * xv.y; acc[t] += v.z * xv.z; acc[t] += v.w * xv.w;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) part[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < ROWS && threadIdx.x < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) v += part[j][threadIdx.x];
+        out[(uint64_t)threadIdx.x * M + row] = v;
+    }
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
+    if (T <= 8 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15) &&
+        (type == 8 || ((type == 0 || type == 1) && !((uintptr_t)w & 15) && !(stride & 15)))) {
+#define QWEN_SPLIT(TYPE, N) matvec_split<TYPE, N><<<M, 256, 0, cuda_decode_stream()>>>(out, w, x, T, K, M, stride)
+#define QWEN_SPLIT_T(TYPE) \
+        if (T == 1) { QWEN_SPLIT(TYPE, 1); } else if (T == 2) { QWEN_SPLIT(TYPE, 2); } \
+        else if (T <= 4) { QWEN_SPLIT(TYPE, 4); } else { QWEN_SPLIT(TYPE, 8); }
+        if (type == 0) { QWEN_SPLIT_T(0) }
+        else if (type == 1) { QWEN_SPLIT_T(1) }
+        else { QWEN_SPLIT_T(8) }
+#undef QWEN_SPLIT_T
+#undef QWEN_SPLIT
+        return launched();
+    }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
