@@ -15945,7 +15945,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
-    s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+    s.qwen4_batch_mtp = (cfg.engine.backend == DS4_BACKEND_METAL || cfg.engine.backend == DS4_BACKEND_CUDA) &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;

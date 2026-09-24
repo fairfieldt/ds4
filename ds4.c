@@ -52,6 +52,8 @@
 #endif
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_QWEN4_GPU 1
+/* Native Qwen3.8 session batches: Metal, and CUDA through its row APIs. */
+#define DS4_HAS_QWEN4_BATCH 1
 #ifdef __APPLE__
 #define DS4_HAS_QWEN4_METAL 1
 #endif
@@ -59346,7 +59348,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #ifdef DS4_HAS_QWEN4_METAL
     const uint32_t mm_min = 64u;
 #else
-    const uint32_t mm_min = 8u;
+    /* Small decode batches underfill the prefill expert tiles. A
+     * sixteen-session verification batch can contain 32 rows; retain
+     * FP32 activations through that width to match single-token experts. */
+    const uint32_t mm_min = 32u;
 #endif
     const bool mm = T > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
@@ -74147,7 +74152,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * previous sessions closed) and keeps private transients otherwise. */
         const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
         const bool share = e->share_session_prefill_workspace &&
-                           e->backend == DS4_BACKEND_METAL;
+                           (e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA);
         const bool arena_fits = e->qwen4_shared_workspace &&
             e->qwen4_shared_workspace->cap_tokens >= cap_tokens &&
             e->qwen4_shared_workspace->n_block_cap >= block_cap;
@@ -79622,7 +79627,7 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
 
 #endif
 
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
 /* Batch weight-only work in the shared arena while keeping each session's
  * recurrence, attention caches and n-gram history independent. Row views
  * let the single-session kernels consume slices of the shared transients. */
@@ -80438,7 +80443,7 @@ static bool qwen4_graph_native_session_batch_supported(ds4_decode_item *items, i
     return qwen4_graph_native_session_batch_check(items, count, e, false);
 }
 
-#endif /* DS4_HAS_QWEN4_METAL */
+#endif /* DS4_HAS_QWEN4_BATCH */
 
 static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
@@ -80875,7 +80880,7 @@ static int ds4_sessions_eval_batch_native(
         (uint32_t)(prefill_prompt->len - prefill->checkpoint.len) : 0u;
     const bool native_glm53 = ok &&
         glm53_graph_native_session_batch_supported(items, count);
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
     const bool native_qwen4 = ok && !prefill &&
         ds4_session_is_qwen4(items[0].session);
 #else
@@ -80902,7 +80907,7 @@ static int ds4_sessions_eval_batch_native(
 #else
         ok = false;
 #endif
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
     } else if (native_qwen4) {
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
@@ -80957,7 +80962,7 @@ static int ds4_sessions_eval_batch_native(
 #endif
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
         if (native_qwen4) {
             ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
                                      (uint64_t)i * DS4_N_VOCAB * sizeof(float),
@@ -81311,7 +81316,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
 /* Speculate when (1 + acceptance) * plain_cost > speculative_cost. Probe
  * both schedules periodically so changes in text or GPU speed can reverse
  * the decision. Transition cycles do not update either timing estimate. */
@@ -81356,9 +81361,9 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             return 1;
         }
     }
-#ifdef DS4_HAS_QWEN4_METAL
+#ifdef DS4_HAS_QWEN4_BATCH
     if (count >= 2 && count <= 16 && ds4_session_is_qwen4(items[0].session) && e->glm_mtp &&
-        !e->tp.active && e->backend == DS4_BACKEND_METAL &&
+        !e->tp.active && (e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA) &&
         qwen4_graph_native_session_batch_check(items, count, e, true)) {
         const ds4_model *m = &e->model;
         const ds4_weights *w = &e->weights;
@@ -81566,6 +81571,12 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     }
 
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_BATCH
+    if (e->backend == DS4_BACKEND_CUDA && ds4_session_is_qwen4(first) && !e->tp.active &&
+        qwen4_graph_native_session_batch_supported(items, count, e)) {
+        return ds4_sessions_eval_batch_native(items, count, e, NULL, NULL, err, errlen);
+    }
+#endif
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
