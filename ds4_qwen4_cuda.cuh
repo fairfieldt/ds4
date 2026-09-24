@@ -5,6 +5,53 @@
 
 namespace qwen4_cuda {
 
+/* Programmatic dependent launch. Each kernel waits for its predecessor
+ * before touching memory, then lets its successor be scheduled, so the
+ * next kernel's blocks are resident when this one finishes instead of
+ * being launched afterwards. Reads and writes keep their order. */
+__device__ __forceinline__ void pdl_enter() {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+/* Reports the virtual architecture these kernels were compiled for. */
+__global__ void pdl_probe() {}
+
+/* PDL needs an sm_90+ device and kernels compiled for sm_90+: a build for
+ * an older target JIT-compiled on a newer GPU has no dependency wait in
+ * pdl_enter() and must launch without it. */
+static bool pdl_enabled() {
+    static int on = -1;   /* DS4_CUDA_NO_PDL=1 launches without it */
+    if (on < 0) {
+        int device = 0, major = 0;
+        cudaFuncAttributes fa;
+        on = getenv("DS4_CUDA_NO_PDL") == NULL && cudaGetDevice(&device) == cudaSuccess &&
+             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+             major >= 9 && cudaFuncGetAttributes(&fa, pdl_probe) == cudaSuccess && fa.ptxVersion >= 90;
+        (void)cudaGetLastError();
+    }
+    return on;
+}
+
+template<typename... KernelArgs, typename... Args>
+static void launch(void (*kernel)(KernelArgs...), dim3 grid, dim3 block, size_t smem, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr[1];
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = cuda_decode_stream();
+    if (pdl_enabled()) {
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+    }
+    (void)cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+}
+
 __device__ __forceinline__ float sum(float x);
 __device__ __forceinline__ float sigmoid(float x);
 template<unsigned TYPE>
@@ -44,6 +91,7 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
         unsigned pos0, float eps, rope_args rp) {
+    pdl_enter();
     const unsigned slot = blockIdx.x, t = blockIdx.y, pos = pos0 + t, lane = threadIdx.x;
     __shared__ float row[256];
     if (slot == H + Hkv + Hi) {
@@ -76,6 +124,7 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
 
 __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
         const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+    pdl_enter();
     const unsigned b = block0 + blockIdx.x, lane = threadIdx.x, npt = D / 32;
     __shared__ float row[128];
     float ss = 0, v[4];
@@ -94,6 +143,7 @@ __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
 
 __global__ void idx_score(float *out, const float *q, const __half *key,
         unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
+    pdl_enter();
     const unsigned b = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, lane = threadIdx.x & 31;
     if (b >= N) return;
     float score = 0;
@@ -108,6 +158,7 @@ __global__ void idx_score(float *out, const float *q, const __half *key,
 }
 
 __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigned tiles) {
+    pdl_enter();
     const unsigned tile = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (tile >= tiles) return;
     unsigned v = 0;
@@ -119,6 +170,7 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
 /* Exact radix threshold and stable gather, with the same greater-than then
  * equal-score ordering as Metal. No context-dependent candidate truncation. */
 __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
+    pdl_enter();
     const unsigned tid = threadIdx.x, t = blockIdx.x;
     __shared__ unsigned hist[256], gt[256], eq[256], threshold, need;
     const float *row = score + (uint64_t)t * N;
@@ -165,6 +217,7 @@ __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K)
 
 __global__ void idx_expand(int *out, unsigned *count, const int *blocks,
         unsigned K, unsigned ratio, unsigned pos0, unsigned stride) {
+    pdl_enter();
     const unsigned t = blockIdx.x, pos = pos0 + t, tail = (pos + 1) / ratio * ratio;
     for (unsigned i = threadIdx.x; i < K * ratio; i += blockDim.x)
         out[(uint64_t)t * stride + i] = blocks[(uint64_t)t * K + i / ratio] * ratio + i % ratio;
@@ -178,6 +231,7 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse,
         unsigned splits, unsigned per, float scale) {
+    pdl_enter();
     const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
     if (h >= H) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
@@ -230,6 +284,7 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
 
 __global__ void attn_merge(float *out, const float *partial, const float *gate,
         unsigned H, unsigned D, unsigned splits) {
+    pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     if (d >= D) return;
     const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
@@ -251,6 +306,7 @@ __global__ void attn_merge(float *out, const float *partial, const float *gate,
 __global__ void attention_group(float *out, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+    pdl_enter();
 #if __CUDA_ARCH__ >= 800
     const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32;
     const unsigned t = blockIdx.y, kh = blockIdx.x, group = H/Hkv;
@@ -578,6 +634,7 @@ static uint64_t expert_row_bytes(unsigned type, unsigned K) {
 __global__ void router(int *selected, float *weights, const float *logits,
         const float *x, const char *gate, float *shared_gate,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
+    pdl_enter();
     const unsigned t = blockIdx.x, tid = threadIdx.x;
     __shared__ float p[512], maxima[256], red[32];
     float mx = -FLT_MAX;
@@ -646,6 +703,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned shared_type, unsigned NE, unsigned NS, unsigned K, unsigned M,
         uint64_t rb, uint64_t srb) {
+    pdl_enter();
     const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
@@ -706,8 +764,8 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
 #define QWEN_MOE_SH(TYPE, SH) \
-    if (down) moe_mv<TYPE, true, SH><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
-    else moe_mv<TYPE, false, SH><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb)
+    if (down) launch(moe_mv<TYPE, true, SH>, grid, 128, 0, out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
+    else launch(moe_mv<TYPE, false, SH>, grid, 128, 0, out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb)
 #define QWEN_MOE(TYPE) case TYPE: \
     if (st == 8) { QWEN_MOE_SH(TYPE, 8); } else { QWEN_MOE_SH(TYPE, SH_ANY); } break
     switch (type) {
@@ -723,6 +781,7 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
 __global__ void moe_reduce(float *out, float *R, const float *inj, const float *part,
         const float *weights, const float *gate, const float *shared,
         unsigned NS, unsigned stride, unsigned D, unsigned hc) {
+    pdl_enter();
     const unsigned d = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     __shared__ float inject[4];
     if (threadIdx.x < hc) inject[threadIdx.x] = injection(inj + (uint64_t)t * hc * hc * 8, hc, threadIdx.x);
@@ -737,6 +796,7 @@ __global__ void moe_reduce(float *out, float *R, const float *inj, const float *
 
 __global__ void expert_lists(int *lists, int *counts, const int *selected,
         unsigned pairs, unsigned NE, unsigned cap) {
+    pdl_enter();
     __shared__ unsigned counters[512];
     for (unsigned e = threadIdx.x; e < NE; e += blockDim.x) counters[e] = 0;
     __syncthreads();
@@ -757,6 +817,7 @@ template<unsigned TYPE, bool DOWN, bool EXPERT>
 __global__ void matrix(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, unsigned T, unsigned NS, unsigned NO,
         unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    pdl_enter();
     const unsigned r = threadIdx.x % 16, c = threadIdx.x / 16, e = blockIdx.y;
     const unsigned row = blockIdx.x * 16 + r;
     const unsigned count = EXPERT ? (unsigned)counts[e] : T;
@@ -798,6 +859,7 @@ __global__ void matrix(float *out, const float *x, const char *w0, const char *w
 }
 
 __global__ void expert_tiles(unsigned *prefix, const int *counts, unsigned NE, unsigned nt) {
+    pdl_enter();
     unsigned n = 0;
     prefix[0] = 0;
     for (unsigned e = 0; e < NE; e++) {
@@ -812,6 +874,7 @@ __global__ void expert_tiles(unsigned *prefix, const int *counts, unsigned NE, u
 template<unsigned TYPE>
 __global__ void matrix_tc(float *out, const float *x, const char *w0,
         unsigned T, unsigned K, unsigned M, uint64_t rb) {
+    pdl_enter();
 #if __CUDA_ARCH__ >= 800
     namespace wm = nvcuda::wmma;
     const unsigned tid = threadIdx.x, warp = tid/32, r0 = blockIdx.x*64;
@@ -887,6 +950,7 @@ template<unsigned TYPE, bool DOWN, unsigned NC>
 __global__ void matrix_reg(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    pdl_enter();
 #if __CUDA_ARCH__ >= 800
     const unsigned lane = threadIdx.x&31, warp = threadIdx.x/32;
     const unsigned row_tiles = (M+31)/32, job = blockIdx.x/row_tiles;
@@ -985,6 +1049,7 @@ template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64>
 __global__ void matrix_half_tile(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    pdl_enter();
 #if __CUDA_ARCH__ >= 800
     namespace wm = nvcuda::wmma;
     const unsigned tid = threadIdx.x, warp = tid/32, nr = (M+NR-1)/NR, job = blockIdx.x/nr;
@@ -1080,15 +1145,15 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             const unsigned nt = T >= 2048 ? 64 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
             if (!tiles) return 0;
-            expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles,counts,NE,nt);
+            launch(expert_tiles, 1, 1, 0, tiles,counts,NE,nt);
             if (!launched()) return 0;
             /* Wider rows reuse activations; Q2_K down is faster at 64 rows. */
             const unsigned nr = nt == 64 && type != 10 ? 128 : 64;
             const uint64_t blocks = (((uint64_t)T*NS+nt-1)/nt+NE)*((M+nr-1)/nr);
             if (blocks > INT_MAX) return 0;
 #define QWEN_HALF(TYPE, DOWN) \
-            if (nt == 64) matrix_half_tile<TYPE,DOWN,64,(TYPE == 10 ? 64 : 128)><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-            else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
+            if (nt == 64) launch(matrix_half_tile<TYPE,DOWN,64,(TYPE == 10 ? 64 : 128)>, blocks, 256, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+            else launch(matrix_half_tile<TYPE,DOWN,32>, blocks, 256, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
             switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
 #undef QWEN_HALF_TYPE
@@ -1100,7 +1165,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         if (lists) {
             tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tile schedule");
             if (!tiles) return 0;
-            expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles,counts,NE,32);
+            launch(expert_tiles, 1, 1, 0, tiles,counts,NE,32);
             if (!launched()) return 0;
             const uint64_t jobs = ((uint64_t)T*NS+31)/32+NE;
             const uint64_t blocks = jobs*((M+31)/32);
@@ -1108,9 +1173,9 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             tcgrid = dim3((unsigned)blocks,1,1);
         }
 #define QWEN_TC(TYPE) case TYPE: \
-        if (!lists) matrix_tc<TYPE><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,T,K,M,rb); \
-        else if (down) matrix_reg<TYPE,true,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
-        else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
+        if (!lists) launch(matrix_tc<TYPE>, tcgrid, 128, 0, out,x,w0,T,K,M,rb); \
+        else if (down) launch(matrix_reg<TYPE,true,2>, tcgrid, 128, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+        else launch(matrix_reg<TYPE,false,2>, tcgrid, 128, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
         QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
         QWEN_TC(12); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
@@ -1120,9 +1185,9 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         return launched();
     }
 #define QWEN_MM(TYPE) case TYPE: \
-    if (!lists) matrix<TYPE,false,false><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); \
-    else if (down) matrix<TYPE,true,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); \
-    else matrix<TYPE,false,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
+    if (!lists) launch(matrix<TYPE,false,false>, grid, 256, 0, out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); \
+    else if (down) launch(matrix<TYPE,true,true>, grid, 256, 0, out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); \
+    else launch(matrix<TYPE,false,true>, grid, 256, 0, out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
     QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
     QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
@@ -1152,6 +1217,7 @@ __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n
 template<unsigned TYPE>
 __global__ void matvec(float *out, const char *w, const float *x,
                        unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
     const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, tok = blockIdx.y;
     if (row >= M) return;
     const float v = dot<TYPE>(w + row * stride, x + (uint64_t)tok * K, K);
@@ -1161,6 +1227,7 @@ __global__ void matvec(float *out, const char *w, const float *x,
 template<unsigned TYPE, unsigned ROWS>
 __global__ void matvec_rows(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
     const unsigned row = blockIdx.x*4+threadIdx.x/32, lane = threadIdx.x&31;
     if (row >= M) return;
     float a[ROWS] = {};
@@ -1191,6 +1258,7 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
 template<unsigned ROWS>
 __global__ void matvec_q8(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
     const unsigned row = blockIdx.x*4+threadIdx.x/32, lane = threadIdx.x&31;
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
@@ -1226,6 +1294,7 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
 template<unsigned TYPE, unsigned ROWS>
 __global__ void matvec_split(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
     const unsigned row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     __shared__ float part[8][ROWS];
     const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
@@ -1278,7 +1347,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     if (!stride) return 0;
     if (T <= 8 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15) &&
         (type == 8 || ((type == 0 || type == 1) && !((uintptr_t)w & 15) && !(stride & 15)))) {
-#define QWEN_SPLIT(TYPE, N) matvec_split<TYPE, N><<<M, 256, 0, cuda_decode_stream()>>>(out, w, x, T, K, M, stride)
+#define QWEN_SPLIT(TYPE, N) launch(matvec_split<TYPE, N>, M, 256, 0, out, w, x, T, K, M, stride)
 #define QWEN_SPLIT_T(TYPE) \
         if (T == 1) { QWEN_SPLIT(TYPE, 1); } else if (T == 2) { QWEN_SPLIT(TYPE, 2); } \
         else if (T <= 4) { QWEN_SPLIT(TYPE, 4); } else { QWEN_SPLIT(TYPE, 8); }
@@ -1290,7 +1359,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         return launched();
     }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
-#define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
+#define QWEN_Q8_ROWS(N) launch(matvec_q8<N>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
         else if (T == 2) { QWEN_Q8_ROWS(2); }
         else if (T <= 4) { QWEN_Q8_ROWS(4); }
@@ -1299,10 +1368,10 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         return launched();
     }
 #define QWEN_MV(TYPE) case TYPE: \
-    if (T == 2) matvec_rows<TYPE,2><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
-    else if (T > 2 && T <= 4) matvec_rows<TYPE,4><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
-    else if (T > 4 && T <= 8) matvec_rows<TYPE,8><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
-    else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
+    if (T == 2) launch(matvec_rows<TYPE,2>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride); \
+    else if (T > 2 && T <= 4) launch(matvec_rows<TYPE,4>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride); \
+    else if (T > 4 && T <= 8) launch(matvec_rows<TYPE,8>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride); \
+    else launch(matvec<TYPE>, grid, 128, 0, out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
     QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
@@ -1314,6 +1383,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
 
 template<unsigned TYPE>
 __global__ void unpack(float *out, const char *w, unsigned K, unsigned M, uint64_t rb) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
     if (i < (uint64_t)K*M) out[i] = value<TYPE>(w+(i/K)*rb,i%K);
 }
@@ -1323,6 +1393,7 @@ __global__ void unpack(float *out, const char *w, unsigned K, unsigned M, uint64
 template<unsigned TYPE>
 __global__ void pack_half_components(float *scales, __half *hi, __half *lo,
         const char *x, unsigned K, uint64_t rb) {
+    pdl_enter();
     const unsigned row = blockIdx.x, tid = threadIdx.x;
     __shared__ float maxima[256], inv;
     float mx = 0;
@@ -1348,6 +1419,7 @@ __global__ void pack_half_components(float *scales, __half *hi, __half *lo,
 
 __global__ void dense_rescale(float *out, const float *scales,
         unsigned M, unsigned N) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
     if (i < (uint64_t)M*N) out[i] *= scales[i/M];
 }
@@ -1356,6 +1428,7 @@ __global__ void dense_rescale(float *out, const float *scales,
  * Keep separate FP32 sums and the same scaled residual as the cuBLAS path. */
 __global__ void dense_f16_components(float *out, const __half *xh, const __half *xl,
         const __half *w, const float *scales, unsigned T, unsigned K, unsigned M) {
+    pdl_enter();
 #if __CUDA_ARCH__ >= 800
     namespace wm = nvcuda::wmma;
     const unsigned tid = threadIdx.x, warp = tid/32;
@@ -1410,10 +1483,10 @@ static int dense_f16_blas(float *out, const float *x, const __half *w,
     if (!hi) return 0;
     __half *lo = hi+xn;
     float *scales = (float *)(lo+xn);
-    pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(scales,hi,lo,(const char *)x,K,(uint64_t)K*4);
+    launch(pack_half_components<0>, T, 256, 0, scales,hi,lo,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
     if (K <= 512 && K%64 == 0 && T >= 32 && ds4_cuda_attn_tokentile_arch_ok()) {
-        dense_f16_components<<<dim3((M+63)/64,(T+63)/64),256,0,cuda_decode_stream()>>>(out,hi,lo,w,scales,T,K,M);
+        launch(dense_f16_components, dim3((M+63)/64,(T+63)/64), 256, 0, out,hi,lo,w,scales,T,K,M);
         return launched();
     }
     const float zero = 0, one = 1, low = 0x1p-12f;
@@ -1423,12 +1496,13 @@ static int dense_f16_blas(float *out, const float *x, const __half *w,
         !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
                 M,T,K,&one,w,CUDA_R_16F,K,hi,CUDA_R_16F,K,&one,out,CUDA_R_32F,M,
                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 leading projection")) return 0;
-    dense_rescale<<<((uint64_t)M*T+255)/256,256,0,cuda_decode_stream()>>>(out,scales,M,T);
+    launch(dense_rescale, ((uint64_t)M*T+255)/256, 256, 0, out,scales,M,T);
     return launched();
 }
 
 __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
         unsigned M, unsigned T, unsigned stride) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
     if (i < (uint64_t)M*T) {
         const uint64_t dst = (i/M)*stride+i%M;
@@ -1445,13 +1519,13 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
     if (!xh) return 0;
     __half *xl = xh+xn, *wh = xl+xn, *wl = wh+wn;
     float *xs = (float *)(wl+wn), *ws = xs+T;
-    pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(xs,xh,xl,(const char *)x,K,(uint64_t)K*4);
+    launch(pack_half_components<0>, T, 256, 0, xs,xh,xl,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
     const float zero = 0, one = 1, low = 0x1p-12f;
     const uint64_t rb = row_bytes(8,K);
     for (unsigned r = 0; r < M; r += tile) {
         const unsigned n = std::min(tile,M-r);
-        pack_half_components<8><<<n,256,0,cuda_decode_stream()>>>(ws,wh,wl,w+(uint64_t)r*rb,K,rb);
+        launch(pack_half_components<8>, n, 256, 0, ws,wh,wl,w+(uint64_t)r*rb,K,rb);
         if (!launched()) return 0;
         if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
                 n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out+r,CUDA_R_32F,M,
@@ -1462,7 +1536,7 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
             !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
                 n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 leading product")) return 0;
-        dense_rescale2<<<((uint64_t)n*T+255)/256,256,0,cuda_decode_stream()>>>(out+r,xs,ws,n,T,M);
+        launch(dense_rescale2, ((uint64_t)n*T+255)/256, 256, 0, out+r,xs,ws,n,T,M);
         if (!launched()) return 0;
     }
     return 1;
@@ -1481,7 +1555,7 @@ static int dense_blas(float *out, const float *x, const char *w,
         const unsigned n = std::min(tile,M-r);
         const float *wf = type ? scratch : (const float *)w+(uint64_t)r*K;
         if (type) {
-#define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,cuda_decode_stream()>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
+#define QWEN_UNPACK(TYPE) case TYPE: launch(unpack<TYPE>, ((uint64_t)n*K+255)/256, 256, 0, scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
             QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
             QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
@@ -1499,6 +1573,7 @@ static int dense_blas(float *out, const float *x, const char *w,
 
 __global__ void mtp_stage(float *cat, const float *e, const float *R,
         const float *ge, const float *gh, unsigned E, unsigned hc, float eps) {
+    pdl_enter();
     const unsigned row = blockIdx.x, tid = threadIdx.x;
     const bool emb = row == 0;
     const unsigned n = emb ? E : E * hc;
@@ -1517,6 +1592,7 @@ __global__ void mtp_stage(float *cat, const float *e, const float *R,
 }
 
 __global__ void mtp_combine(float *out, const float *proj, unsigned E, unsigned hc) {
+    pdl_enter();
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < E * hc) out[i] = proj[i % E] + proj[E + i];
 }
@@ -1524,6 +1600,7 @@ __global__ void mtp_combine(float *out, const float *proj, unsigned E, unsigned 
 struct max_pair { float value; int index; };
 template<bool FINISH>
 __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigned n) {
+    pdl_enter();
     const unsigned tid = threadIdx.x;
     __shared__ max_pair best[256];
     max_pair v = {-1e30f, 0};
@@ -1546,11 +1623,13 @@ __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigne
 
 __global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
         const float *pos, unsigned N, unsigned E) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (uint64_t)N * E) x[i] = a[i] + b[i] + bias[i % E] + pos[i];
 }
 
 __global__ void vis_norm(float *out, const float *x, const float *w, const float *b, unsigned E, float eps) {
+    pdl_enter();
     const unsigned tid = threadIdx.x;
     const uint64_t base = (uint64_t)blockIdx.x * E;
     __shared__ float red[32];
@@ -1565,6 +1644,7 @@ __global__ void vis_norm(float *out, const float *x, const float *w, const float
 
 __global__ void vis_qkv(float *q, float *k, float *v, const float *qkv, const float *bias,
         unsigned H, unsigned D, unsigned grid_w) {
+    pdl_enter();
     const unsigned row = blockIdx.x, tid = threadIdx.x, E = H*D, hd = D/2, qd = D/4;
     const unsigned blk = row/4, within = row%4, w2 = grid_w/2;
     const float hp = (blk/w2)*2 + within/2, wp = (blk%w2)*2 + within%2;
@@ -1586,6 +1666,7 @@ __global__ void vis_qkv(float *q, float *k, float *v, const float *qkv, const fl
 
 __global__ void vis_attention(float *out, const float *q, const float *k, const float *v,
         unsigned N, unsigned H, unsigned D) {
+    pdl_enter();
     const unsigned row = blockIdx.x, h = blockIdx.y, lane = threadIdx.x, E = H*D;
     const uint64_t qb = (uint64_t)row*E + h*D;
     float query[3] = {}, acc[3] = {};
@@ -1605,6 +1686,7 @@ __global__ void vis_attention(float *out, const float *q, const float *k, const 
 }
 
 __global__ void vis_add(float *x, const float *add, const float *bias, unsigned N, unsigned E, unsigned mode) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= (uint64_t)N*E) return;
     if (add) { x[i] += add[i] + bias[i%E]; return; }
@@ -1618,6 +1700,7 @@ template<unsigned TYPE>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned E, unsigned hc,
                         unsigned ni, float eps) {
+    pdl_enter();
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
@@ -1672,6 +1755,7 @@ template<unsigned TYPE>
 __global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
         const float *gamma, const char *wi, unsigned E, unsigned hc,
         unsigned ni, float eps) {
+    pdl_enter();
     const unsigned stream = blockIdx.x, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, lane = tid & 31, chunk = tid / 32;
     const unsigned dim = E * hc, per = (E + 7) / 8;
@@ -1705,6 +1789,7 @@ __global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
 template<unsigned TYPE>
 __global__ void hc_mix(float *out, const float *xn, const float *lo,
                        const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+    pdl_enter();
     const unsigned d = blockIdx.x * 4 + threadIdx.x / 32, tok = blockIdx.y;
     __shared__ __align__(16) float activated[512];
     if (rank <= 512) {
@@ -1743,6 +1828,7 @@ __device__ float injection(const float *inj, unsigned hc, unsigned stream) {
 }
 
 __global__ void hc_combine(float *R, const float *out, const float *inj, unsigned E, unsigned hc) {
+    pdl_enter();
     const unsigned d = blockIdx.x * blockDim.x + threadIdx.x, tok = blockIdx.y;
     __shared__ float weights[4];
     if (threadIdx.x < hc) weights[threadIdx.x] = injection(inj + (uint64_t)tok * hc * hc * 8, hc, threadIdx.x);
@@ -1752,11 +1838,13 @@ __global__ void hc_combine(float *R, const float *out, const float *inj, unsigne
 }
 
 __global__ void hc_lo(float *dst, const float *src, uint64_t n, unsigned hc) {
+    pdl_enter();
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = silu(src[i] / hc);
 }
 
 __global__ void hc_rows(float *dst, const float *up, const float *xn, unsigned E, unsigned hc) {
+    pdl_enter();
     const unsigned d = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (d >= E) return;
     float v = 0;
@@ -1774,6 +1862,7 @@ namespace qwen4_cuda {
 __global__ void conv(float *x, float *history, const float *w, unsigned T,
                      unsigned C, unsigned K, bool activate,
                      float *snap, unsigned snap_t, float *snap2, unsigned snap2_t) {
+    pdl_enter();
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float win[3], taps[4];
@@ -1795,6 +1884,7 @@ __global__ void conv(float *x, float *history, const float *w, unsigned T,
 
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
                          unsigned Hk, unsigned Hv, unsigned D) {
+    pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
     const unsigned C = (2 * Hk + Hv) * D, npt = D / 32;
     float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
@@ -1817,6 +1907,7 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
                          const float *a, const float *b, unsigned T, unsigned Hk,
                          unsigned Hv, float *snap, unsigned st,
                          float *snap2, unsigned st2) {
+    pdl_enter();
     const unsigned dv = (blockIdx.x * 4 + threadIdx.x / 32)*ROWS, h = blockIdx.y;
     if (dv >= D) return;
     const unsigned npt = D / 32, k0 = (threadIdx.x & 31) * npt, kh = h % Hk;
@@ -1853,6 +1944,7 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
 }
 
 __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
+    pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, npt = D / 32, k0 = threadIdx.x * npt;
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
     float ss = 0;
@@ -1864,6 +1956,7 @@ __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, un
 __global__ void ngram_gate(float *gated, float *normed, const float *R, const float *key,
                            const float *val, const float *gk, const float *gq, const float *gc,
                            unsigned E, unsigned hc, float eps) {
+    pdl_enter();
     const unsigned s = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
     const uint64_t base = ((uint64_t)t * hc + s) * E;
     __shared__ float red[32];
@@ -1890,6 +1983,7 @@ __global__ void ngram_gate(float *gated, float *normed, const float *R, const fl
 __global__ void ngram_conv(float *R, const float *gated, const float *normed, float *history,
                            const char *w, unsigned type, unsigned T, unsigned C, unsigned K,
                            unsigned dilation, float *snap, unsigned st, float *snap2, unsigned st2) {
+    pdl_enter();
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const unsigned H = (K - 1) * dilation;
@@ -1918,8 +2012,8 @@ extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tenso
     if (!T || !C || K < 2 || K > 4 || !tensor(x, (uint64_t)T * C * 4) || !tensor(history, (uint64_t)(K - 1) * C * 4)) return 0;
     const char *w = weight(map, size, offset, (uint64_t)C * K * 4);
     if (!w) return 0;
-    conv<<<(C + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)x->ptr, (float *)history->ptr,
-        (const float *)w, T, C, K, activate, NULL, UINT_MAX, NULL, UINT_MAX);
+    launch(conv, (C + 255) / 256, 256, 0, (float *)x->ptr, (float *)history->ptr,
+        (const float *)w, T, C, K, activate, nullptr, UINT_MAX, nullptr, UINT_MAX);
     return launched();
 }
 
@@ -1931,7 +2025,7 @@ extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4)) return 0;
     const char *A = weight(map, size, ao, (uint64_t)Hv * 4), *bias = weight(map, size, bo, (uint64_t)Hv * 4);
     if (!A || !bias) return 0;
-    gdn_prep<<<dim3(Hk, T), 32, 0, cuda_decode_stream()>>>((float *)qkv->ptr,
+    launch(gdn_prep, dim3(Hk, T), 32, 0, (float *)qkv->ptr,
         (float *)a->ptr, (float *)b->ptr, (const float *)A, (const float *)bias, Hk, Hv, D);
     return launched();
 }
@@ -1949,9 +2043,9 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         !tensor(qkv, (uint64_t)T * (2 * Hk + Hv) * D * 4) ||
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4) ||
         (snap && !tensor(snap, bytes)) || (snap2 && !tensor(snap2, bytes))) return 0;
-#define QWEN_GDN(ROWS, DIM) gdn_scan<ROWS,DIM><<<dim3((DIM+4*ROWS-1)/(4*ROWS),Hv),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
+#define QWEN_GDN(ROWS, DIM) launch(gdn_scan<ROWS,DIM>, dim3((DIM+4*ROWS-1)/(4*ROWS),Hv), 128, 0, (float *)out->ptr, \
         (float *)state->ptr,(const float *)qkv->ptr,(const float *)a->ptr,(const float *)b->ptr, \
-        T,Hk,Hv,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2)
+        T,Hk,Hv,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2)
 #define QWEN_GDN_DIM(DIM) case DIM: if (T > 8) { QWEN_GDN(4,DIM); } else { QWEN_GDN(1,DIM); } break
     switch (D) { QWEN_GDN_DIM(32); QWEN_GDN_DIM(64); QWEN_GDN_DIM(96); QWEN_GDN_DIM(128); }
 #undef QWEN_GDN_DIM
@@ -1966,7 +2060,7 @@ extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_t
     if (!n || D < 32 || D > 128 || D % 32 || !tensor(out, n * 4) || !tensor(z, n * 4)) return 0;
     const char *w = weight(map, size, off, (uint64_t)D * 4);
     if (!w) return 0;
-    gdn_out<<<dim3(H, T), 32, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)z->ptr, (const float *)w, H, D, eps);
+    launch(gdn_out, dim3(H, T), 32, 0, (float *)out->ptr, (const float *)z->ptr, (const float *)w, H, D, eps);
     return launched();
 }
 
@@ -1980,7 +2074,7 @@ extern "C" int ds4_gpu_qwen4_ple_gate_tensor(ds4_gpu_tensor *gated, ds4_gpu_tens
         !tensor(R, bytes) || !tensor(key, bytes) || !tensor(val, (uint64_t)T * E * 4)) return 0;
     const char *gk = weight(map, size, ko, wb), *gq = weight(map, size, qo, wb), *gc = weight(map, size, co, wb);
     if (!gk || !gq || !gc) return 0;
-    ngram_gate<<<dim3(hc, T), 128, 0, cuda_decode_stream()>>>((float *)gated->ptr, (float *)normed->ptr,
+    launch(ngram_gate, dim3(hc, T), 128, 0, (float *)gated->ptr, (float *)normed->ptr,
         (const float *)R->ptr, (const float *)key->ptr, (const float *)val->ptr,
         (const float *)gk, (const float *)gq, (const float *)gc, E, hc, eps);
     return launched();
@@ -1997,9 +2091,9 @@ extern "C" int ds4_gpu_qwen4_ple_conv_tensor(ds4_gpu_tensor *R, const ds4_gpu_te
         !tensor(history, hb) || (snap && !tensor(snap, hb)) || (snap2 && !tensor(snap2, hb))) return 0;
     const char *w = weight(map, size, off, row_bytes(type, (uint64_t)C * K));
     if (!w) return 0;
-    ngram_conv<<<(C + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)R->ptr,
+    launch(ngram_conv, (C + 255) / 256, 256, 0, (float *)R->ptr,
         (const float *)gated->ptr, (const float *)normed->ptr, (float *)history->ptr, w, type, T, C, K,
-        dilation, snap ? (float *)snap->ptr : NULL, st, snap2 ? (float *)snap2->ptr : NULL, st2);
+        dilation, snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
     return launched();
 }
 
@@ -2015,16 +2109,16 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
     if (!gamma || !wi || (type != 0 && type != 1 && type != 8)) return 0;
     if (T > 8) {
-#define QWEN_HC_NORM(TYPE) hc_norm_prefill<TYPE><<<dim3(hc,T),256,0,cuda_decode_stream()>>>((float *)xn->ptr, \
-        ni ? (float *)inj->ptr : NULL,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
+#define QWEN_HC_NORM(TYPE) launch(hc_norm_prefill<TYPE>, dim3(hc,T), 256, 0, (float *)xn->ptr, \
+        ni ? (float *)inj->ptr : nullptr,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
         if (type == 0) { QWEN_HC_NORM(0); }
         else if (type == 1) { QWEN_HC_NORM(1); }
         else { QWEN_HC_NORM(8); }
 #undef QWEN_HC_NORM
         return launched();
     }
-#define QWEN_HC_NORM(TYPE) hc_norm<TYPE><<<dim3(hc * 8, T), 128, 0, cuda_decode_stream()>>>((float *)xn->ptr, \
-        ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps)
+#define QWEN_HC_NORM(TYPE) launch(hc_norm<TYPE>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
+        ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps)
     if (type == 0) { QWEN_HC_NORM(0); }
     else if (type == 1) { QWEN_HC_NORM(1); }
     else { QWEN_HC_NORM(8); }
@@ -2040,7 +2134,7 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
-#define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
+#define QWEN_HC(TYPE) launch(hc_mix<TYPE>, dim3((E + 3) / 4, T), 128, 0, (float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
     if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
@@ -2054,7 +2148,7 @@ extern "C" int ds4_gpu_qwen4_hc_combine_tensor(ds4_gpu_tensor *R,
     using namespace qwen4_cuda;
     if (!T || !E || !hc || hc > 4 || !tensor(R, (uint64_t)T * E * hc * 4) ||
         !tensor(out, (uint64_t)T * E * 4) || !tensor(inj, (uint64_t)T * hc * hc * 8 * 4)) return 0;
-    hc_combine<<<dim3((E + 255) / 256, T), 256, 0, cuda_decode_stream()>>>(
+    launch(hc_combine, dim3((E + 255) / 256, T), 256, 0,
         (float *)R->ptr, (const float *)out->ptr, (const float *)inj->ptr, E, hc);
     return launched();
 }
@@ -2064,7 +2158,7 @@ extern "C" int ds4_gpu_qwen4_hc_lo_act_tensor(ds4_gpu_tensor *dst,
     using namespace qwen4_cuda;
     const uint64_t n = (uint64_t)T * rank;
     if (!n || !hc || !tensor(dst, n * 4) || !tensor(src, n * 4)) return 0;
-    hc_lo<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)dst->ptr, (const float *)src->ptr, n, hc);
+    launch(hc_lo, (n + 255) / 256, 256, 0, (float *)dst->ptr, (const float *)src->ptr, n, hc);
     return launched();
 }
 
@@ -2073,7 +2167,7 @@ extern "C" int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *dst,
     using namespace qwen4_cuda;
     if (!T || !E || !hc || hc > 4 || !tensor(dst, (uint64_t)T * E * 4) ||
         !tensor(up, (uint64_t)T * hc * E * 4) || !tensor(xn, (uint64_t)T * hc * E * 4)) return 0;
-    hc_rows<<<dim3((E + 255) / 256, T), 256, 0, cuda_decode_stream()>>>(
+    launch(hc_rows, dim3((E + 255) / 256, T), 256, 0,
         (float *)dst->ptr, (const float *)up->ptr, (const float *)xn->ptr, E, hc);
     return launched();
 }
@@ -2103,7 +2197,7 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
     const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
     if (!gq || !gk || !giq) return 0;
-    attn_prep<<<dim3(H + Hkv + Hi + 1, T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr,
+    launch(attn_prep, dim3(H + Hkv + Hi + 1, T), 32, 0, (float *)q->ptr,
         (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
         (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
         (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq,
@@ -2121,7 +2215,7 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
         !tensor(out, rows * D * 2) || !tensor(ik, rows * ratio * D * 4) || !tensor(pos3, rows * ratio * 16)) return 0;
     const char *w = weight(map, size, off, D * 4);
     if (!w) return 0;
-    block_key<<<N, 32, 0, cuda_decode_stream()>>>((__half *)out->ptr, (const float *)ik->ptr,
+    launch(block_key, N, 32, 0, (__half *)out->ptr, (const float *)ik->ptr,
         (const uint32_t *)pos3->ptr, (const float *)w, b0, ratio, D, eps, rope(nrot, base));
     return launched();
 }
@@ -2134,10 +2228,10 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
-    idx_score<<<dim3((N + 3) / 4, T), 128, 0, cuda_decode_stream()>>>((float *)out->ptr,
+    launch(idx_score, dim3((N + 3) / 4, T), 128, 0, (float *)out->ptr,
         (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
     if (!launched()) return 0;
-    if (tiles) tile_max<<<dim3((nt + 255) / 256, T), 256, 0, cuda_decode_stream()>>>(
+    if (tiles) launch(tile_max, dim3((nt + 255) / 256, T), 256, 0,
         (unsigned *)tiles->ptr, (const float *)out->ptr, N, nt);
     return launched();
 }
@@ -2147,7 +2241,7 @@ extern "C" int ds4_gpu_qwen4_idx_select_tensor(ds4_gpu_tensor *out, const ds4_gp
     using namespace qwen4_cuda;
     (void)tiles;
     if (!T || !K || K > N || !tensor(out, (uint64_t)T * K * 4) || !tensor(score, (uint64_t)T * N * 4)) return 0;
-    idx_select<<<T, 256, 0, cuda_decode_stream()>>>((int *)out->ptr, (const float *)score->ptr, N, K);
+    launch(idx_select, T, 256, 0, (int *)out->ptr, (const float *)score->ptr, N, K);
     return launched();
 }
 
@@ -2156,7 +2250,7 @@ extern "C" int ds4_gpu_qwen4_idx_expand_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
     using namespace qwen4_cuda;
     if (!T || !K || !ratio || (uint64_t)K * ratio + ratio - 1 > stride ||
         !tensor(out, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4) || !tensor(blocks, (uint64_t)T * K * 4)) return 0;
-    idx_expand<<<T, 256, 0, cuda_decode_stream()>>>((int *)out->ptr, (unsigned *)count->ptr,
+    launch(idx_expand, T, 256, 0, (int *)out->ptr, (unsigned *)count->ptr,
         (const int *)blocks->ptr, K, ratio, pos0, stride);
     return launched();
 }
@@ -2225,8 +2319,8 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_ten
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    router<<<T,256,0,cuda_decode_stream()>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
-        K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
+    launch(router, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+        K ? (const float *)x->ptr : nullptr, wg, K ? (float *)sg->ptr : nullptr, NE, NS, K, type);
     return launched();
 }
 
@@ -2272,9 +2366,9 @@ extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gp
         !tensor(weights,(uint64_t)T*NS*4) || (sg && !tensor(sg,(uint64_t)T*4)) ||
         (sh && !tensor(sh,(uint64_t)T*D*4)) ||
         (hc && (!tensor(R,(uint64_t)T*hc*D*4) || !tensor(inj,(uint64_t)T*hc*hc*8*4)))) return 0;
-    moe_reduce<<<dim3((D+255)/256,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
-        hc ? (float *)R->ptr : NULL, hc ? (const float *)inj->ptr : NULL, (const float *)part->ptr,
-        (const float *)weights->ptr, sg ? (const float *)sg->ptr : NULL, sh ? (const float *)sh->ptr : NULL,
+    launch(moe_reduce, dim3((D+255)/256,T), 256, 0, (float *)out->ptr,
+        hc ? (float *)R->ptr : nullptr, hc ? (const float *)inj->ptr : nullptr, (const float *)part->ptr,
+        (const float *)weights->ptr, sg ? (const float *)sg->ptr : nullptr, sh ? (const float *)sh->ptr : nullptr,
         NS,stride,D,hc);
     return launched();
 }
@@ -2284,7 +2378,7 @@ extern "C" int ds4_gpu_qwen4_moe_build_lists_tensor(ds4_gpu_tensor *lists, ds4_g
     using namespace qwen4_cuda;
     if (!T || !NS || NS > NE || !NE || NE > 512 || cap < T || (uint64_t)T*NS > INT_MAX ||
         !tensor(lists,(uint64_t)NE*cap*4) || !tensor(counts,(uint64_t)NE*4) || !tensor(sel,(uint64_t)T*NS*4)) return 0;
-    expert_lists<<<1,256,0,cuda_decode_stream()>>>((int *)lists->ptr,(int *)counts->ptr,(const int *)sel->ptr,T*NS,NE,cap);
+    launch(expert_lists, 1, 256, 0, (int *)lists->ptr,(int *)counts->ptr,(const int *)sel->ptr,T*NS,NE,cap);
     return launched();
 }
 
@@ -2330,8 +2424,8 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     const char *w = weight(map,size,co,C*CK*4);
     if (!w || !ds4_gpu_qwen4_dense_mm_tensor(ga,mixed,map,size,ao,type,T,K,Hv) ||
               !ds4_gpu_qwen4_dense_mm_tensor(gb,mixed,map,size,bo,type,T,K,Hv)) return 0;
-    conv<<<(C+255)/256,256,0,cuda_decode_stream()>>>((float *)qkv->ptr,(float *)state->ptr,(const float *)w,
-        T,C,CK,true,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2);
+    launch(conv, (C+255)/256, 256, 0, (float *)qkv->ptr,(float *)state->ptr,(const float *)w,
+        T,C,CK,true,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2);
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
 }
 
@@ -2357,7 +2451,7 @@ extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu
         !tensor(e,(uint64_t)E*4) || !tensor(R,(uint64_t)hc*E*4)) return 0;
     const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);
     if (!ge || !gh) return 0;
-    mtp_stage<<<hc+1,256,0,cuda_decode_stream()>>>((float *)cat->ptr,(const float *)e->ptr,
+    launch(mtp_stage, hc+1, 256, 0, (float *)cat->ptr,(const float *)e->ptr,
         (const float *)R->ptr,(const float *)ge,(const float *)gh,E,hc,eps);
     return launched();
 }
@@ -2366,7 +2460,7 @@ extern "C" int ds4_gpu_qwen4_mtp_combine_tensor(ds4_gpu_tensor *out, const ds4_g
         uint32_t E, uint32_t hc) {
     using namespace qwen4_cuda;
     if (!E || !hc || hc > 4 || !tensor(out,(uint64_t)hc*E*4) || !tensor(proj,(uint64_t)(hc+1)*E*4)) return 0;
-    mtp_combine<<<((uint64_t)E*hc+255)/256,256,0,cuda_decode_stream()>>>((float *)out->ptr,(const float *)proj->ptr,E,hc);
+    launch(mtp_combine, ((uint64_t)E*hc+255)/256, 256, 0, (float *)out->ptr,(const float *)proj->ptr,E,hc);
     return launched();
 }
 
@@ -2375,8 +2469,8 @@ extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *
     using namespace qwen4_cuda;
     const uint64_t blocks = ((uint64_t)N+4095)/4096;
     if (!N || !tensor(out,4) || !tensor(logits,(uint64_t)N*4) || !tensor(scratch,blocks*sizeof(max_pair))) return 0;
-    argmax<false><<<blocks,256,0,cuda_decode_stream()>>>((int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N);
-    argmax<true><<<1,256,0,cuda_decode_stream()>>>((int *)out->ptr,(max_pair *)scratch->ptr,NULL,blocks);
+    launch(argmax<false>, blocks, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N);
+    launch(argmax<true>, 1, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks);
     return launched();
 }
 
@@ -2411,15 +2505,15 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     auto norm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t wo, uint64_t bo) {
         const float *wgt = wf(wo,E), *bias = wf(bo,E);
         if (!wgt || !bias) return 0;
-        vis_norm<<<N,256,0,cuda_decode_stream()>>>(ptr(dst),(const float *)src->ptr,wgt,bias,E,w->eps);
+        launch(vis_norm, N, 256, 0, ptr(dst),(const float *)src->ptr,wgt,bias,E,w->eps);
         return launched();
     };
     auto add = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bo, unsigned rows,
                    unsigned width, unsigned mode) {
         const float *bias = wf(bo,width);
         if (!bias) return 0;
-        vis_add<<<((uint64_t)rows*width+255)/256,256,0,cuda_decode_stream()>>>(ptr(dst),
-            src ? (const float *)src->ptr : NULL,bias,rows,width,mode);
+        launch(vis_add, ((uint64_t)rows*width+255)/256, 256, 0, ptr(dst),
+            src ? (const float *)src->ptr : nullptr,bias,rows,width,mode);
         return launched();
     };
     do {
@@ -2430,15 +2524,15 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
         ok = mm(a0,patch,w->patch_w0,w->patch_type,N,IP,E) && mm(a1,patch,w->patch_w1,w->patch_type,N,IP,E);
         const float *pb = wf(w->patch_b,E);
         if (!ok || !pb) { ok = false; break; }
-        vis_patch<<<((uint64_t)N*E+255)/256,256,0,cuda_decode_stream()>>>(ptr(x),ptr(a0),ptr(a1),pb,ptr(pos),N,E);
+        launch(vis_patch, ((uint64_t)N*E+255)/256, 256, 0, ptr(x),ptr(a0),ptr(a1),pb,ptr(pos),N,E);
         ok = launched();
         for (unsigned l = 0; ok && l < DS4_QWEN4_VISION_LAYERS; l++) {
             const auto &lw = w->layer[l];
             ok = norm(tmp,x,lw.ln1_w,lw.ln1_b) && mm(qkv,tmp,lw.qkv_w,lw.qkv_type,N,E,3*E);
             const float *qb = wf(lw.qkv_b,3*E);
             if (!ok || !qb) { ok = false; break; }
-            vis_qkv<<<N,256,0,cuda_decode_stream()>>>(ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
-            vis_attention<<<dim3(N,H),32,0,cuda_decode_stream()>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
+            launch(vis_qkv, N, 256, 0, ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
+            launch(vis_attention, dim3(N,H), 32, 0, ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
             ok = launched() && mm(tmp,attn,lw.out_w,lw.out_type,N,E,E) && add(x,tmp,lw.out_b,N,E,2) &&
                  norm(tmp,x,lw.ln2_w,lw.ln2_b) && mm(ffn,tmp,lw.up_w,lw.up_type,N,E,FF) &&
                  add(ffn,NULL,lw.up_b,N,FF,0) && mm(tmp,ffn,lw.down_w,lw.down_type,N,FF,E) &&
@@ -2467,25 +2561,25 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
         !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
         ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
-        attention_group<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
+        launch(attention_group, dim3(Hkv,T), 256, 0, (float *)out->ptr,
             (const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
-            sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,
+            sparse ? (const int *)sel->ptr : nullptr,sparse ? (const unsigned *)count->ptr : nullptr,
             H,Hkv,pos0,stride,sparse,scale);
         return launched();
     }
     const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
     if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
     const dim3 grid((H + 3) / 4, T, splits);
-#define QWEN_ATTN(DIM) attention<DIM><<<grid, 128, 0, cuda_decode_stream()>>>((float *)out->ptr, \
-        partial ? (float *)partial->ptr : NULL, (const float *)q->ptr, (const float *)gate->ptr, \
-        (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : NULL, \
-        sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
+#define QWEN_ATTN(DIM) launch(attention<DIM>, grid, 128, 0, (float *)out->ptr, \
+        partial ? (float *)partial->ptr : nullptr, (const float *)q->ptr, (const float *)gate->ptr, \
+        (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : nullptr, \
+        sparse ? (const unsigned *)count->ptr : nullptr, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
     if (D == 32) { QWEN_ATTN(32); }
     else if (D == 128) { QWEN_ATTN(128); }
     else { QWEN_ATTN(256); }
 #undef QWEN_ATTN
     if (!launched()) return 0;
-    if (splits > 1) attn_merge<<<dim3(H, T), D, 0, cuda_decode_stream()>>>((float *)out->ptr,
+    if (splits > 1) launch(attn_merge, dim3(H, T), D, 0, (float *)out->ptr,
         (const float *)partial->ptr, (const float *)gate->ptr, H, D, splits);
     return launched();
 }
