@@ -59856,7 +59856,21 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
+#ifdef DS4_HAS_QWEN4_METAL
     if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+#else
+    /* Project each token's hc + 1 rows on its own: T * (hc + 1) rows would
+     * leave the row-batched GEMV for the tiled GEMM, about 0.5 ms for three
+     * tokens on an RTX PRO 6000, and a caught-up draft now rounds exactly
+     * like a single-token step. */
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *proj_rows = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
+        ds4_gpu_tensor *cat_rows = ds4_gpu_tensor_view(g->mtp_cat, t * cat_bytes, cat_bytes);
+        ok = proj_rows && cat_rows && qwen4_gemv(proj_rows, m, l->nextn_eh_proj, cat_rows, hc + 1u);
+        ds4_gpu_tensor_free(cat_rows);
+        ds4_gpu_tensor_free(proj_rows);
+    }
+#endif
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
