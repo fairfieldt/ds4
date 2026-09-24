@@ -758,11 +758,189 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     if (!(threadIdx.x & 31)) out[pair * M + row] = DOWN ? a : silu(a) * b;
 }
 
+/* Decode MoE for the Qwen packs (Q4_K gate/up, MXFP4 down, Q8_0 shared
+ * expert), laid out for bandwidth. moe_mv decodes four elements per step
+ * and re-derives the Q4_K block scales every time, which costs about fifteen
+ * instructions per weight and keeps it near 60% of DRAM bandwidth. Here
+ * each lane takes eight elements of a Q4_K superblock sharing two scale
+ * groups, and the MXFP4 rows (17-byte blocks) are staged in shared memory
+ * and decoded through a 16-entry table. Every weight decodes to the same
+ * value; the sums are taken in a different order. One kernel serves every
+ * row count, so MTP verify rows keep matching single-token decode. */
+__device__ __forceinline__ void moe_q8_row(float &a, float &b, const char *r0, const char *r1,
+        const float *xt, unsigned K, bool two) {
+    #pragma unroll 4
+    for (unsigned i = (threadIdx.x & 31) * 4; i < K; i += 128) {
+        const float4 v = *(const float4 *)(xt + i);
+        const char *q0 = r0 + (i / 32) * 34;
+        const uint16_t *p0 = (const uint16_t *)(q0 + 2 + i % 32);
+        float p = (float)(int8_t)p0[0] * v.x;
+        p += (float)(int8_t)(p0[0] >> 8) * v.y;
+        p += (float)(int8_t)p0[1] * v.z;
+        p += (float)(int8_t)(p0[1] >> 8) * v.w;
+        a += p * __half2float(*(const __half *)q0);
+        if (two) {
+            const char *q1 = r1 + (i / 32) * 34;
+            const uint16_t *p1 = (const uint16_t *)(q1 + 2 + i % 32);
+            p = (float)(int8_t)p1[0] * v.x;
+            p += (float)(int8_t)(p1[0] >> 8) * v.y;
+            p += (float)(int8_t)p1[1] * v.z;
+            p += (float)(int8_t)(p1[1] >> 8) * v.w;
+            b += p * __half2float(*(const __half *)q1);
+        }
+    }
+}
+
+/* Scales and mins of Q4_K groups 2c and 2c + 1 from the 16-byte header
+ * (d, dmin, scales[12]); the same values value<12> derives. */
+__device__ __forceinline__ void q4k_group_pair(const uint4 h, unsigned c,
+        float &s0, float &o0, float &s1, float &o1) {
+    const float d = dev_f16_to_f32((uint16_t)(h.x & 0xffff)), dm = dev_f16_to_f32((uint16_t)(h.x >> 16));
+    unsigned sc0, mn0, sc1, mn1;
+    if (c < 2) {
+        const unsigned lo = h.y >> (16 * c), hi = h.z >> (16 * c);
+        sc0 = lo & 63; sc1 = (lo >> 8) & 63; mn0 = hi & 63; mn1 = (hi >> 8) & 63;
+    } else {
+        const unsigned e = h.w >> (16 * (c - 2)), lo = h.y >> (16 * (c - 2)), hi = h.z >> (16 * (c - 2));
+        sc0 = (e & 15) | (((lo >> 6) & 3) << 4);
+        mn0 = ((e >> 4) & 15) | (((hi >> 6) & 3) << 4);
+        sc1 = ((e >> 8) & 15) | (((lo >> 14) & 3) << 4);
+        mn1 = ((e >> 12) & 15) | (((hi >> 14) & 3) << 4);
+    }
+    s0 = d * sc0; o0 = dm * mn0; s1 = d * sc1; o1 = dm * mn1;
+}
+
+__device__ __forceinline__ float q4k_dot8(unsigned q, float s0, float o0, float s1, float o1, float4 x0, float4 x1) {
+    float a = (s0 * (q & 15) - o0) * x0.x;
+    a += (s0 * ((q >> 8) & 15) - o0) * x0.y;
+    a += (s0 * ((q >> 16) & 15) - o0) * x0.z;
+    a += (s0 * ((q >> 24) & 15) - o0) * x0.w;
+    a += (s1 * ((q >> 4) & 15) - o1) * x1.x;
+    a += (s1 * ((q >> 12) & 15) - o1) * x1.y;
+    a += (s1 * ((q >> 20) & 15) - o1) * x1.z;
+    a += (s1 * (q >> 28) - o1) * x1.w;
+    return a;
+}
+
+__global__ void moe_gate_up_q4k(float *out, const float *x, const int *selected,
+        const char *w0, const char *w1, const char *sh0, const char *sh1,
+        unsigned NE, unsigned NS, unsigned stride, unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+    pdl_enter();
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const uint64_t pair = (uint64_t)t * stride + slot;
+    const float *xt = x + (uint64_t)t * K;
+    float a = 0, b = 0;
+    if (slot == NS) {
+        moe_q8_row(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, true);
+    } else {
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const uint64_t off = ((uint64_t)e * M + row) * rb;
+            const cuda_block_q4_K *g = (const cuda_block_q4_K *)(w0 + off), *u = (const cuda_block_q4_K *)(w1 + off);
+            const unsigned c = lane / 8, q4 = (lane % 8) * 4;
+            #pragma unroll 2
+            for (unsigned sb = 0; sb < K / 256; sb++) {
+                const unsigned qg = *(const unsigned *)(g[sb].qs + c * 32 + q4);
+                const unsigned qu = *(const unsigned *)(u[sb].qs + c * 32 + q4);
+                const uint4 hg = *(const uint4 *)(g + sb), hu = *(const uint4 *)(u + sb);
+                const float *xs = xt + sb * 256 + c * 64 + q4;
+                const float4 x0 = *(const float4 *)xs, x1 = *(const float4 *)(xs + 32);
+                float s0, o0, s1, o1;
+                q4k_group_pair(hg, c, s0, o0, s1, o1);
+                a += q4k_dot8(qg, s0, o0, s1, o1, x0, x1);
+                q4k_group_pair(hu, c, s0, o0, s1, o1);
+                b += q4k_dot8(qu, s0, o0, s1, o1, x0, x1);
+            }
+        }
+    }
+    a = sum(a); b = sum(b);
+    if (!lane) out[pair * M + row] = silu(a) * b;
+}
+
+/* Two rows per warp: an MXFP4 down row is only 340 bytes. */
+__global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
+        const char *w0, const char *sh0, unsigned NE, unsigned NS, unsigned stride,
+        unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+    pdl_enter();
+    extern __shared__ __align__(16) unsigned moe_stage[];
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) {
+        const unsigned mag = threadIdx.x & 7;
+        const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+        lut[threadIdx.x] = threadIdx.x & 8 ? -level : level;
+    }
+    __syncthreads();
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, rw = (unsigned)(rb / 4);
+    const unsigned row0 = (blockIdx.x * 4 + warp) * 2, slot = blockIdx.y, t = blockIdx.z;
+    if (row0 >= M) return;
+    const unsigned rows = min(2u, M - row0);
+    const uint64_t pair = (uint64_t)t * stride + slot;
+    const float *xt = x + pair * K;
+    float acc[2] = {};
+    if (slot == NS) {
+        float unused = 0;
+        for (unsigned r = 0; r < rows; r++) moe_q8_row(acc[r], unused, sh0 + (row0 + r) * srb, NULL, xt, K, false);
+    } else {
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const unsigned *src = (const unsigned *)(w0 + ((uint64_t)e * M + row0) * rb);
+            unsigned *stage = moe_stage + warp * (2 * rw + 1);
+            const unsigned words = rows * rw;
+            for (unsigned k0 = 0; k0 < words; k0 += 128) {
+                unsigned r[4];
+                #pragma unroll
+                for (unsigned k = 0; k < 4; k++) if (k0 + lane + 32 * k < words) r[k] = src[k0 + lane + 32 * k];
+                #pragma unroll
+                for (unsigned k = 0; k < 4; k++) if (k0 + lane + 32 * k < words) stage[k0 + lane + 32 * k] = r[k];
+            }
+            __syncwarp();
+            const unsigned sub = lane % 4;
+            for (unsigned blk = lane / 4; blk < K / 32; blk += 8) {
+                const float *xs = xt + blk * 32 + 4 * sub;
+                const float4 x0 = *(const float4 *)xs, x1 = *(const float4 *)(xs + 16);
+                for (unsigned r = 0; r < rows; r++) {
+                    const unsigned *sw = stage + r * rw, at = blk * 17 + 1 + 4 * sub;
+                    const unsigned q = __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
+                    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
+                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+                    float p = lut[q & 15] * x0.x;
+                    p += lut[(q >> 8) & 15] * x0.y;
+                    p += lut[(q >> 16) & 15] * x0.z;
+                    p += lut[(q >> 24) & 15] * x0.w;
+                    p += lut[(q >> 4) & 15] * x1.x;
+                    p += lut[(q >> 12) & 15] * x1.y;
+                    p += lut[(q >> 20) & 15] * x1.z;
+                    p += lut[q >> 28] * x1.w;
+                    acc[r] += p * scale;
+                }
+            }
+        }
+    }
+    for (unsigned r = 0; r < rows; r++) {
+        const float v = sum(acc[r]);
+        if (!lane) out[pair * M + row0 + r] = v;
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
+    const unsigned stride = NS + (st != UINT_MAX);
+    const bool xa = !((uintptr_t)x & 15), sha = st == UINT_MAX || (st == 8 && !(K % 128) && !((uintptr_t)s0 & 1) && !(srb & 1));
+    if (xa && sha && !down && type == 12 && !(K % 256) && !(rb & 15) &&
+        !((uintptr_t)w0 & 15) && !((uintptr_t)w1 & 15)) {
+        launch(moe_gate_up_q4k, grid, 128, 0, out, x, sel, w0, w1, s0, s1, NE, NS, stride, K, M, rb, srb);
+        return launched();
+    }
+    if (xa && sha && down && type == 39 && !(K % 32) && !(rb & 3) && rb <= 4096 &&
+        !((uintptr_t)w0 & 3)) {
+        const dim3 g2((M + 7) / 8, grid.y, T);
+        launch(moe_down_mxfp4, g2, 128, (size_t)4 * (2 * (rb / 4) + 1) * 4, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        return launched();
+    }
 #define QWEN_MOE_SH(TYPE, SH) \
     if (down) launch(moe_mv<TYPE, true, SH>, grid, 128, 0, out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
     else launch(moe_mv<TYPE, false, SH>, grid, 128, 0, out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb)
