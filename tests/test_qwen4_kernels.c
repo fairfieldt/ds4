@@ -1378,8 +1378,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
-#ifdef __APPLE__
-/* Native cross-session row kernels are Metal-only; CUDA uses ordered rows. */
+/* Cross-session row dispatch must preserve each session's private state. */
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1553,8 +1552,6 @@ static void test_attention_rows(arena_t *a) {
     free(ik); free(iq); free(vp); free(kp); free(qg);
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
-
-#endif
 
 /* ---- routed experts ---- */
 
@@ -3673,9 +3670,7 @@ int main(void) {
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
-#ifdef __APPLE__
     test_attention_rows(&arena);
-#endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
