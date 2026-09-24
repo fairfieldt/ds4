@@ -1518,6 +1518,109 @@ __global__ void matvec_split(float *out, const char *w, const float *x,
     }
 }
 
+/* Decode batches of 4..32 rows (several sessions, or sessions with drafts)
+ * make the per-row Q8 GEMV issue-bound: each weight feeds up to 32 FP32
+ * FMAs and as many activation loads.  Run them on tensor cores instead:
+ * int8 weights are exact in FP16, and each activation is split into an
+ * FP16 high and low part, so the two products keep about 22 bits of it; the
+ * FP32 accumulator takes the Q8 block scale per 32-wide block, as the GEMV
+ * does.  Inside a block, lane q of each quad owns elements 8q..8q+7 for
+ * both operands (the same permutation of k on both sides), so activations
+ * load as one 16-byte vector.  MTP verify rows (T <= 3) keep the GEMV and
+ * with it their match with single-token decode. */
+__global__ void split_rows_f16(__half *hi, __half *lo, const float *x, unsigned T, unsigned Tp, unsigned K) {
+    pdl_enter();
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)Tp * K) return;
+    const float v = i / K < T ? x[i] : 0.f;
+    const __half h = __float2half_rn(v);
+    hi[i] = h;
+    lo[i] = __float2half_rn(v - __half2float(h));
+}
+
+__device__ __forceinline__ unsigned i8x2_to_h2(unsigned u16) {
+    /* two int8 as (b + 128) in the mantissa of 1024, minus 1152: exact */
+    const unsigned u = u16 ^ 0x8080u;
+    const unsigned bits = 0x64006400u | (u & 0xffu) | ((u & 0xff00u) << 8);
+    __half2 h = *(const __half2 *)&bits;
+    h = __hsub2(h, __float2half2_rn(1152.f));
+    return *(unsigned *)&h;
+}
+
+__device__ __forceinline__ void mma_f16_16816(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                              unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+/* One block per 16 weight rows; its 16 warps split K; NT tiles of 8 rows. */
+template<unsigned NT>
+__global__ void q8_rows_tc(float *out, const char *w, const __half *xh, const __half *xl,
+                           unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
+    enum { SPLIT = 16 };
+    __shared__ float red[SPLIT][NT][32][4];
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, m0 = blockIdx.x * 16;
+    const unsigned g = lane / 4, q8 = 8 * (lane % 4);
+    const unsigned r0 = min(m0 + g, M - 1), r1 = min(m0 + g + 8, M - 1);
+    const char *w0 = w + (uint64_t)r0 * stride, *w1 = w + (uint64_t)r1 * stride;
+    const unsigned nb = K / 32, b0 = nb * warp / SPLIT, b1 = nb * (warp + 1) / SPLIT;
+    float acc[NT][4] = {};
+    #pragma unroll 4
+    for (unsigned b = b0; b < b1; b++) {
+        const char *blk0 = w0 + b * 34, *blk1 = w1 + b * 34;
+        const uint16_t *p0 = (const uint16_t *)(blk0 + 2 + q8), *p1 = (const uint16_t *)(blk1 + 2 + q8);
+        const float s0 = __half2float(*(const __half *)blk0), s1 = __half2float(*(const __half *)blk1);
+        const unsigned a00 = i8x2_to_h2(p0[0]), a01 = i8x2_to_h2(p1[0]), a02 = i8x2_to_h2(p0[1]), a03 = i8x2_to_h2(p1[1]);
+        const unsigned a10 = i8x2_to_h2(p0[2]), a11 = i8x2_to_h2(p1[2]), a12 = i8x2_to_h2(p0[3]), a13 = i8x2_to_h2(p1[3]);
+        #pragma unroll
+        for (unsigned n = 0; n < NT; n++) {
+            const uint64_t xo = (uint64_t)(n * 8 + g) * K + b * 32 + q8;
+            const uint4 h = *(const uint4 *)(xh + xo), l = *(const uint4 *)(xl + xo);
+            float t[4] = {0, 0, 0, 0};
+            mma_f16_16816(t, a00, a01, a02, a03, h.x, h.y);
+            mma_f16_16816(t, a10, a11, a12, a13, h.z, h.w);
+            mma_f16_16816(t, a00, a01, a02, a03, l.x, l.y);
+            mma_f16_16816(t, a10, a11, a12, a13, l.z, l.w);
+            acc[n][0] += t[0] * s0; acc[n][1] += t[1] * s0;
+            acc[n][2] += t[2] * s1; acc[n][3] += t[3] * s1;
+        }
+    }
+    #pragma unroll
+    for (unsigned n = 0; n < NT; n++)
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) red[warp][n][lane][k] = acc[n][k];
+    __syncthreads();
+    for (unsigned idx = threadIdx.x; idx < NT * 128; idx += blockDim.x) {
+        const unsigned n = idx / 128, l = (idx / 4) % 32, k = idx % 4;
+        float v = 0;
+        #pragma unroll
+        for (unsigned sp = 0; sp < SPLIT; sp++) v += red[sp][n][l][k];
+        const unsigned row = m0 + l / 4 + (k >= 2 ? 8 : 0), tok = n * 8 + 2 * (l % 4) + (k & 1);
+        if (row < M && tok < T) out[(uint64_t)tok * M + row] = v;
+    }
+}
+
+static int q8_rows_tc_dispatch(float *out, const char *w, const float *x, unsigned T, unsigned K, unsigned M) {
+    const unsigned Tp = (T + 7) / 8 * 8;
+    __half *xh = (__half *)cuda_tmp_alloc((uint64_t)Tp * K * 4, "Qwen rows f16 activations");
+    if (!xh) return 0;
+    __half *xl = xh + (uint64_t)Tp * K;
+    launch(split_rows_f16, (unsigned)(((uint64_t)Tp * K + 255) / 256), 256, 0, xh, xl, x, T, Tp, K);
+    const unsigned blocks = (M + 15) / 16;
+    const uint64_t stride = row_bytes(8, K);
+    switch (Tp / 8) {
+    case 1: launch(q8_rows_tc<1>, blocks, 512, 0, out, w, xh, xl, T, K, M, stride); break;
+    case 2: launch(q8_rows_tc<2>, blocks, 512, 0, out, w, xh, xl, T, K, M, stride); break;
+    case 3: launch(q8_rows_tc<3>, blocks, 512, 0, out, w, xh, xl, T, K, M, stride); break;
+    default: launch(q8_rows_tc<4>, blocks, 512, 0, out, w, xh, xl, T, K, M, stride); break;
+    }
+    return launched();
+}
+
 static int matvec_dispatch(float *out, const char *w, const float *x,
                            unsigned type, unsigned T, unsigned K, unsigned M) {
     const dim3 grid((M + 3) / 4, T);
@@ -2445,6 +2548,10 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
+    /* the output head (248K rows) streams best through the GEMV up to 8 rows */
+    if (type == 8 && T >= 4 && T <= 32 && !(K % 32) && (M < 65536 || T > 8) && !((uintptr_t)x->ptr & 15) &&
+        ds4_cuda_attn_tokentile_arch_ok())
+        return q8_rows_tc_dispatch((float *)out->ptr, w, (const float *)x->ptr, T, K, M);
     if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
     /* Decode batches of 9..31 rows (sessions, or sessions with drafts): the
      * row-batched GEMV in chunks of eight still reads the weights T / 8
