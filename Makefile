@@ -739,6 +739,15 @@ tests/test_qwen4_cuda: tests/test_qwen4_cuda.o ds4_cuda.o ds4_image.o $(MMQ_OBJS
 .PHONY: test-qwen4-cuda
 test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
+
+speed-bench/session_concurrency_bench.o: speed-bench/session_concurrency_bench.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/session_concurrency_bench: speed-bench/session_concurrency_bench.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: session-concurrency-bench
+session-concurrency-bench: speed-bench/session_concurrency_bench
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_copy.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
