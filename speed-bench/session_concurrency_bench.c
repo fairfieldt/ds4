@@ -1067,7 +1067,11 @@ int main(int argc, char **argv) {
                           (int)decode_budget * (cfg.spec ? 2 : 1) + CTX_MARGIN;
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
         .context_size = max_alloc,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,
