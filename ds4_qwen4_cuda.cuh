@@ -2141,7 +2141,7 @@ __global__ void mtp_combine(float *out, const float *proj, unsigned E, unsigned 
 
 struct max_pair { float value; int index; };
 template<bool FINISH>
-__global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigned n) {
+__global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigned n, int *host_out) {
     pdl_enter();
     out += blockIdx.y;
     scratch += (uint64_t)blockIdx.y*(FINISH ? n : (n+4095)/4096);
@@ -2163,7 +2163,13 @@ __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigne
         }
         __syncthreads();
     }
-    if (!tid) { if (FINISH) *out = best[0].index; else scratch[blockIdx.x] = best[0]; }
+    if (!tid) {
+        if (!FINISH) scratch[blockIdx.x] = best[0];
+        else {
+            *out = best[0].index;
+            if (host_out) host_out[blockIdx.y] = best[0].index;
+        }
+    }
 }
 
 __global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
@@ -3267,25 +3273,37 @@ extern "C" int ds4_gpu_qwen4_mtp_combine_tensor(ds4_gpu_tensor *out, const ds4_g
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
-        const ds4_gpu_tensor *logits, uint32_t N) {
+extern "C" int ds4_gpu_qwen4_argmax_host_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, int32_t *host_out) {
     using namespace qwen4_cuda;
     const uint64_t blocks = ((uint64_t)N+4095)/4096;
     if (!N || !tensor(out,4) || !tensor(logits,(uint64_t)N*4) || !tensor(scratch,blocks*sizeof(max_pair))) return 0;
-    launch(argmax<false>, blocks, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N);
-    launch(argmax<true>, 1, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks);
+    launch(argmax<false>, blocks, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N,
+           (int *)nullptr);
+    launch(argmax<true>, 1, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks,(int *)host_out);
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_argmax_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
-        const ds4_gpu_tensor *logits, uint32_t N, uint32_t T) {
+extern "C" int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, uint32_t T, int32_t *host_out) {
     using namespace qwen4_cuda;
     const uint64_t blocks = ((uint64_t)N+4095)/4096;
     if (!N || !T || T > 65535 || !tensor(out,(uint64_t)T*4) || !tensor(logits,(uint64_t)T*N*4) ||
         !tensor(scratch,(uint64_t)T*blocks*sizeof(max_pair))) return 0;
-    launch(argmax<false>,dim3(blocks,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N);
-    launch(argmax<true>,dim3(1,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks);
+    launch(argmax<false>,dim3(blocks,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N,
+           (int *)nullptr);
+    launch(argmax<true>,dim3(1,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks,(int *)host_out);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N) {
+    return ds4_gpu_qwen4_argmax_host_tensor(out, scratch, logits, N, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4_argmax_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, uint32_t T) {
+    return ds4_gpu_qwen4_argmax_rows_host_tensor(out, scratch, logits, N, T, NULL);
 }
 
 extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed,
