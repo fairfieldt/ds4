@@ -1,0 +1,169 @@
+stage,image,detail,before_ms,after_ms,output_identical
+decode,maple.png,640x480,5.50,3.58,yes
+decode,orbit.png,640x480,5.45,3.54,yes
+decode,diagram.png,1200x700,14.92,8.09,yes
+decode,screenshot.png,1400x900,22.49,12.39,yes
+decode,spatial.png,1000x800,13.57,7.14,yes
+decode,text.png,1000x800,14.00,7.51,yes
+decode,earth.jpg,512x507,5.85,5.84,yes
+decode,prog_ac_refine_zrl_420.jpg,64x48,0.08,0.08,yes
+decode,prog_ac_refine_zrl_gray.jpg,24x16,0.01,0.01,yes
+decode,big12mp.jpg,4000x3000,253.93,251.13,yes
+decode,big3mp.jpg,2048x1536,65.44,65.11,yes
+decode,earth1024.png,1024x1024,46.02,31.48,yes
+decode,earth256.png,256x256,2.67,1.67,yes
+decode,earth512.png,512x512,10.96,7.11,yes
+decode,flat.png,2000x1500,52.20,34.38,yes
+decode,gray.png,1024x768,8.75,7.04,yes
+decode,la.png,1024x768,11.62,8.36,yes
+decode,pal.png,1024x768,8.86,7.12,yes
+decode,rgb_l0.png,1024x768,21.04,10.41,yes
+decode,rgb_l1.png,1024x768,12.49,7.47,yes
+decode,rgb_l6.png,1024x768,14.74,9.74,yes
+decode,rgb_l9.png,1024x768,14.63,9.65,yes
+decode,rgba.png,1024x768,17.64,11.14,yes
+decode,tiny.png,33x17,0.01,0.01,yes
+preprocess,maple.png,qwen 64-64 18x12,6.55,2.27,yes
+preprocess,maple.png,qwen 256-256 36x26,8.44,2.49,yes
+preprocess,maple.png,qwen 64-1024 40x30,0.61,0.61,yes
+preprocess,maple.png,qwen 1024-1024 74x56,29.64,4.20,yes
+preprocess,maple.png,qwen 4096-4096 148x112,119.19,18.55,yes
+preprocess,maple.png,glm 46x36,1.27,1.25,yes
+preprocess,orbit.png,qwen 64-64 18x12,6.38,2.13,yes
+preprocess,orbit.png,qwen 256-256 36x26,7.92,2.13,yes
+preprocess,orbit.png,qwen 64-1024 40x30,0.20,0.17,yes
+preprocess,orbit.png,qwen 1024-1024 74x56,30.63,3.80,yes
+preprocess,orbit.png,qwen 4096-4096 148x112,122.49,16.84,yes
+preprocess,orbit.png,glm 46x36,1.21,0.95,yes
+preprocess,diagram.png,qwen 64-64 20x12,18.75,2.40,yes
+preprocess,diagram.png,qwen 256-256 40x24,18.21,2.02,yes
+preprocess,diagram.png,qwen 64-1024 76x44,23.90,2.98,yes
+preprocess,diagram.png,qwen 1024-1024 84x50,29.42,3.42,yes
+preprocess,diagram.png,qwen 4096-4096 168x98,120.39,17.92,yes
+preprocess,diagram.png,glm 86x50,2.24,1.90,yes
+preprocess,screenshot.png,qwen 64-64 18x12,26.97,2.88,yes
+preprocess,screenshot.png,qwen 256-256 38x24,27.15,2.78,yes
+preprocess,screenshot.png,qwen 64-1024 78x50,32.34,3.36,yes
+preprocess,screenshot.png,qwen 1024-1024 78x50,32.95,2.87,yes
+preprocess,screenshot.png,qwen 4096-4096 160x104,121.07,18.32,yes
+preprocess,screenshot.png,glm 100x66,3.42,3.29,yes
+preprocess,spatial.png,qwen 64-64 16x14,18.11,2.39,yes
+preprocess,spatial.png,qwen 256-256 34x28,18.07,2.43,yes
+preprocess,spatial.png,qwen 64-1024 62x50,21.49,2.59,yes
+preprocess,spatial.png,qwen 1024-1024 72x58,28.41,2.81,yes
+preprocess,spatial.png,qwen 4096-4096 144x116,123.67,20.95,NO
+preprocess,spatial.png,glm 72x58,1.48,1.48,yes
+preprocess,text.png,qwen 64-64 16x14,17.88,2.32,yes
+preprocess,text.png,qwen 256-256 34x28,17.09,2.14,yes
+preprocess,text.png,qwen 64-1024 62x50,20.97,2.55,yes
+preprocess,text.png,qwen 1024-1024 72x58,29.89,3.49,yes
+preprocess,text.png,qwen 4096-4096 144x116,122.96,18.96,yes
+preprocess,text.png,glm 72x58,1.42,1.42,yes
+preprocess,earth.jpg,qwen 64-64 16x14,5.31,1.88,yes
+preprocess,earth.jpg,qwen 256-256 32x32,6.60,1.71,yes
+preprocess,earth.jpg,qwen 64-1024 32x32,6.57,1.68,yes
+preprocess,earth.jpg,qwen 1024-1024 66x64,28.54,2.94,yes
+preprocess,earth.jpg,qwen 4096-4096 130x128,118.97,17.77,yes
+preprocess,earth.jpg,glm 38x38,0.45,0.55,yes
+preprocess,prog_ac_refine_zrl_420.jpg,qwen 64-64 20x14,1.82,1.36,yes
+preprocess,prog_ac_refine_zrl_420.jpg,qwen 256-256 38x28,6.92,1.79,yes
+preprocess,prog_ac_refine_zrl_420.jpg,qwen 64-1024 20x14,1.79,1.37,yes
+preprocess,prog_ac_refine_zrl_420.jpg,qwen 1024-1024 74x56,27.12,2.79,yes
+preprocess,prog_ac_refine_zrl_420.jpg,qwen 4096-4096 148x112,116.43,15.59,yes
+preprocess,prog_ac_refine_zrl_420.jpg,glm 10x8,0.40,0.33,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,qwen 64-64 20x14,1.76,1.30,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,qwen 256-256 40x28,7.00,1.61,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,qwen 64-1024 20x14,1.75,1.30,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,qwen 1024-1024 80x54,27.18,3.10,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,qwen 4096-4096 158x106,111.53,17.26,yes
+preprocess,prog_ac_refine_zrl_gray.jpg,glm 10x8,0.33,0.29,yes
+preprocess,big12mp.jpg,qwen 64-64 18x12,222.48,15.89,yes
+preprocess,big12mp.jpg,qwen 256-256 36x26,240.00,14.62,yes
+preprocess,big12mp.jpg,qwen 64-1024 72x54,243.40,17.52,yes
+preprocess,big12mp.jpg,qwen 1024-1024 72x54,243.10,16.90,yes
+preprocess,big12mp.jpg,qwen 4096-4096 146x110,269.00,21.82,yes
+preprocess,big12mp.jpg,glm 206x154,292.74,32.69,yes
+preprocess,big3mp.jpg,qwen 64-64 18x12,63.07,3.70,yes
+preprocess,big3mp.jpg,qwen 256-256 36x26,67.30,5.28,yes
+preprocess,big3mp.jpg,qwen 64-1024 72x54,68.74,5.80,yes
+preprocess,big3mp.jpg,qwen 1024-1024 72x54,68.34,5.46,yes
+preprocess,big3mp.jpg,qwen 4096-4096 148x112,118.95,17.86,NO
+preprocess,big3mp.jpg,glm 148x110,10.25,9.96,yes
+preprocess,earth1024.png,qwen 64-64 16x16,23.31,2.40,yes
+preprocess,earth1024.png,qwen 256-256 32x32,22.51,2.76,yes
+preprocess,earth1024.png,qwen 64-1024 64x64,0.97,1.30,yes
+preprocess,earth1024.png,qwen 1024-1024 64x64,1.08,0.77,yes
+preprocess,earth1024.png,qwen 4096-4096 128x128,121.36,20.82,yes
+preprocess,earth1024.png,glm 74x74,2.37,2.86,yes
+preprocess,earth256.png,qwen 64-64 16x16,0.05,0.06,yes
+preprocess,earth256.png,qwen 256-256 32x32,6.87,1.78,yes
+preprocess,earth256.png,qwen 64-1024 16x16,0.04,0.04,yes
+preprocess,earth256.png,qwen 1024-1024 64x64,27.80,3.40,yes
+preprocess,earth256.png,qwen 4096-4096 128x128,120.42,17.32,yes
+preprocess,earth256.png,glm 20x20,0.14,0.13,yes
+preprocess,earth512.png,qwen 64-64 16x16,5.56,2.10,yes
+preprocess,earth512.png,qwen 256-256 32x32,0.21,0.23,yes
+preprocess,earth512.png,qwen 64-1024 32x32,0.17,0.17,yes
+preprocess,earth512.png,qwen 1024-1024 64x64,29.00,3.34,yes
+preprocess,earth512.png,qwen 4096-4096 128x128,123.52,16.38,yes
+preprocess,earth512.png,glm 38x38,0.47,0.34,yes
+preprocess,flat.png,qwen 64-64 18x12,60.50,3.60,yes
+preprocess,flat.png,qwen 256-256 36x26,60.79,3.33,yes
+preprocess,flat.png,qwen 64-1024 72x54,65.07,5.51,yes
+preprocess,flat.png,qwen 1024-1024 72x54,65.10,5.85,yes
+preprocess,flat.png,qwen 4096-4096 148x112,119.94,15.63,yes
+preprocess,flat.png,glm 144x108,10.14,9.69,yes
+preprocess,gray.png,qwen 64-64 18x12,16.66,2.53,yes
+preprocess,gray.png,qwen 256-256 36x26,17.26,3.39,yes
+preprocess,gray.png,qwen 64-1024 64x48,0.74,0.70,yes
+preprocess,gray.png,qwen 1024-1024 74x56,28.53,2.84,yes
+preprocess,gray.png,qwen 4096-4096 148x112,120.43,17.53,yes
+preprocess,gray.png,glm 74x56,1.99,1.39,yes
+preprocess,la.png,qwen 64-64 18x12,16.17,2.24,yes
+preprocess,la.png,qwen 256-256 36x26,16.92,2.20,yes
+preprocess,la.png,qwen 64-1024 64x48,0.82,0.76,yes
+preprocess,la.png,qwen 1024-1024 74x56,28.37,2.79,yes
+preprocess,la.png,qwen 4096-4096 148x112,120.33,17.16,yes
+preprocess,la.png,glm 74x56,1.50,1.27,yes
+preprocess,pal.png,qwen 64-64 18x12,16.03,2.40,yes
+preprocess,pal.png,qwen 256-256 36x26,16.79,2.52,yes
+preprocess,pal.png,qwen 64-1024 64x48,0.79,0.69,yes
+preprocess,pal.png,qwen 1024-1024 74x56,28.44,2.80,yes
+preprocess,pal.png,qwen 4096-4096 148x112,121.27,18.11,yes
+preprocess,pal.png,glm 74x56,1.37,1.37,yes
+preprocess,rgb_l0.png,qwen 64-64 18x12,16.12,2.49,yes
+preprocess,rgb_l0.png,qwen 256-256 36x26,16.82,2.38,yes
+preprocess,rgb_l0.png,qwen 64-1024 64x48,0.76,0.79,yes
+preprocess,rgb_l0.png,qwen 1024-1024 74x56,28.05,4.11,yes
+preprocess,rgb_l0.png,qwen 4096-4096 148x112,119.82,16.84,yes
+preprocess,rgb_l0.png,glm 74x56,1.31,1.45,yes
+preprocess,rgb_l1.png,qwen 64-64 18x12,16.07,2.58,yes
+preprocess,rgb_l1.png,qwen 256-256 36x26,16.84,2.32,yes
+preprocess,rgb_l1.png,qwen 64-1024 64x48,0.75,0.77,yes
+preprocess,rgb_l1.png,qwen 1024-1024 74x56,28.13,2.70,yes
+preprocess,rgb_l1.png,qwen 4096-4096 148x112,121.07,15.25,yes
+preprocess,rgb_l1.png,glm 74x56,1.05,1.49,yes
+preprocess,rgb_l6.png,qwen 64-64 18x12,16.04,2.51,yes
+preprocess,rgb_l6.png,qwen 256-256 36x26,16.93,2.62,yes
+preprocess,rgb_l6.png,qwen 64-1024 64x48,0.71,0.72,yes
+preprocess,rgb_l6.png,qwen 1024-1024 74x56,28.07,2.85,yes
+preprocess,rgb_l6.png,qwen 4096-4096 148x112,119.66,17.86,yes
+preprocess,rgb_l6.png,glm 74x56,1.38,1.62,yes
+preprocess,rgb_l9.png,qwen 64-64 18x12,17.69,2.67,yes
+preprocess,rgb_l9.png,qwen 256-256 36x26,18.01,2.44,yes
+preprocess,rgb_l9.png,qwen 64-1024 64x48,0.73,0.74,yes
+preprocess,rgb_l9.png,qwen 1024-1024 74x56,29.64,2.92,yes
+preprocess,rgb_l9.png,qwen 4096-4096 148x112,120.23,17.63,yes
+preprocess,rgb_l9.png,glm 74x56,1.55,1.47,yes
+preprocess,rgba.png,qwen 64-64 18x12,16.60,2.27,yes
+preprocess,rgba.png,qwen 256-256 36x26,16.89,2.58,yes
+preprocess,rgba.png,qwen 64-1024 64x48,0.67,0.73,yes
+preprocess,rgba.png,qwen 1024-1024 74x56,28.16,2.77,yes
+preprocess,rgba.png,qwen 4096-4096 148x112,119.93,18.20,yes
+preprocess,rgba.png,glm 74x56,1.31,1.40,yes
+preprocess,tiny.png,qwen 64-64 24x12,1.81,1.36,yes
+preprocess,tiny.png,qwen 256-256 46x24,6.92,1.91,yes
+preprocess,tiny.png,qwen 64-1024 24x12,1.80,1.35,yes
+preprocess,tiny.png,qwen 1024-1024 90x46,26.16,2.82,yes
+preprocess,tiny.png,qwen 4096-4096 180x92,112.90,15.45,yes
+preprocess,tiny.png,glm 12x6,0.35,0.31,yes

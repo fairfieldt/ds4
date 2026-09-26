@@ -1,0 +1,9 @@
+arm,build,prompt,mode,run_mean_tps,run_min_tps,run_max_tps,blocks,outputs_identical
+A,before,code.txt,plain,140.60,140.58,140.64,4,yes
+A,before,prose.txt,plain,140.30,140.27,140.33,4,yes
+B,7d8abb5,code.txt,plain,140.60,140.55,140.64,4,yes
+B,7d8abb5,prose.txt,plain,140.35,140.33,140.36,4,yes
+B,7d8abb5,code.txt,plain,140.56,140.52,140.60,4,yes
+B,7d8abb5,prose.txt,plain,140.27,140.25,140.30,4,yes
+A,before,code.txt,plain,140.54,140.51,140.56,4,yes
+A,before,prose.txt,plain,140.21,140.08,140.27,4,yes

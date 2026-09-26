@@ -151,6 +151,12 @@ The test checks that all four turns complete in each mode, including errors
 that the interactive CLI can report without a nonzero process exit. It saves
 the responses and diagnostics for inspection; it does not grade image content.
 
+`tests/test_qwen4_vision mmproj.gguf image out.bin MIN MAX N` encodes the image
+N times and prints each encode's time. `speed-bench/qwen_vision_bench` loads
+the model and encoder once and reports encode latency, time to first token
+and decode speed for image prompts, ordinary or `--mtp`; results for the RTX
+PRO 6000 are in `speed-bench/qwen-cuda-6000-vision`.
+
 The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
