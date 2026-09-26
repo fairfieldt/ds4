@@ -863,6 +863,77 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     free(order); free(got); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gs); free(sc);
 }
 
+#ifndef __APPLE__
+static int cmp_u32_desc(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* The selection's exact output layout, on the CPU: the keys are the bits of
+ * max(score, 0), the threshold is the k-th largest key, slots [0, g) hold the
+ * g keys above it in index order and slots [g, k) the first k - g keys equal
+ * to it, in index order. */
+static void idx_select_cpu(int32_t *out, const float *row, uint32_t n, uint32_t k) {
+    uint32_t *keys = malloc((uint64_t)n * 4), *sorted = malloc((uint64_t)n * 4);
+    require_ok(keys && sorted, "idx select cpu alloc");
+    for (uint32_t i = 0; i < n; i++) {
+        const float v = row[i] > 0.0f ? row[i] : 0.0f;
+        memcpy(&keys[i], &v, 4);
+        sorted[i] = keys[i];
+    }
+    qsort(sorted, n, 4, cmp_u32_desc);
+    const uint32_t thr = sorted[k - 1];
+    uint32_t g = 0;
+    for (uint32_t i = 0; i < n; i++) if (keys[i] > thr) out[g++] = (int32_t)i;
+    for (uint32_t i = 0; i < n && g < k; i++) if (keys[i] == thr) out[g++] = (int32_t)i;
+    free(sorted); free(keys);
+}
+
+/* Every output slot of the block-parallel selection against the CPU layout,
+ * on random relu rows with duplicates, tie-heavy rows, rows of equal scores
+ * and rows whose tail is the -3e38 incomplete-block marker. */
+static void test_idx_select_exact(uint32_t T, uint32_t n, uint32_t k, uint32_t visible, uint32_t levels) {
+    float *sc = rand_vec((uint64_t)T * n, 4.0f);
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t b = 0; b < n; b++) {
+            float *v = &sc[(uint64_t)t * n + b];
+            if (b >= visible) *v = -3.0e38f;
+            else if (levels) *v = (float)((uint32_t)(fabsf(*v) * 1000.0f) % levels) * 0.75f;
+            else if (*v < 0.0f) *v = 0.0f;
+            else if ((b % 7) == 3) *v = sc[(uint64_t)t * n + (b / 7) * 7];
+        }
+    }
+    ds4_gpu_tensor *gs = upload(sc, (uint64_t)T * n);
+    ds4_gpu_tensor *ga = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
+    int32_t *a = malloc((uint64_t)T * k * 4), *b = malloc((uint64_t)T * k * 4);
+    require_ok(gs && ga && a && b, "idx select exact alloc");
+    require_ok(ds4_gpu_qwen4_idx_select_tensor(ga, gs, NULL, n, T, k), "idx select");
+    require_ok(ds4_gpu_tensor_read(ga, 0, a, (uint64_t)T * k * 4), "idx select exact read");
+    for (uint32_t t = 0; t < T; t++) idx_select_cpu(b + (uint64_t)t * k, sc + (uint64_t)t * n, n, k);
+    char name[96];
+    snprintf(name, sizeof(name), "idx select slots==cpu T=%u n=%u k=%u vis=%u lv=%u", T, n, k, visible, levels);
+    require_ok(memcmp(a, b, (uint64_t)T * k * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(a); free(b); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gs); free(sc);
+}
+#endif
+
+static void test_idx_select_exact_all(void) {
+#ifndef __APPLE__
+    const uint32_t ns[] = { 512, 513, 700, 1024, 1031, 1100, 2048, 4097, 70001 };
+    for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        test_idx_select_exact(3, ns[i], 512, ns[i], 0);
+        test_idx_select_exact(2, ns[i], 512, ns[i] - ns[i] / 5, 0);
+        test_idx_select_exact(2, ns[i], 512, ns[i], 3);
+        test_idx_select_exact(1, ns[i], 512, ns[i], 1);
+        test_idx_select_exact(1, ns[i], 512, 512, 0);
+    }
+    test_idx_select_exact(2, 300, 1, 300, 0);
+    test_idx_select_exact(2, 300, 300, 300, 2);
+    test_idx_select_exact(2, 3000, 511, 1500, 17);
+#endif
+}
+
 /* Prefill and split attention against scalar attention on the same inputs. */
 static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
@@ -4227,6 +4298,7 @@ int main(void) {
         printf("all Qwen MoE decode specialization tests passed\n");
         return 0;
     }
+    if (getenv("DS4_TEST_QWEN4_IDX_SELECT_ONLY")) { test_idx_select_exact_all(); printf("all qwen4 idx select tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
@@ -4284,6 +4356,7 @@ int main(void) {
     test_idx_select(4, 70001, 512, 69000);
     test_idx_select(3, 600, 512, 599);
     test_idx_select(2, 3000, 512, 520);
+    test_idx_select_exact_all();
     test_attn_mm(40, 0, false);
     test_attn_mm(37, 3000, true);
     test_attn_mm(3, 100, true);
