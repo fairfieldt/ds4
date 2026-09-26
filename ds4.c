@@ -59227,9 +59227,15 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    /* The CUDA gate/mix kernel computes each row on its own (one grid row
+     * per token, no cross-row state), so a 3-row launch already rounds
+     * every row exactly like T <= 2; only Metal's pair kernel needs the
+     * split. */
     if (T == 3u && g->verify_rows_exact) {
         /* Split the 3-row gate/mix into the exact 2-row pair kernel plus the
          * 1-row generic kernel, so every row matches its T <= 2 rounding. */
+        if (!ok) return false;
         const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
         ds4_gpu_tensor *xn2 = ds4_gpu_tensor_view(g->xn, 0, 2u * dim * sizeof(float));
         ds4_gpu_tensor *lo2 = ds4_gpu_tensor_view(g->lo, 0, 2u * DS4_N_HC_LOWRANK * sizeof(float));
@@ -59254,6 +59260,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         ds4_gpu_tensor_free(xn1);
         return ok1;
     }
+#endif
     return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
 }

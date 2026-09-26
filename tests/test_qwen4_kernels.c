@@ -2647,6 +2647,45 @@ static void test_hc_pair_groups(arena_t *a) {
     printf("HC paired mixer geometry: all formats and guarded tails exact\n");
 }
 
+#ifndef __APPLE__
+/* The 3-row speculative verify runs the gate/mix in one launch on CUDA; it
+ * must match the old exact split (rows 0-1 as a pair, row 2 alone). */
+static void test_hc_mix3_split(arena_t *a) {
+    const uint32_t types[] = {1u, 0u, 8u}, E = 2560u, hc = 4u, rank = 320u, T = 3u;
+    for (uint32_t it = 0; it < 3u; it++) {
+        const uint32_t type = types[it];
+        double *shadow = NULL;
+        const uint64_t off = type == 8u ? arena_q8_0(a, hc * E, rank, &shadow, 0.2f) :
+            type == 1u ? arena_f16(a, (uint64_t)hc * E * rank, &shadow, 0.2f) :
+            arena_f32(a, (uint64_t)hc * E * rank, &shadow, -0.2f, 0.2f);
+        free(shadow);
+        const uint64_t dim = (uint64_t)hc * E;
+        float *xn = rand_vec(T * dim, 1.0f), *lo = rand_vec(T * rank, 1.0f);
+        ds4_gpu_tensor *gx = upload(xn, T * dim), *gl = upload(lo, T * rank);
+        ds4_gpu_tensor *one = upload(NULL, (uint64_t)T * E), *split = upload(NULL, (uint64_t)T * E);
+        ds4_gpu_tensor *x2 = ds4_gpu_tensor_view(gx, 0, 2u * dim * sizeof(float));
+        ds4_gpu_tensor *l2 = ds4_gpu_tensor_view(gl, 0, 2u * rank * sizeof(float));
+        ds4_gpu_tensor *o2 = ds4_gpu_tensor_view(split, 0, 2u * E * sizeof(float));
+        ds4_gpu_tensor *x1 = ds4_gpu_tensor_view(gx, 2u * dim * sizeof(float), dim * sizeof(float));
+        ds4_gpu_tensor *l1 = ds4_gpu_tensor_view(gl, 2u * rank * sizeof(float), rank * sizeof(float));
+        ds4_gpu_tensor *o1 = ds4_gpu_tensor_view(split, 2u * E * sizeof(float), E * sizeof(float));
+        require_ok(x2 && l2 && o2 && x1 && l1 && o1, "HC mix3 views");
+        require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(one, gx, gl, a->base, a->size, off, type, T, E, hc, rank) &&
+                   ds4_gpu_qwen4_hc_gate_mix_tensor(o2, x2, l2, a->base, a->size, off, type, 2u, E, hc, rank) &&
+                   ds4_gpu_qwen4_hc_gate_mix_tensor(o1, x1, l1, a->base, a->size, off, type, 1u, E, hc, rank),
+                   "HC mix3 dispatch");
+        float *got = download(one, (uint64_t)T * E), *ref = download(split, (uint64_t)T * E);
+        check_exact_f32("HC mix3 one launch vs 2+1 split", got, ref, (uint64_t)T * E);
+        free(got); free(ref);
+        ds4_gpu_tensor_free(o1); ds4_gpu_tensor_free(l1); ds4_gpu_tensor_free(x1);
+        ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(l2); ds4_gpu_tensor_free(x2);
+        ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(one); ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(gx);
+        free(lo); free(xn);
+    }
+    printf("HC gate/mix T=3: one launch byte-exact against the 2+1 split, all formats\n");
+}
+#endif
+
 /* Freeze the stream input and weights across forced old/reuse and automatic
  * dispatch. All three share a command batch and all readbacks follow it. */
 static void test_hc_norm_reuse_case(arena_t *a, uint32_t type, uint32_t E,
@@ -4334,6 +4373,9 @@ int main(void) {
     test_presync_load(&arena);
 #endif
     test_hc_pair_groups(&arena);
+#ifndef __APPLE__
+    test_hc_mix3_split(&arena);
+#endif
     test_mv_ext_groups(&arena);
     test_moe_grouped(&arena);
     test_hc_mix_prefetch(&arena);
