@@ -2185,6 +2185,32 @@ static void test_argmax_rows(void) {
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); free(v);
     puts("  argmax rows: ties, chunk boundaries, NaNs, independent rows and guards passed");
 }
+
+/* The argmax kernels also store the ids into mapped page-locked host memory:
+ * the same ids as the device tensor, readable after end_commands, and only
+ * the requested rows. */
+static void test_host_argmax(void) {
+    const unsigned N = 8193, T = 3;
+    int32_t *top = ds4_gpu_host_alloc(64);
+    require_ok(top != NULL, "mapped argmax ids");
+    float *v = rand_vec(N * T, 1.f);
+    const unsigned want[3] = {977u, 4096u, N - 1u};
+    for (unsigned r = 0; r < T; r++) v[r * N + want[r]] = 40.f + (float)r;
+    v[4096] = 40.f;   /* tie in row 0: the lower index wins */
+    ds4_gpu_tensor *x = upload(v, N * T), *out = upload(NULL, T), *tmp = upload(NULL, T * 3 * 2);
+    for (unsigned j = 0; j < 16; j++) top[j] = -7;
+    int32_t dev[3];
+    require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_rows_host_tensor(out, tmp, x, N, T, top) &&
+               ds4_gpu_end_commands() && ds4_gpu_tensor_read(out, 0, dev, sizeof(dev)), "host argmax rows");
+    for (unsigned r = 0; r < T; r++) require_ok(top[r] == (int32_t)want[r] && dev[r] == top[r], "host argmax row ids");
+    require_ok(top[3] == -7, "host argmax row guard");
+    top[0] = -7;
+    require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_host_tensor(out, tmp, x, N, top) &&
+               ds4_gpu_end_commands() && top[0] == 977 && top[1] == (int32_t)want[1], "host argmax single row");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); free(v);
+    ds4_gpu_host_free(top);
+    puts("  host argmax: mapped ids match the device rows passed");
+}
 #endif
 
 /* The paired mixer must preserve both token rows and its partial-group guard. */
@@ -3869,6 +3895,7 @@ int main(void) {
     test_qwen4_argmax();
 #ifndef __APPLE__
     test_argmax_rows();
+    test_host_argmax();
 #endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);

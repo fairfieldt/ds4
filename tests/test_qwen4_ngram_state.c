@@ -62,7 +62,7 @@ static void check_batch(ds4_engine *engine, const ds4_tokens *prompt, bool specu
             assert(ds4_session_argmax_excluding(s,-1) == top);
             assert(ds4_session_sample(s,0,0,1,0,NULL) == top);
             if (s->qwen4_frontier_on_device) {
-                assert(ds4_gpu_tensor_read(s->qwen4_verify_device,
+                assert(ds4_gpu_tensor_read(s->qwen4_frontier_src,
                     (uint64_t)s->qwen4_frontier_row*DS4_N_VOCAB*sizeof(float),
                     current_logits,(uint64_t)DS4_N_VOCAB*sizeof(float)));
             } else memcpy(current_logits,s->logits,DS4_N_VOCAB*sizeof(float));
