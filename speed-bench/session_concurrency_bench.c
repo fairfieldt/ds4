@@ -453,16 +453,18 @@ static bool verify_spec_matches_plain(const bench_env *env,
         }
     }
     printf("  spec: %.2f tokens per stream and cycle\n", (double)committed / ((double)count * cycles));
-    /* the reference walks every stream to the same length */
+    /* The reference is the plain batch of the same sessions, so every
+     * stream stays in it until the longest is checked: a stream checked in
+     * full keeps decoding its own greedy tokens, and each reference step has
+     * the width of the speculative cycles it is compared with. */
     int max_len = 0;
     for (int i = 0; i < count; i++) if (len[i] > max_len) max_len = len[i];
     bool ok = true;
     for (int k = 0; k < max_len && ok; k++) {
         int n = 0;
         for (int i = 0; i < count; i++) {
-            if (k >= len[i]) continue;
             const int token = ds4_session_argmax_excluding(reference[i], env->eos);
-            const int want = seq[(size_t)i * cycles * 2 + k];
+            const int want = k < len[i] ? seq[(size_t)i * cycles * 2 + k] : token;
             if (token != want) {
                 fprintf(stderr, BENCH ": spec verify failed: stream %d token %d: speculative %d, plain %d\n",
                         i, k, want, token);
