@@ -59211,11 +59211,17 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *iqn = ds4_gpu_tensor_view(iqn_rows,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    /* Only Metal's selection reads the per-tile score maxima; the CUDA
+     * selection scans the scores themselves. */
+    ds4_gpu_tensor *tiles = NULL;
+#ifdef DS4_HAS_QWEN4_METAL
+    tiles = n_sparse <= 2u ? g->tile_max : NULL;
+#endif
     const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
+        ds4_gpu_qwen4_idx_score_tensor(g->score, tiles, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
+        qwen4_idx_select(g->sel_blocks, g->score, tiles,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&

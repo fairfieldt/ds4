@@ -3025,12 +3025,12 @@ extern "C" int ds4_gpu_qwen4_idx_score_rows_tensor(
         uint32_t n_block_stride, uint32_t Hi, uint32_t Di, uint32_t ratio) {
     using namespace qwen4_cuda;
     (void)table; (void)entry0;
-    const uint32_t tile_stride = (n_block_stride + 7) / 8;
+    (void)tile_max;   /* CUDA selection scans the scores; the tile maxima are Metal's */
     for (uint32_t i = 0; i < n_rows; i++) {
         if (!rows[i].use_sel) continue;
         const uint32_t N = (rows[i].pos + 1u) / ratio;
-        row_view s(score, i, 1, n_block_stride), t(tile_max, i, 1, tile_stride), q(iq, i, 1, (uint64_t)Hi * Di);
-        if (!ds4_gpu_qwen4_idx_score_tensor(s, t, q, rows[i].block_key, 1, N, Hi, Di, rows[i].pos, ratio)) return 0;
+        row_view s(score, i, 1, n_block_stride), q(iq, i, 1, (uint64_t)Hi * Di);
+        if (!ds4_gpu_qwen4_idx_score_tensor(s, NULL, q, rows[i].block_key, 1, N, Hi, Di, rows[i].pos, ratio)) return 0;
     }
     return 1;
 }
