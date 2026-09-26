@@ -3618,6 +3618,16 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t in_dim, uint32_t ff_dim,
         uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
+/* CUDA only: as ds4_gpu_qwen4_moe_mid_tensor, and the shared-expert blocks
+ * prefetch the shared down matrix (in_dim rows of ff_dim, type
+ * shared_down_type; UINT32_MAX for none) into L2 for the down launch. */
+int ds4_gpu_qwen4_moe_mid_prefetch_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type,
+        uint64_t shared_down_offset, uint32_t shared_down_type);
 int ds4_gpu_qwen4_moe_down_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t down_offset,

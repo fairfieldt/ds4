@@ -1089,9 +1089,29 @@ __device__ __forceinline__ float q4k_dot8(unsigned q, float s0, float o0, float 
     return a;
 }
 
+__device__ __forceinline__ void l2_prefetch(const void *p, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p), "r"(bytes) : "memory");
+#endif
+}
+
+/* With pd set, the shared-expert blocks first ask L2 for their own gate and
+ * up rows and for a 1/gridDim.x slice of the shared down matrix pd (pdb
+ * bytes). They do it before the dependency wait: these are weights, and
+ * under programmatic launch this grid is resident while the one-block router
+ * runs, when DRAM is otherwise idle. Addresses and sizes are 16-byte
+ * multiples (checked by the caller). */
 __global__ void moe_gate_up_q4k(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
-        unsigned NE, unsigned NS, unsigned stride, unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+        unsigned NE, unsigned NS, unsigned stride, unsigned K, unsigned M, uint64_t rb, uint64_t srb,
+        const char *pd, uint64_t pdb) {
+    if (pd && blockIdx.y == NS && !blockIdx.z && !threadIdx.x && blockIdx.x * 4 < M) {
+        const unsigned r0 = blockIdx.x * 4, nr = min(4u, M - r0);
+        l2_prefetch(sh0 + r0 * srb, (unsigned)(nr * srb));
+        l2_prefetch(sh1 + r0 * srb, (unsigned)(nr * srb));
+        const uint64_t chunk = (pdb / gridDim.x + 15) & ~(uint64_t)15, at = blockIdx.x * chunk;
+        if (at < pdb) l2_prefetch(pd + at, (unsigned)min(chunk, pdb - at));
+    }
     pdl_enter();
     const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
     if (row >= M) return;
@@ -1363,14 +1383,18 @@ __global__ void moe_grouped(float *out, const float *x, const int *selected,
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down,
-        bool ref = false) {
+        const char *pd = NULL, uint64_t pdb = 0, bool ref = false) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
     const unsigned stride = NS + (st != UINT_MAX);
     const bool xa = !((uintptr_t)x & 15), sha = st == UINT_MAX || (st == 8 && !(K % 128) && !((uintptr_t)s0 & 1) && !(srb & 1));
     if (xa && sha && !down && type == 12 && !(K % 256) && !(rb & 15) &&
         !((uintptr_t)w0 & 15) && !((uintptr_t)w1 & 15)) {
-        launch(moe_gate_up_q4k, grid, 128, 0, out, x, sel, w0, w1, s0, s1, NE, NS, stride, K, M, rb, srb);
+        /* the shared-expert L2 prefetch needs 16-byte rows and ranges */
+        const bool pf = pd && st == 8 && !(srb & 15) && !((uintptr_t)s0 & 15) && !((uintptr_t)s1 & 15) &&
+            !((uintptr_t)pd & 15) && !(pdb & 15) && 4 * srb < (1u << 20);
+        launch(moe_gate_up_q4k, grid, 128, 0, out, x, sel, w0, w1, s0, s1, NE, NS, stride, K, M, rb, srb,
+               pf ? pd : (const char *)NULL, pf ? pdb : (uint64_t)0);
         return launched();
     }
     if (xa && sha && down && type == 39 && !(K % 32) && !(rb & 3) && rb <= 4096 &&
@@ -3819,10 +3843,13 @@ extern "C" int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu
     return qwen4_router_topk(sel, weights, logits, x, map, size, off, type, K, sg, T, NE, NS, false);
 }
 
-extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+/* As ds4_gpu_qwen4_moe_mid_tensor; sdo/sdt name the shared expert's down
+ * matrix (K rows of M), which the kernel may prefetch into L2 for the down
+ * launch that follows. sdt == UINT32_MAX gives no prefetch. */
+extern "C" int ds4_gpu_qwen4_moe_mid_prefetch_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t go, uint64_t uo,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
-        uint64_t sgo, uint64_t suo, uint32_t st) {
+        uint64_t sgo, uint64_t suo, uint32_t st, uint64_t sdo, uint32_t sdt) {
     using namespace qwen4_cuda;
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(mid, (uint64_t)T*NO*M*4) ||
@@ -3832,8 +3859,18 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_t
     const char *sg = st != UINT_MAX ? weight(map,size,sgo,sb) : NULL;
     const char *su = st != UINT_MAX ? weight(map,size,suo,sb) : NULL;
     if (!g || !u || (st != UINT_MAX && (!sg || !su))) return 0;
+    const uint64_t pdb = st != UINT_MAX && sdt != UINT32_MAX ? row_bytes(sdt, M)*K : 0;
+    const char *pd = pdb ? weight(map,size,sdo,pdb) : NULL;
     return moe_mv_dispatch((float *)mid->ptr,(const float *)x->ptr,(const int *)sel->ptr,
-                           g,u,sg,su,type,st,NE,T,NS,K,M,false);
+                           g,u,sg,su,type,st,NE,T,NS,K,M,false,pd,pd ? pdb : 0);
+}
+
+extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t go, uint64_t uo,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t sgo, uint64_t suo, uint32_t st) {
+    return ds4_gpu_qwen4_moe_mid_prefetch_tensor(mid, x, sel, map, size, go, uo, type, NE, T, NS, K, M,
+                                                 sgo, suo, st, 0, UINT32_MAX);
 }
 
 static int qwen4_moe_down(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
@@ -3848,7 +3885,7 @@ static int qwen4_moe_down(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
     const char *sw = st != UINT_MAX ? weight(map,size,so,row_bytes(st,K)*M) : NULL;
     if (!w || (st != UINT_MAX && !sw)) return 0;
     return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,(const int *)sel->ptr,
-                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true,ref);
+                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true,NULL,0,ref);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,

@@ -59590,12 +59590,25 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
     } else
     if (ok) {
+#ifndef DS4_HAS_QWEN4_METAL
+        /* The gate/up launch also warms L2 with the shared down matrix. */
+        ok = ds4_gpu_qwen4_moe_mid_prefetch_tensor(g->mid, g->mixed, g->selected, m->map, m->size,
+                                          l->ffn_gate_exps->abs_offset,
+                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                          DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                          shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                          shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
+                                          shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                          shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0 &&
+#else
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+#endif
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
