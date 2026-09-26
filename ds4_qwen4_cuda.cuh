@@ -2666,6 +2666,68 @@ __global__ void mtp_stage(float *cat, const float *e, const float *R,
     }
 }
 
+/* mtp_stage for T tokens in one launch, grid (hc + 1, T).  Each thread keeps
+ * the element order of mtp_stage's strided loops (same partial sums, same
+ * block reduction, same products), so the output is byte-identical; the loads
+ * of a chunk are issued before any of them is used, so the reduction pays one
+ * memory latency per chunk instead of one per element, and the norm weights
+ * (never written on the device) are requested before the dependency wait
+ * (ptxas keeps only some of those loads ahead of it).  e and R are written by
+ * earlier work on the stream, so they are not __restrict__: a read-only
+ * (.nc) load of them could be scheduled above the wait. */
+constexpr unsigned MTP_STAGE_CHUNK = 16;
+
+__global__ void mtp_stage_rows(float *__restrict__ cat, const float *e,
+        const float *R, const float *__restrict__ ge, const float *__restrict__ gh,
+        unsigned E, unsigned hc, float eps) {
+    const unsigned row = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
+    const bool emb = row == 0;
+    const float *g = emb ? ge : gh + (uint64_t)(row - 1) * E;
+    float gv[MTP_STAGE_CHUNK];
+    #pragma unroll
+    for (unsigned k = 0; k < MTP_STAGE_CHUNK; k++) {
+        const unsigned i = tid + k * nt;
+        gv[k] = i < E ? g[i] : 0.0f;
+    }
+    pdl_enter();
+    const unsigned n = emb ? E : E * hc;
+    const float *rs = emb ? e + (uint64_t)t * E : R + (uint64_t)t * hc * E;
+    __shared__ float red[32];
+    float ss = 0;
+    for (unsigned base = tid; base < n; base += MTP_STAGE_CHUNK * nt) {
+        float v[MTP_STAGE_CHUNK];
+        #pragma unroll
+        for (unsigned k = 0; k < MTP_STAGE_CHUNK; k++) {
+            const unsigned i = base + k * nt;
+            v[k] = i < n ? rs[i] : 0.0f;
+        }
+        /* mtp_stage's loop compiles to one FFMA per element; a lane past
+         * the end adds fma(0, 0, ss) == ss (ss is never -0) */
+        #pragma unroll
+        for (unsigned k = 0; k < MTP_STAGE_CHUNK; k++) ss = fmaf(v[k], v[k], ss);
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / n + eps);
+    const float *src = emb ? rs : rs + (uint64_t)(row - 1) * E;
+    float *o = cat + ((uint64_t)t * (hc + 1) + row) * 2 * E;
+    for (unsigned base = tid; base < E; base += MTP_STAGE_CHUNK * nt) {
+        float sv[MTP_STAGE_CHUNK];
+        #pragma unroll
+        for (unsigned k = 0; k < MTP_STAGE_CHUNK; k++) {
+            const unsigned i = base + k * nt;
+            sv[k] = i < E ? src[i] : 0.0f;
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < MTP_STAGE_CHUNK; k++) {
+            const unsigned i = base + k * nt;
+            if (i < E) {
+                const float gk = base == tid ? gv[k] : g[i];
+                o[(emb ? 0 : E) + i] = sv[k] * inv * gk;
+                o[(emb ? E : 0) + i] = 0;
+            }
+        }
+    }
+}
+
 __global__ void mtp_combine(float *out, const float *proj, unsigned E, unsigned hc) {
     pdl_enter();
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4146,6 +4208,19 @@ extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu
     const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);
     if (!ge || !gh) return 0;
     launch(mtp_stage, hc+1, 256, 0, (float *)cat->ptr,(const float *)e->ptr,
+        (const float *)R->ptr,(const float *)ge,(const float *)gh,E,hc,eps);
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_mtp_stage_rows_tensor(ds4_gpu_tensor *cat, const ds4_gpu_tensor *e,
+        const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t eo, uint64_t ho,
+        uint32_t T, uint32_t E, uint32_t hc, float eps) {
+    using namespace qwen4_cuda;
+    if (!T || !E || !hc || hc > 4 || !tensor(cat,(uint64_t)T*(hc+1)*2*E*4) ||
+        !tensor(e,(uint64_t)T*E*4) || !tensor(R,(uint64_t)T*hc*E*4)) return 0;
+    const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);
+    if (!ge || !gh) return 0;
+    launch(mtp_stage_rows, dim3(hc+1, T), 256, 0, (float *)cat->ptr,(const float *)e->ptr,
         (const float *)R->ptr,(const float *)ge,(const float *)gh,E,hc,eps);
     return launched();
 }

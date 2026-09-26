@@ -60042,6 +60042,17 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
     return true;
 }
 
+/* CUDA: one mtp_stage dispatch and one eh_proj projection for all of a
+ * step's rows (byte-identical to one of each per row); Metal keeps the
+ * per-row dispatches. */
+static bool qwen4_mtp_stage_rows(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return false;
+#else
+    return true;
+#endif
+}
+
 /* The steering bank contains trunk layers only. The predictor remains
  * unsteered; its drafts are verified by the steered target trunk.
  * One to three causal predictor steps at idx, using consecutive rows of the
@@ -60068,17 +60079,32 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
-    for (uint32_t t = 0; t < T && ok; t++) {
-        ds4_gpu_tensor *e_row = ds4_gpu_tensor_view(g->mtp_e, t * emb_bytes, emb_bytes);
-        ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(R_save, (uint64_t)(row + t) * hc * emb_bytes, hc * emb_bytes);
-        ds4_gpu_tensor *cat_row = ds4_gpu_tensor_view(g->mtp_cat, t * cat_bytes, cat_bytes);
-        ok = e_row && R_row && cat_row &&
-             ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
-                                             l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
-                                             E, hc, DS4_RMS_EPS);
-        ds4_gpu_tensor_free(cat_row);
-        ds4_gpu_tensor_free(R_row);
-        ds4_gpu_tensor_free(e_row);
+    if (qwen4_mtp_stage_rows()) {
+#ifndef DS4_HAS_QWEN4_METAL
+        ds4_gpu_tensor *e_rows = ds4_gpu_tensor_view(g->mtp_e, 0, T * emb_bytes);
+        ds4_gpu_tensor *R_rows = ds4_gpu_tensor_view(R_save, (uint64_t)row * hc * emb_bytes, T * hc * emb_bytes);
+        ds4_gpu_tensor *cat_rows = ds4_gpu_tensor_view(g->mtp_cat, 0, T * cat_bytes);
+        ok = e_rows && R_rows && cat_rows &&
+             ds4_gpu_qwen4_mtp_stage_rows_tensor(cat_rows, e_rows, R_rows, m->map, m->size,
+                                                  l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
+                                                  T, E, hc, DS4_RMS_EPS);
+        ds4_gpu_tensor_free(cat_rows);
+        ds4_gpu_tensor_free(R_rows);
+        ds4_gpu_tensor_free(e_rows);
+#endif
+    } else {
+        for (uint32_t t = 0; t < T && ok; t++) {
+            ds4_gpu_tensor *e_row = ds4_gpu_tensor_view(g->mtp_e, t * emb_bytes, emb_bytes);
+            ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(R_save, (uint64_t)(row + t) * hc * emb_bytes, hc * emb_bytes);
+            ds4_gpu_tensor *cat_row = ds4_gpu_tensor_view(g->mtp_cat, t * cat_bytes, cat_bytes);
+            ok = e_row && R_row && cat_row &&
+                 ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
+                                                 l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
+                                                 E, hc, DS4_RMS_EPS);
+            ds4_gpu_tensor_free(cat_row);
+            ds4_gpu_tensor_free(R_row);
+            ds4_gpu_tensor_free(e_row);
+        }
     }
 #ifdef DS4_HAS_QWEN4_METAL
     if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
@@ -60086,8 +60112,20 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     /* Project each token's hc + 1 rows on its own: T * (hc + 1) rows would
      * leave the row-batched GEMV for the tiled GEMM, about 0.5 ms for three
      * tokens on an RTX PRO 6000, and a caught-up draft now rounds exactly
-     * like a single-token step. */
-    for (uint32_t t = 0; t < T && ok; t++) {
+     * like a single-token step.  On CUDA the 4..31-row tensor-core
+     * projection computes every row on its own for F16 and Q8_0 weights, so
+     * all T * (hc + 1) rows take one dispatch (one weight read) with the
+     * single-step rounding. */
+    const bool proj_rows_once = T > 1u && qwen4_mtp_stage_rows() &&
+        (l->nextn_eh_proj->type == DS4_TENSOR_F16 || l->nextn_eh_proj->type == DS4_TENSOR_Q8_0);
+    if (ok && proj_rows_once) {
+        ds4_gpu_tensor *proj_rows = ds4_gpu_tensor_view(g->mtp_proj, 0, T * proj_bytes);
+        ds4_gpu_tensor *cat_rows = ds4_gpu_tensor_view(g->mtp_cat, 0, T * cat_bytes);
+        ok = proj_rows && cat_rows && qwen4_gemv(proj_rows, m, l->nextn_eh_proj, cat_rows, T * (hc + 1u));
+        ds4_gpu_tensor_free(cat_rows);
+        ds4_gpu_tensor_free(proj_rows);
+    }
+    for (uint32_t t = 0; t < T && ok && !proj_rows_once; t++) {
         ds4_gpu_tensor *proj_rows = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *cat_rows = ds4_gpu_tensor_view(g->mtp_cat, t * cat_bytes, cat_bytes);
         ok = proj_rows && cat_rows && qwen4_gemv(proj_rows, m, l->nextn_eh_proj, cat_rows, hc + 1u);
@@ -60178,10 +60216,17 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R,
                 (uint64_t)(g->mtp_last_rows - 1u) * hc * emb_bytes, hc * emb_bytes);
         ds4_gpu_tensor *cat_row = ds4_gpu_tensor_view(g->mtp_cat, 0, cat_bytes);
+#ifndef DS4_HAS_QWEN4_METAL
+        ok = e_row && R_row && cat_row &&
+             ds4_gpu_qwen4_mtp_stage_rows_tensor(cat_row, e_row, R_row, m->map, m->size,
+                                                  l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
+                                                  1u, E, hc, DS4_RMS_EPS);
+#else
         ok = e_row && R_row && cat_row &&
              ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
                                              l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
                                              E, hc, DS4_RMS_EPS);
+#endif
         ds4_gpu_tensor_free(cat_row);
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);

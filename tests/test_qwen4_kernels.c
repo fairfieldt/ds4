@@ -3388,6 +3388,65 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
     free(R_ref); free(cat); free(proj); free(R); free(e); free(g_e); free(g_h);
 }
 
+#ifndef __APPLE__
+/* The batched MTP staging (one launch for T rows) must reproduce one
+ * mtp_stage launch per row byte for byte. */
+static void test_mtp_stage_rows(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
+    double *g_e, *g_h;
+    const uint64_t g_e_off = arena_f32(a, E, &g_e, 0.5f, 1.5f);
+    const uint64_t g_h_off = arena_f32(a, (uint64_t)hc * E, &g_h, 0.5f, 1.5f);
+    free(g_e); free(g_h);
+    const uint64_t cat_n = (uint64_t)(hc + 1u) * 2u * E, R_n = (uint64_t)hc * E;
+    float *e = rand_vec((uint64_t)T * E, 1.0f), *R = rand_vec((uint64_t)T * R_n, 1.0f);
+    ds4_gpu_tensor *ge = upload(e, (uint64_t)T * E), *gR = upload(R, (uint64_t)T * R_n);
+    ds4_gpu_tensor *rows = upload(NULL, (uint64_t)T * cat_n + 7u), *ref = upload(NULL, (uint64_t)T * cat_n + 7u);
+    require_ok(ds4_gpu_tensor_fill_f32(rows, 99.5f, (uint64_t)T * cat_n + 7u) &&
+               ds4_gpu_tensor_fill_f32(ref, 99.5f, (uint64_t)T * cat_n + 7u), "mtp stage rows fill");
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *et = ds4_gpu_tensor_view(ge, (uint64_t)t * E * 4u, (uint64_t)E * 4u);
+        ds4_gpu_tensor *Rt = ds4_gpu_tensor_view(gR, (uint64_t)t * R_n * 4u, R_n * 4u);
+        ds4_gpu_tensor *ct = ds4_gpu_tensor_view(ref, (uint64_t)t * cat_n * 4u, cat_n * 4u);
+        require_ok(et && Rt && ct && ds4_gpu_qwen4_mtp_stage_tensor(ct, et, Rt, a->base, a->size, g_e_off, g_h_off,
+                                                                    E, hc, 1e-6f), "mtp stage per row");
+        ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(Rt); ds4_gpu_tensor_free(et);
+    }
+    require_ok(ds4_gpu_qwen4_mtp_stage_rows_tensor(rows, ge, gR, a->base, a->size, g_e_off, g_h_off,
+                                                   T, E, hc, 1e-6f), "mtp stage rows");
+    float *got = download(rows, (uint64_t)T * cat_n + 7u), *want = download(ref, (uint64_t)T * cat_n + 7u);
+    check_exact_f32("mtp stage rows vs per-row launches (with guard)", got, want, (uint64_t)T * cat_n + 7u);
+    printf("  mtp stage rows E=%u hc=%u T=%u: byte-exact against per-row mtp_stage\n", E, hc, T);
+    free(got); free(want);
+    ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(rows); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(ge);
+    free(R); free(e);
+}
+
+/* The predictor's eh_proj over T * (hc + 1) rows in one dispatch must match
+ * one (hc + 1)-row dispatch per token (F16 and Q8_0 weights). */
+static void test_mtp_proj_rows(arena_t *a, uint32_t type, uint32_t K, uint32_t M, uint32_t per, uint32_t T) {
+    double *shadow = NULL;
+    const uint64_t off = type == 8u ? arena_q8_0(a, M, K, &shadow, 0.05f) : arena_f16(a, (uint64_t)M * K, &shadow, 0.05f);
+    free(shadow);
+    const uint32_t n = per * T;
+    float *x = rand_vec((uint64_t)n * K, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)n * K);
+    ds4_gpu_tensor *one = upload(NULL, (uint64_t)n * M), *each = upload(NULL, (uint64_t)n * M);
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(one, gx, a->base, a->size, off, type, n, K, M), "mtp proj rows");
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *xt = ds4_gpu_tensor_view(gx, (uint64_t)t * per * K * 4u, (uint64_t)per * K * 4u);
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_view(each, (uint64_t)t * per * M * 4u, (uint64_t)per * M * 4u);
+        require_ok(xt && ot && ds4_gpu_qwen4_dense_mm_tensor(ot, xt, a->base, a->size, off, type, per, K, M),
+                   "mtp proj per token");
+        ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(xt);
+    }
+    float *got = download(one, (uint64_t)n * M), *want = download(each, (uint64_t)n * M);
+    check_exact_f32("mtp proj rows vs per-token dispatch", got, want, (uint64_t)n * M);
+    printf("  mtp proj rows type=%u %ux%u %u x %u rows: byte-exact against per-token dispatch\n", type, M, K, T, per);
+    free(got); free(want);
+    ds4_gpu_tensor_free(each); ds4_gpu_tensor_free(one); ds4_gpu_tensor_free(gx);
+    free(x);
+}
+#endif
+
 /* A split immediately below the large-prefill boundary uses the original
  * scan geometry. Compare every output and state value across that boundary,
  * including the first-token snapshot used by speculative verification. */
@@ -4514,6 +4573,16 @@ int main(void) {
     printf("mtp\n");
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
+#ifndef __APPLE__
+    test_mtp_stage_rows(&arena, 2560, 4, 1);
+    test_mtp_stage_rows(&arena, 2560, 4, 3);
+    test_mtp_stage_rows(&arena, 64, 4, 2);
+    test_mtp_stage_rows(&arena, 4200, 3, 2);
+    test_mtp_proj_rows(&arena, 1u, 5120, 2560, 5, 2);
+    test_mtp_proj_rows(&arena, 1u, 5120, 2560, 5, 3);
+    test_mtp_proj_rows(&arena, 8u, 5120, 2560, 5, 2);
+    test_mtp_proj_rows(&arena, 8u, 5120, 2560, 5, 3);
+#endif
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
     printf("all qwen4 kernel tests passed\n");
