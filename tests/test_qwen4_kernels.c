@@ -3787,6 +3787,12 @@ int main(void) {
     test_half_expert_tiles(&arena,2049,12,39,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
+    /* 4..32-row tensor-core projections: F16 from K = 1024 with K split over
+     * four slices (the HC down shape), Q8 narrow matrices split in two or
+     * four, and four Q8 rows of a long input on the GEMV */
+    for (uint32_t T = 4; T <= 25; T += 7) test_dense_mm(&arena, 10240, 320, T, 1u);
+    for (uint32_t T = 4; T <= 25; T += 7) test_dense_mm(&arena, 2560, 512, T, 8u);
+    test_dense_mm(&arena, 640, 2560, 16, 8u);
     test_dense_mm_large(&arena, 1u);
     test_dense_mm_large(&arena, 8u);
     test_dense_mm(&arena, 67, 97, 35, 1u);
