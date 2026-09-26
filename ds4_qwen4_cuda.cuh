@@ -226,14 +226,30 @@ __global__ void idx_expand(int *out, unsigned *count, const int *blocks,
     if (!threadIdx.x) count[t] = K * ratio + pos + 1 - tail;
 }
 
+/* Keys a row at pos attends, and the key splits its decode step takes
+ * (partial scratch holds up to 64 splits per row). */
+__host__ __device__ __forceinline__ unsigned attn_keys(bool sparse, unsigned stride, unsigned pos) {
+    return sparse ? stride : pos + 1;
+}
+__host__ __device__ __forceinline__ unsigned attn_splits(unsigned keys) {
+    const unsigned splits = (keys + 31) / 32;
+    return splits < 64 ? splits : 64;
+}
+
+/* Row t of a launch is the one-token step at pos0 + t. With partial scratch
+ * (decode rows: a token or the MTP verify rows) its keys split by its own key
+ * count and its partials sit at a fixed 64-split row stride, so every row
+ * rounds exactly like a single-token decode at that position. Without it
+ * (prefill) a row takes one split. */
 template<unsigned D>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
-        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse,
-        unsigned splits, unsigned per, float scale) {
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
     pdl_enter();
     const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
-    if (h >= H) return;
+    const unsigned keys = attn_keys(sparse, stride, pos0 + t), splits = partial ? attn_splits(keys) : 1;
+    const unsigned per = (keys + splits - 1) / splits;
+    if (h >= H || split >= splits) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
     float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
     for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
@@ -276,18 +292,20 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
             out[p] = (denom > 0 ? acc[i] / denom : 0) * sigmoid(gate[p]);
         }
     } else {
-        float *dst = partial + (((uint64_t)t * H + h) * splits + split) * (D + 2);
+        float *dst = partial + ((uint64_t)t * H * 64 + (uint64_t)h * splits + split) * (D + 2);
         if (!lane) { dst[0] = m; dst[1] = denom; }
         for (unsigned i = 0; i < D / 32; i++) dst[2 + lane + 32 * i] = acc[i];
     }
 }
 
+/* Rows and splits as in attention<D>; a row of one split wrote its output. */
 __global__ void attn_merge(float *out, const float *partial, const float *gate,
-        unsigned H, unsigned D, unsigned splits) {
+        unsigned H, unsigned D, unsigned pos0, unsigned stride, bool sparse) {
     pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    if (d >= D) return;
-    const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
+    const unsigned splits = attn_splits(attn_keys(sparse, stride, pos0 + t));
+    if (d >= D || splits == 1) return;
+    const float *p = partial + ((uint64_t)t * H * 64 + (uint64_t)h * splits) * (D + 2);
     float m = -3e38f, denom = 0, acc = 0;
     for (unsigned s = 0; s < splits; s++) m = fmaxf(m, p[s * (D + 2)]);
     for (unsigned s = 0; s < splits; s++) {
@@ -2853,7 +2871,6 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     if (!T || !H || !Hkv || H % Hkv || (D != 32 && D != 128 && D != 256) ||
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
-    const unsigned keys = sparse ? stride : pos0 + T;
     if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
         !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
         ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
@@ -2863,20 +2880,24 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
             H,Hkv,pos0,stride,sparse,scale);
         return launched();
     }
-    const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
-    if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
-    const dim3 grid((H + 3) / 4, T, splits);
+    /* With partial scratch these are decode rows: row t splits its keys like
+     * the one-token decode at pos0 + t, so MTP verify rows round exactly like
+     * plain decode. Dense key counts grow with the row, so the last row takes
+     * the most splits. */
+    const unsigned max_splits = partial ? attn_splits(attn_keys(sparse, stride, pos0 + T - 1)) : 1;
+    if (partial && !tensor(partial, ((uint64_t)(T - 1) * 64 + max_splits) * H * (D + 2) * 4)) return 0;
+    const dim3 grid((H + 3) / 4, T, max_splits);
 #define QWEN_ATTN(DIM) launch(attention<DIM>, grid, 128, 0, (float *)out->ptr, \
         partial ? (float *)partial->ptr : nullptr, (const float *)q->ptr, (const float *)gate->ptr, \
         (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : nullptr, \
-        sparse ? (const unsigned *)count->ptr : nullptr, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
+        sparse ? (const unsigned *)count->ptr : nullptr, H, Hkv, pos0, stride, sparse, scale)
     if (D == 32) { QWEN_ATTN(32); }
     else if (D == 128) { QWEN_ATTN(128); }
     else { QWEN_ATTN(256); }
 #undef QWEN_ATTN
     if (!launched()) return 0;
-    if (splits > 1) launch(attn_merge, dim3(H, T), D, 0, (float *)out->ptr,
-        (const float *)partial->ptr, (const float *)gate->ptr, H, D, splits);
+    if (max_splits > 1) launch(attn_merge, dim3(H, T), D, 0, (float *)out->ptr,
+        (const float *)partial->ptr, (const float *)gate->ptr, H, D, pos0, stride, sparse);
     return launched();
 }
 

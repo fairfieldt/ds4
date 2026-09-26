@@ -995,6 +995,78 @@ static void test_attn_groups(void) {
     test_attn_mm_keys(8, 8193, true, 511, 32, true);
     test_attn_mm_keys(2, 32769, false, 6, 24, true);
 }
+
+/* MTP verify rows must round exactly like plain decode: each row of a 2- or
+ * 3-row decode equals, byte for byte, the one-token decode at its own
+ * position on the same caches.  Positions cover one split, the split count
+ * stepping at 32 keys, the keys-per-split step under the 64-split cap and
+ * sparse rows. */
+static void test_attn_decode_rows_exact(uint32_t H, uint32_t D, uint32_t pos0, uint32_t T,
+                                        bool sparse, uint32_t stride) {
+    const uint32_t Hkv = 2, cap = pos0 + T;
+    const uint64_t hd = (uint64_t)H * D, qn = T * hd, kvn = (uint64_t)cap * Hkv * D;
+    const float scale = 1.0f / sqrtf((float)D);
+    float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
+    _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2);
+    int32_t *sel = malloc((uint64_t)T * stride * 4);
+    uint32_t *cnt = malloc(T * 4);
+    require_ok(kc && vc && sel && cnt, "attention rows exact allocation");
+    for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(2.0f * frand()); vc[i] = (_Float16)frand(); }
+    for (uint32_t t = 0; t < T; t++) {
+        cnt[t] = stride - 3u * t;
+        for (uint32_t j = 0; j < cnt[t]; j++)
+            sel[(uint64_t)t * stride + j] = (int32_t)((j * 7919u + 13u * t) % (pos0 + t + 1u));
+    }
+    ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
+    ds4_gpu_tensor *rows = upload(NULL, qn), *one = upload(NULL, qn);
+    ds4_gpu_tensor *part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(T, H, D) * 4);
+    require_ok(gk && gv && gsel && gcnt && part && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) &&
+               ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * stride * 4) &&
+               ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attention rows exact setup");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(rows, gq, ggate, gk, gv, gsel, gcnt, part, T, H, Hkv, D,
+                                                pos0, sparse, stride, scale), "attention decode rows");
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *qt = ds4_gpu_tensor_view(gq, t * hd * 4, hd * 4);
+        ds4_gpu_tensor *gt = ds4_gpu_tensor_view(ggate, t * hd * 4, hd * 4);
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_view(one, t * hd * 4, hd * 4);
+        ds4_gpu_tensor *st = ds4_gpu_tensor_view(gsel, (uint64_t)t * stride * 4, (uint64_t)stride * 4);
+        ds4_gpu_tensor *ct = ds4_gpu_tensor_view(gcnt, (uint64_t)t * 4, 4);
+        require_ok(qt && gt && ot && st && ct &&
+                   ds4_gpu_qwen4_attn_decode_tensor(ot, qt, gt, gk, gv, st, ct, part, 1, H, Hkv, D,
+                                                    pos0 + t, sparse, stride, scale), "attention one-token decode");
+        ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(ot);
+        ds4_gpu_tensor_free(gt); ds4_gpu_tensor_free(qt);
+    }
+    float *a = download(rows, qn), *b = download(one, qn);
+    for (uint64_t i = 0; i < qn; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            fprintf(stderr, "attention rows exact: T=%u pos0=%u %s row %llu differs at %llu (%.9g vs %.9g)\n",
+                    T, pos0, sparse ? "sparse" : "dense", (unsigned long long)(i / hd),
+                    (unsigned long long)(i % hd), a[i], b[i]);
+            exit(1);
+        }
+    }
+    printf("  attn decode rows T=%u H=%u D=%u pos0=%u %-6s byte-exact against one-token decode\n",
+           T, H, D, pos0, sparse ? "sparse" : "dense");
+    free(a); free(b); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
+    ds4_gpu_tensor_free(part); ds4_gpu_tensor_free(one); ds4_gpu_tensor_free(rows);
+    ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk);
+    ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gq);
+}
+
+static void test_attn_decode_rows(void) {
+    static const struct { uint32_t pos0, T; } dense[] = {
+        {5, 2}, {5, 3}, {30, 3}, {125, 3}, {126, 2}, {1000, 3}, {2046, 3}, {2047, 2}, {3000, 2},
+    };
+    for (unsigned i = 0; i < sizeof(dense) / sizeof(dense[0]); i++)
+        test_attn_decode_rows_exact(24, 256, dense[i].pos0, dense[i].T, false, 8);
+    test_attn_decode_rows_exact(24, 256, 8193, 2, true, 2052);
+    test_attn_decode_rows_exact(24, 256, 8193, 3, true, 2052);
+    test_attn_decode_rows_exact(24, 256, 40, 3, true, 24);
+    test_attn_decode_rows_exact(4, 128, 60, 3, false, 8);
+}
 #endif
 
 /* ---- PLE ---- */
@@ -3654,6 +3726,7 @@ int main(void) {
     test_attn_mm(9, 128, false);
 #ifndef __APPLE__
     test_attn_groups();
+    test_attn_decode_rows();
 #endif
     test_gdn(&arena, 2, 6, 32, 7);
     test_gdn(&arena, 2, 6, 64, 9);
