@@ -3384,6 +3384,18 @@ extern "C" void ds4_gpu_host_free(void *p) {
     if (p) (void)cudaFreeHost(p);
 }
 
+/* D2D copy queued on the decode stream; the host does not wait. */
+extern "C" int ds4_gpu_tensor_copy_queued(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                          const ds4_gpu_tensor *src, uint64_t src_offset,
+                                          uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) return 0;
+    if (bytes == 0) return 1;
+    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset, (const char *)src->ptr + src_offset,
+                                   (size_t)bytes, cudaMemcpyDeviceToDevice, cuda_decode_stream()),
+                   "tensor copy queued");
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
