@@ -3667,6 +3667,18 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* CUDA only.  Decode (n_tokens <= 3) GDN front: the qkv/gate Q8 projections
+ * with alpha/beta folded into their launch, then conv and q/k norm, in
+ * place of the qkv/gate pair plus gdn_front_tensor.  Returns 0 when it does
+ * not apply (nothing launched), 1 when the front ran, -1 on error. */
+int ds4_gpu_qwen4_gdn_proj_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *conv_state, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,
+        uint64_t qkv_offset, uint64_t gate_offset, uint64_t conv_offset, uint64_t alpha_offset,
+        uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset, uint32_t alpha_type,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */

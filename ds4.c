@@ -59262,17 +59262,39 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
-    if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
+    int front = 0;
+#ifndef DS4_HAS_QWEN4_METAL
+    /* CUDA, a token or the MTP verify rows: the alpha/beta projections join
+     * the qkv+gate launch.  On CUDA the Q8 pair below and qwen4_gemv_pair
+     * launch the same kernel with or without MTP, and the fused kernel rounds
+     * every row as the separate ones do at any T, so verify rows stay exact. */
+    if (T <= 3u && qwen4_graph_fused(g, T) && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0 &&
+        l->lin_qkv->dim[0] == DS4_N_EMBD && l->lin_gate->dim[0] == DS4_N_EMBD &&
+        l->lin_qkv->dim[1] == conv_dim && l->lin_gate->dim[1] == (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM &&
+        l->lin_alpha->type == l->lin_beta->type) {
+        front = ds4_gpu_qwen4_gdn_proj_tensor(g->qkv, g->z, g->layer_lin_hist[il], g->mixed, g->ga, g->gb,
+            m->map, m->size, l->lin_qkv->abs_offset, l->lin_gate->abs_offset, l->lin_conv->abs_offset,
+            l->lin_alpha->abs_offset, l->lin_beta->abs_offset, l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+            l->lin_alpha->type, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV,
+            DS4_N_EMBD, g->snap_after_first ? g->snap_lin_hist[il] : NULL, 0u,
+            g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u);
+        if (front < 0) return false;
+    }
+#endif
+    if (!front && T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
         paired = ds4_gpu_qwen4_q8_pair_tensor(g->qkv, g->z, m->map, m->size,
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
             l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T) != 0;
     }
-    if (!paired && !(qwen4_gemv_pair(g->qkv, g->z, m, l->lin_qkv, l->lin_gate, g->mixed, T))) {
+    if (!front && !paired && !(qwen4_gemv_pair(g->qkv, g->z, m, l->lin_qkv, l->lin_gate, g->mixed, T))) {
         return false;
     }
-    bool ok;
-    if (qwen4_graph_fused(g, T)) {
+    bool ok = true;
+    if (front) {
+        /* the fused front ran projections, conv and prep */
+    } else if (qwen4_graph_fused(g, T)) {
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
                                             l->lin_conv->abs_offset, l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
                                             l->lin_a->abs_offset, l->lin_dt_bias->abs_offset, l->lin_alpha->type, T,

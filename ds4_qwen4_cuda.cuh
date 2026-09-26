@@ -1833,14 +1833,11 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
  * row. Split each row's K across the eight warps of a block instead. The
  * per-row arithmetic is the same for every T, so MTP verify rows keep
  * matching single-token decode. */
+/* Lane partials of one warp's split-K part, groups [g0, g1) of 128. */
 template<unsigned TYPE, unsigned ROWS>
-__device__ __forceinline__ void matvec_split_body(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
-    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    __shared__ float part[8][ROWS];
-    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
-    const char *wr = w + (uint64_t)row * stride;
-    float acc[ROWS] = {};
+__device__ __forceinline__ void split_row_acc(float (&acc)[ROWS], const char *wr, const float *x,
+        unsigned T, unsigned K, unsigned g0, unsigned g1) {
+    const unsigned lane = threadIdx.x & 31;
     #pragma unroll 4
     for (unsigned g = g0; g < g1; g++) {
         const unsigned i = g * 128 + lane * 4;
@@ -1867,6 +1864,16 @@ __device__ __forceinline__ void matvec_split_body(float *out, const char *w, con
             }
         }
     }
+}
+
+template<unsigned TYPE, unsigned ROWS>
+__device__ __forceinline__ void matvec_split_body(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    __shared__ float part[8][ROWS];
+    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
+    float acc[ROWS] = {};
+    split_row_acc<TYPE,ROWS>(acc, w + (uint64_t)row * stride, x, T, K, g0, g1);
     #pragma unroll
     for (unsigned t = 0; t < ROWS; t++) if (t < T) {
         const float v = sum(acc[t]);
@@ -3029,6 +3036,11 @@ __global__ void conv_slots(float *x, float *history, const float *w, row_slots s
     conv_body(x+(uint64_t)r*C,history+(uint64_t)slots.slot[r]*state_stride,w,1,C,K,activate,NULL,0,NULL,0);
 }
 
+/* Shared by gdn_prep and the fused decode projection, so both round alike. */
+__device__ __forceinline__ float gdn_decay(float a, float A, float bias) { return expf(A * softplus(a + bias)); }
+
+/* ACT = false: the decode projection already activated alpha/beta. */
+template<bool ACT>
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
                          unsigned Hk, unsigned Hv, unsigned D) {
     pdl_enter();
@@ -3040,9 +3052,9 @@ __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const f
     qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
     ks = rsqrtf(sum(ks) + 1e-6f);
     for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
-    if (!h) for (unsigned j = lane; j < Hv; j += 32) {
+    if (ACT && !h) for (unsigned j = lane; j < Hv; j += 32) {
         const uint64_t p = (uint64_t)t * Hv + j;
-        a[p] = expf(A[j] * softplus(a[p] + bias[j]));
+        a[p] = gdn_decay(a[p], A[j], bias[j]);
         b[p] = sigmoid(b[p]);
     }
 }
@@ -3124,6 +3136,59 @@ __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, un
     for (unsigned i = 0; i < npt; i++) o[idx + i] = o[idx + i] * r * w[k0 + i] * sigmoid(z[idx + i]);
 }
 
+/* The decode (T <= 3: a token, or the MTP verify rows) GDN projections in
+ * one launch.  Blocks run, in order:
+ * - ab_tiles (0 or 2*Hv) F32 alpha/beta rows, split-K exactly like
+ *   matvec_split<0,ROWS> (each of the four warps runs two of its eight
+ *   parts, in order), activated as gdn_prep does;
+ * - the qkv Q8 rows, then the gate Q8 rows, one warp per row.
+ * Every output rounds as with the separate launches, at any T, so verify
+ * rows keep matching single-token decode. */
+struct gdn_proj_args {
+    const char *wqkv, *wz, *walpha, *wbeta;
+    float *qkv, *z, *ga, *gb;
+    const float *A, *bias;
+    unsigned C, Mz, Hv, ab_tiles;
+};
+
+template<unsigned ROWS>
+__global__ void gdn_proj(const __grid_constant__ gdn_proj_args p, const float *x, unsigned T, unsigned K) {
+    pdl_enter();
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    unsigned b = blockIdx.x;
+    if (b < p.ab_tiles) {
+        __shared__ float part[8][ROWS];
+        const bool beta = b >= p.Hv;
+        const unsigned row = beta ? b - p.Hv : b, groups = K / 128;
+        const char *wr = (beta ? p.wbeta : p.walpha) + (uint64_t)row * K * 4;
+        #pragma unroll 1
+        for (unsigned j = warp; j < 8; j += 4) {
+            float acc[ROWS] = {};
+            split_row_acc<0,ROWS>(acc, wr, x, T, K, groups * j / 8, groups * (j + 1) / 8);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float v = sum(acc[t]);
+                if (!lane) part[j][t] = v;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < ROWS && threadIdx.x < T) {
+            float v = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) v += part[j][threadIdx.x];
+            const uint64_t o = (uint64_t)threadIdx.x * p.Hv + row;
+            if (beta) p.gb[o] = sigmoid(v);
+            else p.ga[o] = gdn_decay(v, p.A[row], p.bias[row]);
+        }
+        return;
+    }
+    b -= p.ab_tiles;
+    const uint64_t stride = (uint64_t)K / 32 * 34;
+    const unsigned qkv_tiles = (p.C + 3) / 4;
+    if (b >= qkv_tiles) matvec_q8_body<ROWS>(p.z, p.wz, x, T, K, p.Mz, stride, (b - qkv_tiles) * 4 + warp);
+    else matvec_q8_body<ROWS>(p.qkv, p.wqkv, x, T, K, p.C, stride, b * 4 + warp);
+}
+
 __global__ void ngram_gate(float *gated, float *normed, const float *R, const float *key,
                            const float *val, const float *gk, const float *gq, const float *gc,
                            unsigned E, unsigned hc, float eps) {
@@ -3196,7 +3261,7 @@ extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4)) return 0;
     const char *A = weight(map, size, ao, (uint64_t)Hv * 4), *bias = weight(map, size, bo, (uint64_t)Hv * 4);
     if (!A || !bias) return 0;
-    launch(gdn_prep, dim3(Hk, T), 32, 0, (float *)qkv->ptr,
+    launch(gdn_prep<true>, dim3(Hk, T), 32, 0, (float *)qkv->ptr,
         (float *)a->ptr, (float *)b->ptr, (const float *)A, (const float *)bias, Hk, Hv, D);
     return launched();
 }
@@ -3758,6 +3823,56 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     launch(conv, (C+255)/256, 256, 0, (float *)qkv->ptr,(float *)state->ptr,(const float *)w,
         T,C,CK,true,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2);
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
+}
+
+/* Decode GDN front for T <= 3 (a token or the MTP verify rows), in place of
+ * the qkv+gate pair and gdn_front_tensor: the alpha/beta projections (F32)
+ * run as extra blocks of the qkv+gate launch and come out activated.
+ * Returns 0 without launching when that does not apply (the caller runs the
+ * separate kernels), 1 when the front ran, -1 on a launch error. */
+extern "C" int ds4_gpu_qwen4_gdn_proj_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *hist, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *map, uint64_t size,
+        uint64_t qkv_off, uint64_t gate_off, uint64_t conv_off, uint64_t alpha_off, uint64_t beta_off,
+        uint64_t ssm_a_off, uint64_t dt_off, uint32_t ab_type,
+        uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
+        ds4_gpu_tensor *snap, uint32_t st, ds4_gpu_tensor *snap2, uint32_t st2) {
+    using namespace qwen4_cuda;
+    const uint64_t C = ((uint64_t)2*Hk+Hv)*D, Mz = (uint64_t)Hv*D, rb = row_bytes(8,K), hb = (uint64_t)(CK-1)*C*4;
+    /* the qkv/gate rows must be the single-warp Q8 rows multi_q8 runs */
+    if (!T || T > 3 || !Hk || !Hv || D < 32 || D > 128 || D%32 || !K || K%128 || !rb || CK < 2 || CK > 4 ||
+        C > UINT_MAX || C <= 1536 || Mz <= 1536 ||
+        !tensor(mixed,(uint64_t)T*K*4) || ((uintptr_t)mixed->ptr & 15) ||
+        !tensor(qkv,(uint64_t)T*C*4) || !tensor(z,(uint64_t)T*Mz*4) || !tensor(hist,hb) ||
+        !tensor(ga,(uint64_t)T*Hv*4) || !tensor(gb,(uint64_t)T*Hv*4) ||
+        (snap && (st >= T || !tensor(snap,hb))) || (snap2 && (st2 >= T || !tensor(snap2,hb)))) return 0;
+    const char *wqkv = weight(map,size,qkv_off,rb*C), *wz = weight(map,size,gate_off,rb*Mz);
+    const char *cw = weight(map,size,conv_off,C*CK*4);
+    const char *A = weight(map,size,ssm_a_off,(uint64_t)Hv*4), *bias = weight(map,size,dt_off,(uint64_t)Hv*4);
+    const uint64_t ab_rb = row_bytes(ab_type,K);
+    const char *wa = ab_rb ? weight(map,size,alpha_off,ab_rb*Hv) : NULL;
+    const char *wb = ab_rb ? weight(map,size,beta_off,ab_rb*Hv) : NULL;
+    if (!wqkv || !wz || !cw || !A || !bias || !wa || !wb) return 0;
+    /* only where matvec_dispatch would run alpha/beta as matvec_split<0,ROWS> */
+    const bool fold_ab = ab_type == 0 &&
+        Hv <= 1536 && K >= 1024 && !((uintptr_t)wa & 15) && !((uintptr_t)wb & 15) && !(ab_rb & 15);
+    if (!fold_ab) return 0;
+    gdn_proj_args p = {};
+    p.wqkv = wqkv; p.wz = wz; p.walpha = wa; p.wbeta = wb;
+    p.qkv = (float *)qkv->ptr; p.z = (float *)z->ptr; p.ga = (float *)ga->ptr; p.gb = (float *)gb->ptr;
+    p.A = (const float *)A; p.bias = (const float *)bias;
+    p.C = (unsigned)C; p.Mz = (unsigned)Mz; p.Hv = Hv; p.ab_tiles = 2*Hv;
+    const unsigned grid = p.ab_tiles + (unsigned)((C+3)/4 + (Mz+3)/4);
+    const float *x = (const float *)mixed->ptr;
+    if (T == 1) launch(gdn_proj<1>,grid,128,0,p,x,T,K);
+    else if (T == 2) launch(gdn_proj<2>,grid,128,0,p,x,T,K);
+    else launch(gdn_proj<4>,grid,128,0,p,x,T,K);
+    if (!launched()) return -1;
+    launch(conv, (unsigned)((C+255)/256), 256, 0, (float *)qkv->ptr,(float *)hist->ptr,(const float *)cw,
+        T,(unsigned)C,CK,true,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2);
+    launch(gdn_prep<false>,dim3(Hk,T),32,0,(float *)qkv->ptr,
+        (float *)ga->ptr,(float *)gb->ptr,(const float *)A,(const float *)bias,Hk,Hv,D);
+    return launched() ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
