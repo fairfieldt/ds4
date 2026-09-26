@@ -1,0 +1,19 @@
+branch,prompt,mode,control,control_tps,control_range,candidate,candidate_tps,candidate_range,gain_pct,gain_definition,outputs_identical
+qwen-cuda-mtp-depth-ev,explain,mtp,expected-value policy,231.65,230.90..232.63,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),223.52,223.13..223.98,+3.64,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,json,mtp,expected-value policy,272.14,271.50..272.58,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),272.14,271.87..272.47,+0.00,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,math,mtp,expected-value policy,258.88,258.51..259.11,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),243.28,243.05..243.53,+6.41,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,oped,mtp,expected-value policy,192.74,192.48..193.05,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),199.47,199.23..199.67,-3.37,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,rust,mtp,expected-value policy,248.69,248.42..249.04,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),234.97,234.77..235.22,+5.84,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,sql,mtp,expected-value policy,243.98,243.81..244.11,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),240.31,240.14..240.48,+1.53,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,table,mtp,expected-value policy,261.10,260.88..261.33,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),245.79,245.65..245.99,+6.23,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,translate,mtp,expected-value policy,202.05,201.88..202.18,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),207.81,207.71..207.88,-2.77,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,code,mtp,expected-value policy,256.94,256.02..258.18,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),255.80,254.89..256.66,+0.45,EV / old - 1,yes
+qwen-cuda-mtp-depth-ev,prose,mtp,expected-value policy,192.01,191.30..192.78,old depth rule (DS4_QWEN4_NO_DEPTH_EV=1),198.36,197.97..198.77,-3.20,EV / old - 1,yes
+qwen-cuda-q8-split-k,longcode,mtp,split-K off (default),202.18,201.30..203.34,DS4_QWEN4_Q8_SPLIT_K=1,208.53,207.71..209.56,+3.14,on / off - 1,yes
+qwen-cuda-q8-split-k,longdoc,mtp,split-K off (default),208.52,208.18..208.86,DS4_QWEN4_Q8_SPLIT_K=1,215.86,213.99..216.50,+3.52,on / off - 1,NO
+qwen-cuda-q8-split-k,code,mtp,split-K off (default),252.38,251.77..253.31,DS4_QWEN4_Q8_SPLIT_K=1,258.90,258.37..259.58,+2.59,on / off - 1,yes
+qwen-cuda-q8-split-k,prose,mtp,split-K off (default),196.70,196.39..197.03,DS4_QWEN4_Q8_SPLIT_K=1,203.17,202.77..203.45,+3.29,on / off - 1,yes
+qwen-cuda-q8-split-k,longcode,plain,split-K off (default),164.17,164.00..164.42,DS4_QWEN4_Q8_SPLIT_K=1,165.98,165.73..166.24,+1.10,on / off - 1,yes
+qwen-cuda-q8-split-k,longdoc,plain,split-K off (default),163.88,163.83..163.96,DS4_QWEN4_Q8_SPLIT_K=1,165.14,162.68..165.70,+0.77,on / off - 1,NO
+qwen-cuda-q8-split-k,code,plain,split-K off (default),169.71,169.53..169.95,DS4_QWEN4_Q8_SPLIT_K=1,171.68,171.56..171.82,+1.16,on / off - 1,yes
+qwen-cuda-q8-split-k,prose,plain,split-K off (default),169.26,169.14..169.36,DS4_QWEN4_Q8_SPLIT_K=1,171.22,171.14..171.30,+1.15,on / off - 1,yes

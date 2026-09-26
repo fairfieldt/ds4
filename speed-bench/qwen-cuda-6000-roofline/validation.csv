@@ -1,0 +1,32 @@
+check,build,setting,result,base_result
+CUDA build,every commit of main and both side-branch heads,,rc=0; 2 warnings (same as base),2 warnings
+make -j8 ds4 (macOS Metal),every commit of main and both side-branch heads,,rc=0; 0 warnings,
+make tests/test_qwen4_kernels (macOS Metal),main head,,builds,
+tests/test_qwen4_cuda,every commit of main and both side-branch heads,full,all qwen4 kernel tests passed,
+tests/test_qwen4_host_path,every commit of main and both side-branch heads,plain + batch,passed,
+tests/test_qwen4_host_path,every commit of main and both side-branch heads,--mtp,passed,
+tests/test_qwen4_cuda,split-K side branch head,DS4_TEST_QWEN4_ROWS=1 with DS4_QWEN4_Q8_SPLIT_K=1,passed,
+compute-sanitizer memcheck,main,full test_qwen4_cuda,0 errors,
+greedy token hashes (qwen_decode_ab),main,10 short prompts + longcode + longdoc; plain and --mtp; ctx 4096,identical to base in all 24 cases,
+greedy token hashes (cross-binary ABBA),main,same 24 cases at 450 W,tokens_same=yes in all 24,
+greedy token hashes (cross-binary ABBA),measured series with the old depth rule,same 24 cases at 600 W,tokens_same=yes in all 24,
+session --verify plain,main,ctx 256 gen 32 warmup 4 concurrency 1/4/8/16,batched == sequential (all),same
+session --spec --verify,main,ctx 256 gen 32 warmup 4 concurrency 1/16,speculative == plain greedy,same
+session --spec --verify,main,ctx 256 gen 32 warmup 4 concurrency 8,FAIL stream 0 token 33 (spec 428 / plain 67; pre-existing),identical failure
+session --spec --verify,split-K side branch (split-K off),ctx 256 gen 32 warmup 4 concurrency 1/3/4,pass,
+session --spec --verify,split-K side branch (split-K off),ctx 256 gen 32 warmup 4 concurrency 2 and 8,FAIL stream 0 token 33 (pre-existing near-tie),
+session --spec --verify,split-K side branch (DS4_QWEN4_Q8_SPLIT_K=1),ctx 256 gen 32 warmup 4 concurrency 1/2,pass,
+session --spec --verify,split-K side branch (DS4_QWEN4_Q8_SPLIT_K=1),ctx 256 gen 32 warmup 4 concurrency 3/4/8,FAIL stream 0 token 33,
+qwen_decode_ab longdoc plain and --mtp,split-K side branch (DS4_QWEN4_Q8_SPLIT_K=1),6 blocks each,hash daf80c24 (greedy flip at token 109; top-2 gap 0.0146),a8aa66ea
+qwen_decode_ab 10 prompts --mtp,depth-ev side branch,EV policy vs DS4_QWEN4_NO_DEPTH_EV=1,outputs identical in every block,
+qwen_decode_ab oped --mtp,main,auto depth,hash c3e13776 (plain is f9a1f845; pre-existing),c3e13776
+compute-sanitizer racecheck,measured series,ROWS / GDN_FRONT / PRESYNC subsets,0 hazards each,
+session --verify plain,measured series,ctx 4096 concurrency 1/4/8 gen 24,batched == sequential (all),same
+tests/test_cuda_session_batch,measured series,DS4_TEST_CUDA_SINGLE_GPU=1,FAIL max_abs 3.11136e-05 differing 243146 (pre-existing),identical (max_abs 3.11136e-05 differing 243146)
+qwen_decode_ab oped --mtp,measured series,DS4_QWEN4_MTP_DEPTH=2,hash c3e13776,c3e13776
+qwen_decode_ab oped --mtp,measured series,DS4_QWEN4_MTP_DEPTH=3,hash f9a1f845 (= plain),f9a1f845
+split-K 100-case NLL (qwen38-flash-alibaba-100 ctx 4096),measured series,split-K off / on,0.290510 / 0.290498; API top-1 5127/5568 both,
+CUDA build (make -j12 CUDA_ARCH=native),every commit of this series rebased onto the fused-decode series and both rebased side branches,"ds4, ds4-bench, session bench, kernel/n-gram/host-path/vision tests, score_official",rc=0; 0 warnings,
+make -B -j8 ds4 (macOS Metal),every commit of this series rebased onto the fused-decode series and both rebased side branches,,rc=0; 0 warnings,
+tests/test_qwen4_ngrams (CPU),every commit of this series rebased onto the fused-decode series and both rebased side branches,,passed,
+tests/test_qwen4_cuda,every commit of this series rebased onto the fused-decode series and both rebased side branches,full,all qwen4 kernel tests passed,

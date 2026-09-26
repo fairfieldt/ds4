@@ -1,0 +1,1 @@
+Convert the following SQL schema description into PostgreSQL CREATE TABLE statements with primary keys, foreign keys, NOT NULL constraints and indexes, then write five example queries with comments: a library system with members, books, authors (many-to-many with books), copies, loans, reservations and fines.

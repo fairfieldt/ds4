@@ -1,0 +1,17 @@
+build,mode,power_limit_w,block,code_tps,prose_tps
+base,plain,450,1,140.99,140.68
+base,mtp,450,1,229.17,176.53
+base,plain,600,2,140.84,140.49
+base,mtp,600,2,231.82,177.52
+base,plain,600,3,140.79,140.50
+base,mtp,600,3,231.88,177.53
+base,plain,450,4,140.68,140.36
+base,mtp,450,4,226.97,175.42
+main,plain,450,1,170.57,170.19
+main,mtp,450,1,255.37,198.91
+main,plain,600,2,172.39,172.00
+main,mtp,600,2,269.62,205.85
+main,plain,600,3,172.39,171.94
+main,mtp,600,3,269.60,205.81
+main,plain,450,4,170.47,170.08
+main,mtp,450,4,255.11,198.64

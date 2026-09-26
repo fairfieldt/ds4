@@ -1,0 +1,1 @@
+A train leaves city A at 08:15 travelling at 84 km/h toward city B, 427 km away. A second train leaves city B at 09:05 at 106 km/h toward city A. Work out, step by step and showing every calculation, when and where they meet, then check the answer.

@@ -1,0 +1,19 @@
+commit,feature,measured_by_turning,targets,standalone_plain_code_pct,standalone_plain_prose_pct,standalone_mtp_code_pct,standalone_mtp_prose_pct,combined_plain_code_pct,combined_plain_prose_pct,combined_mtp_code_pct,combined_mtp_prose_pct,status,notes
+945c25b,GPU argmax for greedy decode; logits kept on the device,gpu-argmax off,plain,+1.59,+1.61,-0.02,-0.01,+1.66,+1.63,+0.02,+0.01,kept,nsys: inter-token bubble ~172 -> ~43 us
+eb1bb46,N-gram staging without intra-token device syncs,async-ngram off,plain+MTP,+0.48,+0.48,+0.43,+0.47,+0.47,+0.46,+0.41,+0.41,kept,at the ~0.4% bar in both modes; consistent in every block
+00ea158,Batched sessions: device argmax instead of per-session logits downloads,batch-gpu-argmax off,batched,,,,,,,,,kept,standalone wall incl. selection +2.7% (8 sessions) +3.7% (16); combined wall +3.2% / +3.8%
+9739c9c,Router shared-gate row loaded before the PDL wait,router-preload off,plain+MTP,+3.24,+3.22,+1.77,+2.25,+4.33,+4.28,+1.80,+1.65,kept,router top-k 7.88 -> 3.3 us per launch
+8781645,Router and GDN gate weights read from exact BF16 copies,bf16-gates off,plain+MTP,+1.26,+1.27,+0.72,+0.94,+1.26,+1.24,+0.72,+0.70,kept,router GEMV 4.4 -> 1.5 us (with the pre-wait loads)
+a906488,HC/router/gate weights loaded before the PDL wait,presync-load off,plain+MTP,+5.83,+5.80,+3.48,+4.12,+6.59,+6.50,+2.12,+1.92,kept,its measurement switch also disabled the hc_norm late trigger
+1e89c0f,hc_norm late PDL trigger (T=1),hc-norm-late-trigger off,plain,+0.69,+0.68,0.00,0.00,+0.93,+0.94,+0.04,-0.01,kept,
+55c641f,GDN alpha/beta folded into the qkv+gate launch,gdn-ab-fold off,plain+MTP,+2.54,+2.52,+1.82,+2.03,+2.38,+2.30,+1.51,+1.40,kept,72 launches/token removed
+f3fc2e6,GDN causal conv in the qkv epilogue,gdn-conv-fold off,plain+MTP,+1.44,+1.44,+0.57,+0.14,+1.71,+1.68,+0.66,+0.69,kept,36 launches/token removed
+(dropped),GDN scan state loaded before the PDL wait,gdn-state-preload off,plain+MTP,+0.46 / +0.33,+0.43 / +0.35,+0.15 / +0.12,+0.15 / +0.20,+0.32,+0.33,+0.12,+0.13,dropped,below the ~0.4% bar in combination; MTP t < 1.1
+af2ac5b,MXFP4 down kernel latency rework,moe-down-lat off,plain+MTP,+1.35,+1.31,+0.83,+0.82,+1.66,+1.65,+0.82,+0.79,kept,moe_down 11.8 -> 9.6 us per launch
+cd004b0,Shared-expert L2 prefetch in the router window,shared-prefetch off,plain+MTP,+0.49,+0.47,+0.23,+0.32,+1.06,+1.04,+0.38,+0.34,kept,worth twice its standalone number once the router preload opens the window
+side branch qwen-cuda-q8-split-k,Split-K for the 2560x6144 Q8 projections,q8-split-k on (opt-in),plain+MTP,+0.91,+0.93,+2.83,+3.67,+1.17,+1.17,+2.46,+2.21,side branch (opt-in),combined = measured-series final build with it enabled; fails the exactness gate (longdoc greedy flip)
+9509296,Block-parallel idx_select (sparse path),idx-select-scan off,ctx >= 2051,+1.94 (longcode),+1.84 (longdoc),+1.81 (longcode),+1.74 (longdoc),+2.20 (longcode),+2.18 (longdoc),+2.21 (longcode),+2.12 (longdoc),kept,indexer 6.6 -> 3.4 us per launch at ctx 4096
+21ed16a,3-row MTP verify gate/mix in one launch,hc-mix3 off,MTP,,,+1.36,+1.53,,,+0.38,+0.46,kept,MTP-only; at the bar in combination
+4ef0df9,MTP catch-up staging and projection in one launch,mtp-stage-rows off,MTP,,,+0.65,+0.48,,,+0.67,+0.50,kept,
+6b42d29,Only the last MTP catch-up row finished,mtp-row-trim off,MTP,,,+0.90,+0.49,,,+0.97,+0.52,kept,
+side branch qwen-cuda-mtp-depth-ev,Expected-value MTP depth policy,depth-ev off,MTP,,,+1.04,+0.81,,,+0.37,-3.50,side branch,"measured-series final build over 10 prompts: mean +1.41%; on the new main stack: mean +1.48%, -2.8 to -3.4% on prose/oped/translate"

@@ -1,0 +1,1 @@
+Explain, step by step and with concrete numbers, how TCP congestion control (slow start, congestion avoidance, fast retransmit and fast recovery) reacts to a single packet loss on a 100 Mbit/s link with 40 ms RTT.
