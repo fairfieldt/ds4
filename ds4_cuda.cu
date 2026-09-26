@@ -1496,6 +1496,8 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+namespace qwen4_cuda { static void qwen4_bf16_cache_release(void); }   /* ds4_qwen4_cuda.cuh */
+
 static void cuda_q8_f16_cache_release_all(void) {
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -1503,6 +1505,7 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
+    qwen4_cuda::qwen4_bf16_cache_release();
 }
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {

@@ -1722,42 +1722,65 @@ static void test_gdn_rows(arena_t *a) {
     puts("  GDN rows: reordered ragged sessions, first-token snapshots and guards byte-exact");
 }
 
-/* ds4_qwen4_cuda.cuh, tests only: the top-k through router() at every shape. */
+/* ds4_qwen4_cuda.cuh, tests only: the top-k through router() at every
+ * shape, and dense_mm on the weight as stored (no BF16 copy). */
 int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
         uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS);
+int ds4_gpu_qwen4_dense_mm_ref_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M);
 
 /* The router paths must reproduce the original router GEMV + router() byte
- * for byte (logits, experts, weights, shared gate): router_pre against
- * router() through the reference hook. */
+ * for byte (logits, experts, weights, shared gate), taken through the
+ * reference entry points: router_pre (mode 1) and the BF16 copy of an F32
+ * weight whose low bits are zero (mode 2). An F32 weight with low bits set
+ * keeps its F32 path. */
 static void router_paths_run(arena_t *a, uint64_t woff, uint64_t goff, ds4_gpu_tensor *x, unsigned T,
-                             ds4_gpu_tensor *const *o, bool ref) {
+                             ds4_gpu_tensor *const *o, unsigned mode) {
     const unsigned K = 2560, NE = 512, NS = 10;
-    require_ok(ds4_gpu_qwen4_dense_mm_tensor(o[0],x,a->base,a->size,woff,0u,T,K,NE) &&
-               (ref ? ds4_gpu_qwen4_router_topk_ref_tensor : ds4_gpu_qwen4_router_topk_tensor)(
+    require_ok((mode < 2 ? ds4_gpu_qwen4_dense_mm_ref_tensor : ds4_gpu_qwen4_dense_mm_tensor)(
+                   o[0],x,a->base,a->size,woff,0u,T,K,NE) &&
+               (mode ? ds4_gpu_qwen4_router_topk_tensor : ds4_gpu_qwen4_router_topk_ref_tensor)(
                    o[1],o[2],o[0],x,a->base,a->size,goff,0u,K,o[3],T,NE,NS),
                "router");
 }
 
 static void test_router_paths(arena_t *a) {
-    const unsigned K = 2560, NE = 512, NS = 10;
+    const unsigned K = 2560, NE = 512, NS = 10, G = 48;
     double *sh;
-    const uint64_t woff = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t exact_off = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t inexact_off = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t gdn_off = arena_f32(a,(uint64_t)K*G,&sh,-.08f,.08f); free(sh);
     const uint64_t goff = arena_f32(a,K,&sh,-.05f,.05f); free(sh);
+    uint32_t *bits = (uint32_t *)(a->base + exact_off);
+    for (uint64_t i = 0; i < (uint64_t)K*NE; i++) bits[i] &= 0xffff0000u;
+    bits = (uint32_t *)(a->base + gdn_off);
+    for (uint64_t i = 0; i < (uint64_t)K*G; i++) bits[i] &= 0xffff0000u;
+    const uint64_t offs[2] = {exact_off,inexact_off};
     const unsigned Ts[] = {1,2,3,5,8,13};
-    for (unsigned ti = 0; ti < 6; ti++) {
+    for (unsigned wi = 0; wi < 2; wi++) for (unsigned ti = 0; ti < 6; ti++) {
         const unsigned T = Ts[ti];
         const uint64_t n[4] = {(uint64_t)T*NE,(uint64_t)T*NS,(uint64_t)T*NS,T};
         float *input = rand_vec((uint64_t)T*K,1.0f);
-        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *o[2][4];
-        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 4; j++) o[v][j] = upload(NULL,n[j]);
-        router_paths_run(a,woff,goff,x,T,o[0],true);
-        router_paths_run(a,woff,goff,x,T,o[1],false);
-        for (unsigned j = 0; j < 4; j++) same_bytes("router preload",T,o[0][j],0,o[1][j],0,n[j]*4);
-        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 4; j++) ds4_gpu_tensor_free(o[v][j]);
+        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *o[3][4];
+        for (unsigned v = 0; v < 3; v++) for (unsigned j = 0; j < 4; j++) o[v][j] = upload(NULL,n[j]);
+        for (unsigned v = 0; v < 3; v++) router_paths_run(a,offs[wi],goff,x,T,o[v],v);
+        for (unsigned v = 1; v < 3; v++) for (unsigned j = 0; j < 4; j++)
+            same_bytes(v == 1 ? "router preload" : "router bf16",T,o[0][j],0,o[v][j],0,n[j]*4);
+        for (unsigned v = 0; v < 3; v++) for (unsigned j = 0; j < 4; j++) ds4_gpu_tensor_free(o[v][j]);
         ds4_gpu_tensor_free(x); free(input);
     }
-    puts("  router: preloaded shared gate byte-exact at T=1..13");
+    const unsigned Tg[] = {1,2,3,4,8,9,31};
+    for (unsigned ti = 0; ti < 7; ti++) {
+        const unsigned T = Tg[ti];
+        float *input = rand_vec((uint64_t)T*K,1.0f);
+        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *ref = upload(NULL,(uint64_t)T*G), *out = upload(NULL,(uint64_t)T*G);
+        require_ok(ds4_gpu_qwen4_dense_mm_ref_tensor(ref,x,a->base,a->size,gdn_off,0u,T,K,G),"GDN gate F32");
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out,x,a->base,a->size,gdn_off,0u,T,K,G),"GDN gate BF16");
+        same_bytes("GDN gate bf16",T,ref,0,out,0,(uint64_t)T*G*4);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(x); free(input);
+    }
+    puts("  router: preload and BF16 gates byte-exact at T=1..13; GDN gates BF16 at T=1..31");
 }
 #endif
 

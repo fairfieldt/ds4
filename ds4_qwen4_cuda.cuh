@@ -637,6 +637,10 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         out = make_float4(a.x,a.y,b.x,b.y);
     } else if (TYPE == 0) {
         out = *(const float4 *)(row+i*4);
+    } else if (TYPE == 30) {
+        const uint2 bits = *(const uint2 *)(row+i*2);
+        out = make_float4(__uint_as_float(bits.x<<16),__uint_as_float(bits.x&0xffff0000u),
+                          __uint_as_float(bits.y<<16),__uint_as_float(bits.y&0xffff0000u));
     } else if (TYPE == 8) {
         const char *b = row+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
@@ -1966,13 +1970,14 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
     if (T <= 8 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15) &&
-        (type == 8 || ((type == 0 || type == 1) && !((uintptr_t)w & 15) && !(stride & 15)))) {
+        (type == 8 || ((type == 0 || type == 1 || type == 30) && !((uintptr_t)w & 15) && !(stride & 15)))) {
 #define QWEN_SPLIT(TYPE, N) launch(matvec_split<TYPE, N>, M, 256, 0, out, w, x, T, K, M, stride)
 #define QWEN_SPLIT_T(TYPE) \
         if (T == 1) { QWEN_SPLIT(TYPE, 1); } else if (T == 2) { QWEN_SPLIT(TYPE, 2); } \
         else if (T <= 4) { QWEN_SPLIT(TYPE, 4); } else { QWEN_SPLIT(TYPE, 8); }
         if (type == 0) { QWEN_SPLIT_T(0) }
         else if (type == 1) { QWEN_SPLIT_T(1) }
+        else if (type == 30) { QWEN_SPLIT_T(30) }
         else { QWEN_SPLIT_T(8) }
 #undef QWEN_SPLIT_T
 #undef QWEN_SPLIT
@@ -1999,6 +2004,61 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     }
 #undef QWEN_MV
     return launched();
+}
+
+/* The router and GDN gate projections (ffn_gate_inp, ssm_alpha, ssm_beta)
+ * are stored as F32 but hold widened BF16 values: every element's low 16
+ * bits are zero. The split GEMV reads them from a BF16 copy made on first
+ * use, half the bytes for the same values and the same arithmetic. The
+ * conversion checks every element, and a tensor with any nonzero low bits
+ * keeps its F32 path. Copies are keyed by the resolved device weight and
+ * released with the model's other derived weights; none is made while a
+ * decode graph is being captured. */
+struct qwen_bf16_copy { uint64_t n; char *dst; };
+static std::unordered_map<const char *, qwen_bf16_copy> g_qwen_bf16;
+static int *g_qwen_bf16_inexact;
+
+__global__ void f32_to_bf16_exact(unsigned *out, const uint2 *in, uint64_t pairs, int *inexact) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < pairs;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint2 v = in[i];
+        if ((v.x | v.y) & 0xffffu) *inexact = 1;
+        out[i] = (v.x >> 16) | (v.y & 0xffff0000u);
+    }
+}
+
+static void qwen4_bf16_cache_release(void) {
+    for (auto &c : g_qwen_bf16) if (c.second.dst) (void)cudaFree(c.second.dst);
+    g_qwen_bf16.clear();
+}
+
+static const char *bf16_copy(const char *w, uint64_t n) {
+    if ((n & 1) || ((uintptr_t)w & 7)) return NULL;
+    const auto it = g_qwen_bf16.find(w);
+    if (it != g_qwen_bf16.end()) return it->second.n == n ? it->second.dst : NULL;
+    if (g_decode_graph_capturing) return NULL;
+    const cudaStream_t stream = cuda_decode_stream();
+    char *dst = NULL;
+    int inexact = 1;
+    if ((g_qwen_bf16_inexact || cudaMalloc(&g_qwen_bf16_inexact, sizeof(int)) == cudaSuccess) &&
+        cudaMalloc(&dst, n * 2) == cudaSuccess &&
+        cudaMemsetAsync(g_qwen_bf16_inexact, 0, sizeof(int), stream) == cudaSuccess) {
+        const uint64_t pairs = n / 2;
+        f32_to_bf16_exact<<<(unsigned)std::min<uint64_t>((pairs + 255) / 256, 4096), 256, 0, stream>>>(
+            (unsigned *)dst, (const uint2 *)w, pairs, g_qwen_bf16_inexact);
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaMemcpyAsync(&inexact, g_qwen_bf16_inexact, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) inexact = 1;
+    }
+    (void)cudaGetLastError();
+    if (inexact && dst) { (void)cudaFree(dst); dst = NULL; }
+    g_qwen_bf16[w] = {n, dst};
+    return dst;
+}
+
+/* Whether dense_mm_tensor runs this shape through the split GEMV. */
+static bool split_shape(unsigned T, unsigned K, unsigned M, const float *x) {
+    return T < 32 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15);
 }
 
 template<unsigned TYPE>
@@ -3055,14 +3115,17 @@ extern "C" uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t T, uint32_t H, uint3
     return (uint64_t)T * H * 64 * (D + 2);
 }
 
-extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+/* ref: the weight as stored (no BF16 copy), for the tests' reference. */
+static int dense_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M, bool ref) {
     using namespace qwen4_cuda;
     if (!T || !K || !M || !tensor(x, (uint64_t)T*K*4) || !tensor(out, (uint64_t)T*M*4)) return 0;
     const uint64_t rb = row_bytes(type,K);
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
+    if (!ref && type == 0 && split_shape(T,K,M,(const float *)x->ptr))
+        if (const char *b = bf16_copy(w,(uint64_t)K*M)) { w = b; type = 30; }
     if (rows_tc_shape(type,T,K,M) && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
         rows_projections p = {};
         p.n = 1; p.p[0] = {w,(float *)out->ptr,M,(M+15)/16};
@@ -3090,6 +3153,18 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);
+}
+
+extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return dense_mm(out, x, map, size, off, type, T, K, M, false);
+}
+
+/* Tests only: dense_mm_tensor on the weight as stored, the byte-exact
+ * reference for the BF16 gate copies. */
+extern "C" int ds4_gpu_qwen4_dense_mm_ref_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return dense_mm(out, x, map, size, off, type, T, K, M, true);
 }
 
 extern "C" int ds4_gpu_qwen4_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *map,
