@@ -9,8 +9,9 @@
  * materialized only by the reader that needs it.  Every lazy-logits consumer
  * is compared bit for bit at varying points (argmax, the excluding and
  * EOS-ignoring forms, top logprobs, token logprob, copy_logits, sampling at a
- * positive temperature, payload save/load, rewind and replay), and with --mtp
- * the speculative path must commit the same tokens and frontiers.
+ * positive temperature, payload save/load, rewind and replay); with --mtp
+ * the speculative path must commit the same tokens and frontiers, and
+ * without it native session batches must as well.
  *
  * Not part of `make test`: it needs the model and a CUDA device.
  *   ./tests/test_qwen4_host_path [-m MODEL] [--mtp] [--steps N]
@@ -157,6 +158,45 @@ static void run_plain(ds4_engine *e, const ds4_tokens *prompt, int ctx, int step
     ds4_session_free(b);
 }
 
+/* Native session batches: the candidate keeps each row's logits on the device
+ * as that session's frontier; the reference sessions copy theirs to the host
+ * after every batch.  Both run the same batched kernels, so the frontiers
+ * must match bit for bit. */
+static void run_batch(ds4_engine *e, const ds4_tokens *prompts, int n_prompts, int ctx, int steps) {
+    enum { NB = 4 };
+    char err[160];
+    ds4_session *a[NB] = {0}, *b[NB] = {0};
+    for (int i = 0; i < NB; i++) {
+        if (ds4_session_create(&a[i], e, ctx) != 0 || ds4_session_create(&b[i], e, ctx) != 0) {
+            check(false, "batch session create", -1);
+            goto done;
+        }
+        check(ds4_session_sync(a[i], &prompts[i % n_prompts], err, sizeof(err)) == 0, "batch prefill reference", -1);
+        settle(a[i], -1);
+        check(ds4_session_sync(b[i], &prompts[i % n_prompts], err, sizeof(err)) == 0, "batch prefill candidate", -1);
+    }
+    const int eos = ds4_token_eos(e);
+    for (int step = 0; step < steps && !failures; step++) {
+        ds4_decode_item ia[NB], ib[NB];
+        for (int i = 0; i < NB; i++) {
+            ia[i] = (ds4_decode_item){a[i], ds4_session_argmax(a[i])};
+            ib[i] = (ds4_decode_item){b[i], ds4_session_argmax(b[i])};
+            check(ia[i].token == ib[i].token, "batch argmax", step);
+        }
+        consumers(a[step % NB], b[step % NB], eos, step % 6, step);
+        const int ra = ds4_sessions_eval_batch(ia, NB, err, sizeof(err));
+        for (int i = 0; i < NB; i++) settle(a[i], step);
+        const int rb = ds4_sessions_eval_batch(ib, NB, err, sizeof(err));
+        check(ra == 0 && rb == 0, "batch eval", step);
+    }
+    for (int i = 0; i < NB && !failures; i++) compare_logits(a[i], b[i], steps, "batch final logits");
+done:
+    for (int i = 0; i < NB; i++) {
+        if (a[i]) ds4_session_free(a[i]);
+        if (b[i]) ds4_session_free(b[i]);
+    }
+}
+
 static void run_mtp(ds4_engine *e, const ds4_tokens *prompt, int ctx, int steps, float temperature) {
     char err[160];
     ds4_session *a = NULL, *b = NULL;
@@ -240,6 +280,7 @@ int main(int argc, char **argv) {
             if (!failures) run_mtp(e, &tokens[p], ctx, steps, 0.8f);
         }
     }
+    if (!mtp && !failures) run_batch(e, tokens, NP, ctx, steps);
     for (int p = 0; p < NP; p++) ds4_tokens_free(&tokens[p]);
     free(la);
     free(lb);

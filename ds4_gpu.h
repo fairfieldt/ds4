@@ -3492,6 +3492,9 @@ int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tenso
  * source 16-byte aligned).  It loads the host data before its dependency
  * wait, hiding the transfer. */
 int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+/* D2D copy queued on the decode stream without a host wait. */
+int ds4_gpu_tensor_copy_queued(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                               const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */

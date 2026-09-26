@@ -61402,6 +61402,33 @@ static bool qwen4_session_plain_device(ds4_session *s) {
     return s->qwen4_plain_device != NULL;
 }
 
+#ifndef DS4_HAS_QWEN4_METAL
+/* Batched plain sessions: the same device argmax over the batch's logit rows;
+ * each row is copied into its session's frontier tensor on the device and
+ * the ids come back through the first session's staging. */
+static bool qwen4_batch_gpu_argmax(ds4_decode_item *items, int count, ds4_engine *e) {
+    if (count < 1 || count > 32 || e->tp.active || !qwen4_gpu_verify_enabled() ||
+        !items[0].session->qwen4_graph.pin_top) return false;
+    for (int i = 0; i < count; i++) {
+        if (!qwen4_session_plain_device(items[i].session)) return false;
+    }
+    return true;
+}
+
+static bool qwen4_batch_argmax_encode(ds4_decode_item *items, int count, ds4_engine *e) {
+    ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
+    const uint64_t row = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bool ok = ds4_gpu_qwen4_argmax_rows_host_tensor(arena->selected, arena->router, arena->batch_logits,
+                                                    DS4_N_VOCAB, (uint32_t)count,
+                                                    items[0].session->qwen4_graph.pin_top) != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ok = ds4_gpu_tensor_copy_queued(items[i].session->qwen4_plain_device, 0, arena->batch_logits,
+                                        (uint64_t)i * row, row) != 0;
+    }
+    return ok;
+}
+#endif
+
 static bool qwen4_session_forward_argmax(ds4_session *s, int token) {
     ds4_engine *e = s->engine;
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
@@ -81234,6 +81261,9 @@ static int ds4_sessions_eval_batch_native(
 #endif
     const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
+#ifdef DS4_HAS_QWEN4_BATCH
+    bool batch_argmax = false;
+#endif
     const bool native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
     if (native_ds41) {
@@ -81257,6 +81287,10 @@ static int ds4_sessions_eval_batch_native(
     } else if (native_qwen4) {
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
+#ifndef DS4_HAS_QWEN4_METAL
+        batch_argmax = ok && qwen4_batch_gpu_argmax(items, count, e);
+        if (batch_argmax) ok = qwen4_batch_argmax_encode(items, count, e);
+#endif
 #endif
     } else if (native_glm53) {
         ok = glm53_graph_encode_native_session_batch(
@@ -81311,10 +81345,17 @@ static int ds4_sessions_eval_batch_native(
 #ifdef DS4_HAS_QWEN4_BATCH
         if (native_qwen4) {
             qwen4_session_host_logits(s);
-            ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
-                                     (uint64_t)i * DS4_N_VOCAB * sizeof(float),
-                                     s->logits,
-                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            if (batch_argmax) {
+                s->qwen4_frontier_src = s->qwen4_plain_device;
+                s->qwen4_frontier_row = 0;
+                s->qwen4_frontier_top = items[0].session->qwen4_graph.pin_top[i];
+                s->qwen4_frontier_on_device = true;
+            } else {
+                ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
+                                         (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                         s->logits,
+                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            }
             if (ok) {
                 s->qwen4_graph.pos++;
                 s->qwen4_rewound = false;
