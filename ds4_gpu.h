@@ -3668,9 +3668,10 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 /* CUDA only.  Decode (n_tokens <= 3) GDN front: the qkv/gate Q8 projections
- * with alpha/beta folded into their launch, then conv and q/k norm, in
- * place of the qkv/gate pair plus gdn_front_tensor.  Returns 0 when it does
- * not apply (nothing launched), 1 when the front ran, -1 on error. */
+ * with alpha/beta and the causal conv folded into their launch, then the
+ * q/k norm, in place of the qkv/gate pair plus gdn_front_tensor.  Returns 0
+ * when it does not apply (nothing launched), 1 when the front ran, -1 on
+ * error. */
 int ds4_gpu_qwen4_gdn_proj_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *conv_state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,

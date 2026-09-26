@@ -59264,8 +59264,8 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     bool paired = false;
     int front = 0;
 #ifndef DS4_HAS_QWEN4_METAL
-    /* CUDA, a token or the MTP verify rows: the alpha/beta projections join
-     * the qkv+gate launch.  On CUDA the Q8 pair below and qwen4_gemv_pair
+    /* CUDA, a token or the MTP verify rows: the alpha/beta projections and
+     * the conv join the qkv+gate launch.  On CUDA the Q8 pair below and qwen4_gemv_pair
      * launch the same kernel with or without MTP, and the fused kernel rounds
      * every row as the separate ones do at any T, so verify rows stay exact. */
     if (T <= 3u && qwen4_graph_fused(g, T) && ds4_gpu_qwen4_decode_fusions_enabled() &&

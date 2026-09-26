@@ -1735,24 +1735,28 @@ static void gdn_front_buffers(ds4_gpu_tensor **t, const uint64_t *n, uint32_t gu
 /* The fused decode GDN front against the separate kernels (Q8 pair,
  * alpha/beta, conv, prep, then the scan), byte for byte including guards,
  * at T = 1/2/3 with the MTP snapshots.  F32 alpha/beta fold into the
- * projection launch; F16 ones do not, so the front must decline and the
- * caller runs the separate kernels. */
+ * projection launch and a K = 4 conv into its epilogue; F16 alpha/beta and
+ * a K = 3 conv keep their own launches, and with neither fold the front must
+ * decline so the caller runs the separate kernels. */
 static void test_gdn_front_exact(arena_t *a) {
-    const uint32_t Hk = 16, Hv = 48, D = 128, E = 2560, CK = 4, C = (2 * Hk + Hv) * D, Mz = Hv * D, guard = 16;
-    const uint64_t ns = (uint64_t)Hv * D * D, nh = (uint64_t)(CK - 1) * C;
+    const uint32_t Hk = 16, Hv = 48, D = 128, E = 2560, C = (2 * Hk + Hv) * D, Mz = Hv * D, guard = 16;
+    const uint64_t ns = (uint64_t)Hv * D * D;
     double *sh;
     const uint64_t wqkv = arena_q8_0(a, C, E, &sh, .05f); free(sh);
     const uint64_t wz = arena_q8_0(a, Mz, E, &sh, .05f); free(sh);
-    uint64_t wal[2], wbe[2];
+    uint64_t wal[2], wbe[2], wconv[2];
     wal[0] = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
     wbe[0] = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
     wal[1] = arena_f16(a, (uint64_t)Hv * E, &sh, .03f); free(sh);
     wbe[1] = arena_f16(a, (uint64_t)Hv * E, &sh, .03f); free(sh);
-    const uint64_t wconv = arena_f32(a, (uint64_t)C * CK, &sh, -.5f, .5f); free(sh);
+    wconv[0] = arena_f32(a, (uint64_t)C * 4, &sh, -.5f, .5f); free(sh);
+    wconv[1] = arena_f32(a, (uint64_t)C * 3, &sh, -.5f, .5f); free(sh);
     const uint64_t wA = arena_f32(a, Hv, &sh, -8.f, -.1f); free(sh);
     const uint64_t wdt = arena_f32(a, Hv, &sh, .2f, 1.5f); free(sh);
-    float *state0 = rand_vec(ns, .1f), *hist0 = rand_vec(nh, 1.f);
-    for (uint32_t T = 1; T <= 3; T++) for (uint32_t abt = 0; abt < 2; abt++) {
+    float *state0 = rand_vec(ns, .1f), *hist0 = rand_vec((uint64_t)3 * C, 1.f);
+    for (uint32_t T = 1; T <= 3; T++) for (uint32_t abt = 0; abt < 2; abt++) for (uint32_t ci = 0; ci < 2; ci++) {
+        const uint32_t CK = 4 - ci;
+        const uint64_t nh = (uint64_t)(CK - 1) * C;
         float *mixed = rand_vec((uint64_t)T * E, 1.f);
         ds4_gpu_tensor *x = upload(mixed, (uint64_t)T * E);
         /* qkv, z, alpha, beta, conv history, 2 history snapshots, state, 2 state snapshots, output */
@@ -1761,25 +1765,27 @@ static void test_gdn_front_exact(arena_t *a) {
         ds4_gpu_tensor *ref[11], *got[11];
         gdn_front_buffers(ref, n, guard, hist0, state0);
         require_ok(ds4_gpu_qwen4_q8_pair_tensor(ref[0], ref[1], a->base, a->size, wqkv, wz, E, C, Mz, x, T) &&
-            ds4_gpu_qwen4_gdn_front_tensor(ref[0], ref[4], x, ref[2], ref[3], a->base, a->size, wconv, wal[abt],
-                wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? ref[5] : NULL, 0u, T > 2 ? ref[6] : NULL, 1u) &&
+            ds4_gpu_qwen4_gdn_front_tensor(ref[0], ref[4], x, ref[2], ref[3], a->base, a->size, wconv[ci],
+                wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? ref[5] : NULL, 0u,
+                T > 2 ? ref[6] : NULL, 1u) &&
             ds4_gpu_qwen4_gdn_scan_tensor(ref[10], ref[7], ref[0], ref[2], ref[3], T, Hk, Hv, D,
                 T > 1 ? ref[8] : NULL, 0u, T > 2 ? ref[9] : NULL, 1u), "GDN front reference");
         gdn_front_buffers(got, n, guard, hist0, state0);
         const int front = ds4_gpu_qwen4_gdn_proj_tensor(got[0], got[1], got[4], x, got[2], got[3], a->base, a->size,
-            wqkv, wz, wconv, wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E,
+            wqkv, wz, wconv[ci], wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E,
             T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u);
-        require_ok(front == (abt == 0 ? 1 : 0), "GDN front dispatch");
+        require_ok(front == (abt == 0 || CK == 4 ? 1 : 0), "GDN front dispatch");
         if (!front)
             require_ok(ds4_gpu_qwen4_q8_pair_tensor(got[0], got[1], a->base, a->size, wqkv, wz, E, C, Mz, x, T) &&
-                ds4_gpu_qwen4_gdn_front_tensor(got[0], got[4], x, got[2], got[3], a->base, a->size, wconv, wal[abt],
-                    wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u),
+                ds4_gpu_qwen4_gdn_front_tensor(got[0], got[4], x, got[2], got[3], a->base, a->size, wconv[ci],
+                    wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? got[5] : NULL, 0u,
+                    T > 2 ? got[6] : NULL, 1u),
                 "GDN front separate kernels");
         require_ok(ds4_gpu_qwen4_gdn_scan_tensor(got[10], got[7], got[0], got[2], got[3], T, Hk, Hv, D,
             T > 1 ? got[8] : NULL, 0u, T > 2 ? got[9] : NULL, 1u), "GDN front scan");
         char what[96];
         for (unsigned i = 0; i < 11; i++) {
-            snprintf(what, sizeof(what), "GDN front T=%u alpha/beta type=%u buffer %u", T, abt, i);
+            snprintf(what, sizeof(what), "GDN front T=%u alpha/beta type=%u conv K=%u buffer %u", T, abt, CK, i);
             same_bytes(what, 0, ref[i], 0, got[i], 0, (n[i] + guard) * 4);
             ds4_gpu_tensor_free(got[i]);
         }
@@ -1788,7 +1794,7 @@ static void test_gdn_front_exact(arena_t *a) {
         free(mixed);
     }
     free(state0); free(hist0);
-    puts("  GDN decode front: fused projections byte-exact at T=1/2/3 with snapshots");
+    puts("  GDN decode front: fused projections and conv byte-exact at T=1/2/3 with snapshots");
 }
 
 /* ds4_qwen4_cuda.cuh, tests only: the top-k through router() at every
