@@ -2106,7 +2106,9 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     }
 #ifndef __APPLE__
     if (wtype == 12u && dtype == 39u) {
-        /* The latency-ordered MXFP4 down kernel must match the original one
+        /* The shared-expert L2 prefetch must leave gate/up untouched (against
+         * moe_mid_tensor, which does not prefetch), and the latency-ordered
+         * MXFP4 down kernel must match the original one
          * (ds4_gpu_qwen4_moe_down_ref_tensor) bit for bit, shared slot
          * included. */
         const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
@@ -2123,15 +2125,16 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         memset(ap, 0, np * sizeof(float));
         require_ok(ds4_gpu_tensor_write(gmid, 0, am, nm * sizeof(float)) &&
                    ds4_gpu_tensor_write(gpart, 0, ap, np * sizeof(float)), "MoE switch clear");
-        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off,
-                                                wtype, NE, T, slots, E, F, sg_off, su_off, shared_type) &&
+        require_ok(ds4_gpu_qwen4_moe_mid_prefetch_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off,
+                                                         wtype, NE, T, slots, E, F, sg_off, su_off, shared_type,
+                                                         sd_off, shared_type) &&
                    ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T,
                                                  slots, F, E, sd_off, shared_type) &&
                    ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
                    ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "MoE new kernels");
-        check_exact_f32("Q4K gate/up beside the latency-ordered down", am, bm, nm);
+        check_exact_f32("Q4K gate/up with shared L2 prefetch", am, bm, nm);
         check_exact_f32("MXFP4 down, latency order", ap, bp, np);
-        printf("  moe T=%u: latency-ordered MXFP4 down byte-exact\n", T);
+        printf("  moe T=%u: shared prefetch and latency-ordered MXFP4 down byte-exact\n", T);
         free(bm); free(am); free(bp); free(ap);
     }
 #endif
