@@ -1970,6 +1970,15 @@ static void test_idx_prefilter(void) {
 
 /* Routed gate/up and down types can differ; shared experts stay Q8_0
  * for quantized cases and F32 for the F32 case. */
+#ifndef __APPLE__
+/* ds4_qwen4_cuda.cuh, tests only: moe_down_tensor with the original MXFP4
+ * down kernel. */
+int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st);
+#endif
+
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
                            uint32_t T, uint32_t wtype, uint32_t dtype) {
     /* Nonzero random padding ensures kernels ignore the physical tail. */
@@ -2095,6 +2104,37 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         unsetenv("DS4_QWEN4_MOE_DOWN_PREFETCH");
         free(bp); free(ap);
     }
+#ifndef __APPLE__
+    if (wtype == 12u && dtype == 39u) {
+        /* The latency-ordered MXFP4 down kernel must match the original one
+         * (ds4_gpu_qwen4_moe_down_ref_tensor) bit for bit, shared slot
+         * included. */
+        const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
+        float *bm = malloc(nm * sizeof(float)), *am = malloc(nm * sizeof(float));
+        float *bp = malloc(np * sizeof(float)), *ap = malloc(np * sizeof(float));
+        require_ok(bm && am && bp && ap, "MoE switch allocation");
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T,
+                                                slots, E, F, sg_off, su_off, shared_type) &&
+                   ds4_gpu_qwen4_moe_down_ref_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T,
+                                                     slots, F, E, sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, bm, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_read(gpart, 0, bp, np * sizeof(float)), "MoE original kernels");
+        memset(am, 0, nm * sizeof(float));
+        memset(ap, 0, np * sizeof(float));
+        require_ok(ds4_gpu_tensor_write(gmid, 0, am, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_write(gpart, 0, ap, np * sizeof(float)), "MoE switch clear");
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off,
+                                                wtype, NE, T, slots, E, F, sg_off, su_off, shared_type) &&
+                   ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T,
+                                                 slots, F, E, sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "MoE new kernels");
+        check_exact_f32("Q4K gate/up beside the latency-ordered down", am, bm, nm);
+        check_exact_f32("MXFP4 down, latency order", ap, bp, np);
+        printf("  moe T=%u: latency-ordered MXFP4 down byte-exact\n", T);
+        free(bm); free(am); free(bp); free(ap);
+    }
+#endif
     if (dtype == 10u) {
         require_ok(!ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off,
                     dtype, NE, T, slots, F + 1u, E, 0, UINT32_MAX),
@@ -4278,7 +4318,9 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);

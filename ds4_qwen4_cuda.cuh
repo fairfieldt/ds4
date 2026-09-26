@@ -1190,6 +1190,85 @@ __global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
     }
 }
 
+/* moe_down_mxfp4 for the decode shape (two rows of at most 96 words and at
+ * most 24 MXFP4 blocks per row, i.e. K <= 768), with the latency taken out
+ * of each warp's path. The activation loads go out first, as they do not
+ * depend on the expert id; each lane then loads all of its weight words in
+ * one batch instead of two dependent ones; and the shared expert, whose
+ * Q8_0 rows are twice as long as a routed row, runs both of its rows in one
+ * pass and is dispatched as blockIdx.y == 0, so it lands in the first wave
+ * instead of the tail of the second. Each row's arithmetic and lane order
+ * are those of moe_down_mxfp4, so the results are identical. */
+__global__ void __launch_bounds__(128, 10) moe_down_mxfp4_lat(float *out, const float *x, const int *selected,
+        const char *w0, const char *sh0, unsigned NE, unsigned NS, unsigned stride,
+        unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+    pdl_enter();
+    extern __shared__ __align__(16) unsigned moe_stage[];
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) {
+        const unsigned mag = threadIdx.x & 7;
+        const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+        lut[threadIdx.x] = threadIdx.x & 8 ? -level : level;
+    }
+    __syncthreads();
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, rw = (unsigned)(rb / 4);
+    const unsigned row0 = (blockIdx.x * 4 + warp) * 2, t = blockIdx.z;
+    const unsigned slot = stride > NS ? (blockIdx.y ? blockIdx.y - 1 : NS) : blockIdx.y;
+    if (row0 >= M) return;
+    const unsigned rows = min(2u, M - row0), words = rows * rw;
+    const uint64_t pair = (uint64_t)t * stride + slot;
+    const float *xt = x + pair * K;
+    float acc[2] = {};
+    if (slot == NS) {
+        moe_q8_row(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + 1) * srb, xt, K, rows > 1);
+    } else {
+        const unsigned sub = lane % 4, nb = K / 32;
+        float4 xv[3][2];
+        #pragma unroll
+        for (unsigned j = 0; j < 3; j++) if (lane / 4 + 8 * j < nb) {
+            const float *xs = xt + (lane / 4 + 8 * j) * 32 + 4 * sub;
+            xv[j][0] = *(const float4 *)xs;
+            xv[j][1] = *(const float4 *)(xs + 16);
+        }
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const unsigned *src = (const unsigned *)(w0 + ((uint64_t)e * M + row0) * rb);
+            unsigned r[6];
+            #pragma unroll
+            for (unsigned k = 0; k < 6; k++) if (lane + 32 * k < words) r[k] = src[lane + 32 * k];
+            unsigned *stage = moe_stage + warp * (2 * rw + 1);
+            #pragma unroll
+            for (unsigned k = 0; k < 6; k++) if (lane + 32 * k < words) stage[lane + 32 * k] = r[k];
+            __syncwarp();
+            #pragma unroll
+            for (unsigned j = 0; j < 3; j++) {
+                const unsigned blk = lane / 4 + 8 * j;
+                if (blk >= nb) break;
+                const float4 x0 = xv[j][0], x1 = xv[j][1];
+                for (unsigned rr = 0; rr < rows; rr++) {
+                    const unsigned *sw = stage + rr * rw, at = blk * 17 + 1 + 4 * sub;
+                    const unsigned q = __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
+                    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
+                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+                    float p = lut[q & 15] * x0.x;
+                    p += lut[(q >> 8) & 15] * x0.y;
+                    p += lut[(q >> 16) & 15] * x0.z;
+                    p += lut[(q >> 24) & 15] * x0.w;
+                    p += lut[(q >> 4) & 15] * x1.x;
+                    p += lut[(q >> 12) & 15] * x1.y;
+                    p += lut[(q >> 20) & 15] * x1.z;
+                    p += lut[q >> 28] * x1.w;
+                    acc[rr] += p * scale;
+                }
+            }
+        }
+    }
+    for (unsigned rr = 0; rr < rows; rr++) {
+        const float v = sum(acc[rr]);
+        if (!lane) out[pair * M + row0 + rr] = v;
+    }
+}
+
 /* A block belongs to a selected (token,slot), but only the first occurrence
  * of that expert runs. Each pass reuses its unpacked weights across four
  * tokens. The per-token K and warp reduction orders match the decode path. */
@@ -1283,7 +1362,8 @@ __global__ void moe_grouped(float *out, const float *x, const int *selected,
 
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
-        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
+        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down,
+        bool ref = false) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
     const unsigned stride = NS + (st != UINT_MAX);
@@ -1296,7 +1376,12 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     if (xa && sha && down && type == 39 && !(K % 32) && !(rb & 3) && rb <= 4096 &&
         !((uintptr_t)w0 & 3)) {
         const dim3 g2((M + 7) / 8, grid.y, T);
-        launch(moe_down_mxfp4, g2, 128, (size_t)4 * (2 * (rb / 4) + 1) * 4, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        const size_t smem = (size_t)4 * (2 * (rb / 4) + 1) * 4;
+        /* ref (tests) keeps the original kernel as the byte-exact reference. */
+        if (rb <= 384 && K <= 768 && !ref)
+            launch(moe_down_mxfp4_lat, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        else
+            launch(moe_down_mxfp4, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
         return launched();
     }
 #define QWEN_MOE_SH(TYPE, SH) \
@@ -3751,10 +3836,10 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_t
                            g,u,sg,su,type,st,NE,T,NS,K,M,false);
 }
 
-extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+static int qwen4_moe_down(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
-        uint64_t so, uint32_t st) {
+        uint64_t so, uint32_t st, bool ref) {
     using namespace qwen4_cuda;
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(part,(uint64_t)T*NO*M*4) ||
@@ -3763,7 +3848,22 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     const char *sw = st != UINT_MAX ? weight(map,size,so,row_bytes(st,K)*M) : NULL;
     if (!w || (st != UINT_MAX && !sw)) return 0;
     return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,(const int *)sel->ptr,
-                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true);
+                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true,ref);
+}
+
+extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st) {
+    return qwen4_moe_down(part, mid, sel, map, size, off, type, NE, T, NS, K, M, so, st, false);
+}
+
+/* Tests only: moe_down_tensor with the original MXFP4 down kernel. */
+extern "C" int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st) {
+    return qwen4_moe_down(part, mid, sel, map, size, off, type, NE, T, NS, K, M, so, st, true);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
