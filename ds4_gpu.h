@@ -3691,8 +3691,9 @@ int ds4_gpu_qwen4_gdn_proj_tensor(
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
- * resampled position embedding [n_patches][n_embd]; out receives
- * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */
+ * resampled position embedding [n_patches][n_embd] (Metal; CUDA resamples
+ * the table on the device and takes NULL); out receives [n_patches/4][n_out].
+ * Weights are read from the mapped mmproj GGUF. */
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);

@@ -2778,11 +2778,25 @@ __global__ void stage_host(uint4 *dst, const uint4 *src, unsigned n) {
     if (i < n) dst[i] = a;
 }
 
-__global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
-        const float *pos, unsigned N, unsigned E) {
+/* Start of the residual stream: the learned side x side position table
+ * resampled to the patch grid (bilinear, align_corners, the arithmetic of
+ * qwen4_vision_pos_embed in ds4.c) plus the patch bias.  One block per
+ * patch row; rows are in 2x2 merge-window order. */
+__global__ void vis_pos(float *x, const float *table, const float *bias, unsigned side,
+        unsigned grid_h, unsigned grid_w, unsigned E) {
     pdl_enter();
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < (uint64_t)N * E) x[i] = a[i] + b[i] + bias[i % E] + pos[i];
+    const unsigned row = blockIdx.x, blk = row/4, within = row%4, w2 = grid_w/2;
+    const unsigned py = (blk/w2)*2 + within/2, px = (blk%w2)*2 + within%2;
+    const double sy = grid_h > 1 ? (double)py*(side - 1)/(grid_h - 1) : 0.0;
+    const double sx = grid_w > 1 ? (double)px*(side - 1)/(grid_w - 1) : 0.0;
+    const unsigned y0 = (unsigned)sy, x0 = (unsigned)sx;
+    const unsigned y1 = y0 + 1 < side ? y0 + 1 : y0, x1 = x0 + 1 < side ? x0 + 1 : x0;
+    const float wy = (float)(sy - y0), wx = (float)(sx - x0);
+    const float *t00 = table + ((uint64_t)y0*side + x0)*E, *t01 = table + ((uint64_t)y0*side + x1)*E;
+    const float *t10 = table + ((uint64_t)y1*side + x0)*E, *t11 = table + ((uint64_t)y1*side + x1)*E;
+    for (unsigned d = threadIdx.x; d < E; d += blockDim.x)
+        x[(uint64_t)row*E + d] = (1.0f - wy)*((1.0f - wx)*t00[d] + wx*t01[d]) +
+                                 wy*((1.0f - wx)*t10[d] + wx*t11[d]) + bias[d];
 }
 
 /* x = hi + lo as two FP16 planes of n values: the operand form of vis_mm.
@@ -2799,6 +2813,12 @@ __device__ __forceinline__ void vis_split2(__half *dst, uint64_t n, uint64_t i, 
     const float2 f = __half22float2(h);
     *(__half2 *)&dst[i] = h;
     *(__half2 *)&dst[n + i] = __floats2half2_rn(x0 - f.x, x1 - f.y);
+}
+
+__global__ void vis_split_rows(__half *out, const float *x, uint64_t n) {
+    pdl_enter();
+    const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) vis_split(out, n, i, x[i]);
 }
 
 /* LayerNorm of one row per block, written as vis_mm operand planes [rows][E] */
@@ -4739,16 +4759,17 @@ extern "C" int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off
     return launched();
 }
 
+/* pos_embed must be NULL: the position table is resampled on the device */
 extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed,
         uint32_t N, uint32_t grid_w, const void *map, uint64_t size, const ds4_qwen4_vision_weights *w) {
     using namespace qwen4_cuda;
-    if (!out || !patches || !pos_embed || !w || !map || !N || N > 65535 || ds4_gpu_commands_active()) return 0;
+    if (!out || !patches || pos_embed || !w || !map || !N || N > 65535 || ds4_gpu_commands_active()) return 0;
     const unsigned E = w->n_embd, FF = w->n_ff, H = w->n_head, D = H ? E/H : 0;
-    const unsigned P = w->n_patch, M = w->n_merge, O = w->n_out;
+    const unsigned P = w->n_patch, M = w->n_merge, O = w->n_out, side = w->n_pos_side;
     /* vis_flash is built for D = 72 only: the loader requires 1,152 wide
      * over 16 heads (qwen4_vision_weights_bind) */
     if (M != 2 || !grid_w || grid_w%M || N%grid_w || (N/grid_w)%M ||
-        D != 72 || H*D != E || !FF || !O || !P || P > 32 || E%32) return 0;
+        D != 72 || H*D != E || !FF || !O || !P || P > 32 || E%32 || side < 2) return 0;
     const unsigned IP = 3*P*P, ME = E*M*M, merged = N/(M*M);
     std::vector<ds4_gpu_tensor *> buffers;
     auto alloc = [&](uint64_t n) {
@@ -4756,8 +4777,8 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
         buffers.push_back(t);
         return t;
     };
-    ds4_gpu_tensor *patch = alloc((uint64_t)N*IP), *a0 = alloc((uint64_t)N*E), *a1 = alloc((uint64_t)N*E);
-    ds4_gpu_tensor *pos = alloc((uint64_t)N*E), *x = alloc((uint64_t)N*E), *tmp = alloc((uint64_t)N*E);
+    ds4_gpu_tensor *patch = alloc((uint64_t)N*IP), *planes = alloc((uint64_t)N*IP);
+    ds4_gpu_tensor *x = alloc((uint64_t)N*E), *tmp = alloc((uint64_t)N*E);
     ds4_gpu_tensor *qkv = alloc((uint64_t)N*3*E), *q = alloc((uint64_t)N*E), *k = alloc((uint64_t)N*E);
     ds4_gpu_tensor *v = alloc((uint64_t)N*E), *attn = alloc((uint64_t)N*E), *ffn = alloc((uint64_t)N*FF);
     ds4_gpu_tensor *m0 = alloc((uint64_t)merged*ME), *res = alloc((uint64_t)merged*O);
@@ -4766,18 +4787,13 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     for (const auto b : buffers) if (!b) ok = false;
     auto ptr = [](ds4_gpu_tensor *t) { return (float *)t->ptr; };
     auto half = [](ds4_gpu_tensor *t) { return (__half *)t->ptr; };
-    auto wf = [&](uint64_t off, unsigned n) { return (const float *)weight(map,size,off,(uint64_t)n*4); };
-    auto mm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t off, unsigned type,
-                  unsigned rows, unsigned K, unsigned M) {
-        return ds4_gpu_qwen4_dense_mm_tensor(dst,src,map,size,off,type,rows,K,M);
-    };
+    auto wf = [&](uint64_t off, uint64_t n) { return (const float *)weight(map,size,off,n*4); };
     /* vis_mm: src holds operand planes; epi picks the output form */
     auto proj = [&](unsigned epi, ds4_gpu_tensor *dst, ds4_gpu_tensor *src, uint64_t off, unsigned type,
-                    uint64_t bo, unsigned rows, unsigned K, unsigned M) {
+                    const float *bias, unsigned rows, unsigned K, unsigned M) {
         const uint64_t rb = row_bytes(type,K);
         const char *wp = rb ? weight(map,size,off,rb*M) : NULL;
-        const float *bias = wf(bo,M);
-        if (!wp || !bias) return 0;
+        if (!wp) return 0;
         switch (epi) {
         case VIS_STORE: return vis_mm_launch<VIS_STORE>(dst->ptr,half(src),wp,type,bias,rows,K,M,(float *)part->ptr);
         case VIS_RESID: return vis_mm_launch<VIS_RESID>(dst->ptr,half(src),wp,type,bias,rows,K,M,(float *)part->ptr);
@@ -4792,32 +4808,35 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
         return launched();
     };
     do {
-        if (!ok) break;
-        ok = ds4_gpu_tensor_write(patch,0,patches,(uint64_t)N*IP*4) &&
-             ds4_gpu_tensor_write(pos,0,pos_embed,(uint64_t)N*E*4);
-        if (!ok || !(active = ds4_gpu_begin_commands())) { ok = false; break; }
-        ok = mm(a0,patch,w->patch_w0,w->patch_type,N,IP,E) && mm(a1,patch,w->patch_w1,w->patch_type,N,IP,E);
-        const float *pb = wf(w->patch_b,E);
-        if (!ok || !pb) { ok = false; break; }
-        launch(vis_patch, ((uint64_t)N*E+255)/256, 256, 0, ptr(x),ptr(a0),ptr(a1),pb,ptr(pos),N,E);
-        ok = launched();
+        const float *table = wf(w->pos_embd,(uint64_t)side*side*E), *pb = wf(w->patch_b,E);
+        if (!ok || !table || !pb || !ds4_gpu_tensor_write(patch,0,patches,(uint64_t)N*IP*4) ||
+            !(active = ds4_gpu_begin_commands())) { ok = false; break; }
+        /* x = pos + bias + patch . (w0 + w1): both temporal taps of the
+         * patch conv see the same frame */
+        launch(vis_pos, N, 256, 0, ptr(x),table,pb,side,N/grid_w,grid_w,E);
+        launch(vis_split_rows, ((uint64_t)N*IP+255)/256, 256, 0, half(planes),(const float *)ptr(patch),(uint64_t)N*IP);
+        ok = launched() && proj(VIS_RESID,x,planes,w->patch_w0,w->patch_type,NULL,N,IP,E) &&
+             proj(VIS_RESID,x,planes,w->patch_w1,w->patch_type,NULL,N,IP,E);
         /* x is the FP32 residual stream; tmp, attn, ffn and m0 hold operand
          * planes; q, k and v the high and low FP16 planes of vis_flash */
         __half *qh = half(q), *kh = half(k), *vh = half(v);
         for (unsigned l = 0; ok && l < DS4_QWEN4_VISION_LAYERS; l++) {
             const auto &lw = w->layer[l];
-            ok = norm(tmp,x,lw.ln1_w,lw.ln1_b) && proj(VIS_STORE,qkv,tmp,lw.qkv_w,lw.qkv_type,lw.qkv_b,N,E,3*E);
+            const float *qkv_b = wf(lw.qkv_b,3*E), *out_b = wf(lw.out_b,E), *up_b = wf(lw.up_b,FF), *down_b = wf(lw.down_b,E);
+            ok = qkv_b && out_b && up_b && down_b &&
+                 norm(tmp,x,lw.ln1_w,lw.ln1_b) && proj(VIS_STORE,qkv,tmp,lw.qkv_w,lw.qkv_type,qkv_b,N,E,3*E);
             if (!ok) break;
             launch(vis_qkv_h, N, 256, 0, qh,kh,vh,ptr(qkv),N,H,D,grid_w,1.4426950408889634f/sqrtf((float)D));
             vis_flash_launch<72>(half(attn),qh,kh,vh,N,H);
-            ok = launched() && proj(VIS_RESID,x,attn,lw.out_w,lw.out_type,lw.out_b,N,E,E) &&
-                 norm(tmp,x,lw.ln2_w,lw.ln2_b) && proj(VIS_GELU,ffn,tmp,lw.up_w,lw.up_type,lw.up_b,N,E,FF) &&
-                 proj(VIS_RESID,x,ffn,lw.down_w,lw.down_type,lw.down_b,N,FF,E);
+            ok = launched() && proj(VIS_RESID,x,attn,lw.out_w,lw.out_type,out_b,N,E,E) &&
+                 norm(tmp,x,lw.ln2_w,lw.ln2_b) && proj(VIS_GELU,ffn,tmp,lw.up_w,lw.up_type,up_b,N,E,FF) &&
+                 proj(VIS_RESID,x,ffn,lw.down_w,lw.down_type,down_b,N,FF,E);
         }
         /* the merger reads post-LN rows four at a time: [merged][4E] */
-        ok = ok && norm(tmp,x,w->post_ln_w,w->post_ln_b) &&
-             proj(VIS_GELU_ERF,m0,tmp,w->mm0_w,w->mm0_type,w->mm0_b,merged,ME,ME) &&
-             proj(VIS_STORE,res,m0,w->mm2_w,w->mm2_type,w->mm2_b,merged,ME,O);
+        const float *mm0_b = wf(w->mm0_b,ME), *mm2_b = wf(w->mm2_b,O);
+        ok = ok && mm0_b && mm2_b && norm(tmp,x,w->post_ln_w,w->post_ln_b) &&
+             proj(VIS_GELU_ERF,m0,tmp,w->mm0_w,w->mm0_type,mm0_b,merged,ME,ME) &&
+             proj(VIS_STORE,res,m0,w->mm2_w,w->mm2_type,mm2_b,merged,ME,O);
     } while (false);
     if (active && !ds4_gpu_end_commands()) ok = false;
     if (ok) ok = ds4_gpu_tensor_read(res,0,out,(uint64_t)merged*O*4);

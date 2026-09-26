@@ -7581,8 +7581,10 @@ static void qwen4_vision_weights_bind(ds4_qwen4_vision_weights *w, const ds4_mod
 }
 
 #ifdef DS4_HAS_QWEN4_GPU
+#ifdef DS4_HAS_QWEN4_METAL
 /* Learned 2D position table (side x side) resampled to the patch grid with
- * bilinear, align_corners interpolation; rows in 2x2 window order. */
+ * bilinear, align_corners interpolation; rows in 2x2 window order.  CUDA
+ * does the same on the device (vis_pos). */
 static void qwen4_vision_pos_embed(const float *table, uint32_t side, uint32_t n_embd,
                                    uint32_t grid_h, uint32_t grid_w, float *out) {
     size_t row = 0;
@@ -7610,6 +7612,7 @@ static void qwen4_vision_pos_embed(const float *table, uint32_t side, uint32_t n
         }
     }
 }
+#endif
 
 static uint32_t qwen4_vision_max_tokens(void) {
     const char *env = getenv("DS4_QWEN4_IMAGE_MAX_TOKENS");
@@ -7624,16 +7627,19 @@ static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision
                                      char *error, size_t error_cap) {
     *out = NULL;
     if (!ds4_image_preprocess_qwen4(patches, image, min_tokens, max_tokens, error, error_cap)) return 0;
+    float *emb = malloc((size_t)patches->image_token_count * w->n_out * sizeof(float));
+#ifdef DS4_HAS_QWEN4_METAL
     const uint64_t n = patches->patch_count;
     float *pos = malloc((size_t)n * w->n_embd * sizeof(float));
-    float *emb = malloc((size_t)patches->image_token_count * w->n_out * sizeof(float));
     int ok = pos && emb;
-    if (ok) {
-        qwen4_vision_pos_embed((const float *)((const char *)vm->map + w->pos_embd), w->n_pos_side, w->n_embd,
-                               patches->grid_height, patches->grid_width, pos);
-        ok = ds4_gpu_qwen4_vision_encode(emb, patches->patches, pos, patches->patch_count, patches->grid_width,
-                                         vm->map, vm->size, w);
-    }
+    if (ok) qwen4_vision_pos_embed((const float *)((const char *)vm->map + w->pos_embd), w->n_pos_side, w->n_embd,
+                                   patches->grid_height, patches->grid_width, pos);
+#else
+    float *pos = NULL;   /* CUDA resamples the position table on the device */
+    int ok = emb != NULL;
+#endif
+    if (ok) ok = ds4_gpu_qwen4_vision_encode(emb, patches->patches, pos, patches->patch_count, patches->grid_width,
+                                             vm->map, vm->size, w);
     free(pos);
     if (!ok) {
         free(emb);
