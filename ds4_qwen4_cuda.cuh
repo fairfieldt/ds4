@@ -1452,10 +1452,9 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
 }
 
 template<unsigned ROWS>
-__global__ void matvec_q8(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride) {
-    pdl_enter();
-    const unsigned row = blockIdx.x*4+threadIdx.x/32, lane = threadIdx.x&31;
+__device__ __forceinline__ void matvec_q8_body(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+    const unsigned lane = threadIdx.x&31;
     if (row >= M) return;
     const char *wr = w+(uint64_t)row*stride;
     float acc[ROWS] = {};
@@ -1482,16 +1481,22 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
+template<unsigned ROWS>
+__global__ void matvec_q8(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
+    matvec_q8_body<ROWS>(out,w,x,T,K,M,stride,blockIdx.x*4+threadIdx.x/32);
+}
+
 /* Decode projections with few output rows (the HC down projections, the
  * router, the linear-attention gates) cannot fill the GPU at one warp per
  * row. Split each row's K across the eight warps of a block instead. The
  * per-row arithmetic is the same for every T, so MTP verify rows keep
  * matching single-token decode. */
 template<unsigned TYPE, unsigned ROWS>
-__global__ void matvec_split(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride) {
-    pdl_enter();
-    const unsigned row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+__device__ __forceinline__ void matvec_split_body(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     __shared__ float part[8][ROWS];
     const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
     const char *wr = w + (uint64_t)row * stride;
@@ -1536,6 +1541,13 @@ __global__ void matvec_split(float *out, const char *w, const float *x,
     }
 }
 
+template<unsigned TYPE, unsigned ROWS>
+__global__ void matvec_split(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    pdl_enter();
+    matvec_split_body<TYPE,ROWS>(out,w,x,T,K,M,stride,blockIdx.x);
+}
+
 /* Decode batches of 4..32 rows (several sessions, or sessions with drafts)
  * make the per-row Q8 GEMV issue-bound: each weight feeds up to 32 FP32
  * FMAs and as many activation loads.  Run them on tensor cores instead:
@@ -1575,19 +1587,44 @@ __device__ __forceinline__ void mma_f16_16816(float (&c)[4], unsigned a0, unsign
 #endif
 }
 
+struct rows_projection { const char *w; float *out; unsigned M, tiles; };
+struct rows_projections { rows_projection p[4]; unsigned n; };
+
+/* Keep the established reduction order and block geometry for one through
+ * three tokens. Split-K and ordinary projections have separate launches so
+ * wide matrices do not inherit the narrow kernel's register/shared footprint. */
+template<unsigned ROWS, bool SPLIT>
+__global__ void multi_q8(const __grid_constant__ rows_projections p, const float *x, unsigned T, unsigned K) {
+    pdl_enter();
+    unsigned b = blockIdx.x, i = 0;
+    while (i+1 < p.n && b >= p.p[i].tiles) b -= p.p[i++].tiles;
+    const rows_projection w = p.p[i];
+    const uint64_t stride = (uint64_t)K/32*34;
+    if (SPLIT)
+        matvec_split_body<8,ROWS>(w.out,w.w,x,T,K,w.M,stride,b);
+    else
+        matvec_q8_body<ROWS>(w.out,w.w,x,T,K,w.M,stride,b*4+threadIdx.x/32);
+}
+
 /* One block per 16 weight rows; its 16 warps split K; NT tiles of 8 rows.
- * A grid with gridDim.y > 1 splits K further: slice blockIdx.y writes its
- * partial sums to its own T x M plane of out, which rows_tc_reduce adds up.
- * TYPE is 8 (Q8_0) or 1 (F16). */
+ * Shared-input projections share one activation pack and one launch: the
+ * flattened grid holds only real output tiles of each projection, including
+ * unequal pairs.  A grid with gridDim.y > 1 splits K further: slice
+ * blockIdx.y writes its partial sums to its own T x M plane of the output,
+ * which rows_tc_reduce adds up.  TYPE is 8 (Q8_0) or 1 (F16). */
 template<unsigned NT, unsigned TYPE>
-__global__ void rows_tc(float *out, const char *w, const __half *xh, const __half *xl,
-                        unsigned T, unsigned K, unsigned M) {
+__global__ void rows_tc(const __grid_constant__ rows_projections projections, const __half *xh, const __half *xl,
+                       unsigned T, unsigned K) {
     pdl_enter();
     enum { SPLIT = 16 };
     __shared__ float red[SPLIT][NT][32][4];
-    out += (uint64_t)blockIdx.y*T*M;
+    unsigned tile = blockIdx.x, pi = 0;
+    while (pi+1 < projections.n && tile >= projections.p[pi].tiles) tile -= projections.p[pi++].tiles;
+    const unsigned M = projections.p[pi].M;
+    const char *w = projections.p[pi].w;
+    float *out = projections.p[pi].out + (uint64_t)blockIdx.y*T*M;
     const uint64_t stride = TYPE == 8 ? (uint64_t)K/32*34 : (uint64_t)K*2;
-    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, m0 = blockIdx.x * 16;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, m0 = tile * 16;
     const unsigned g = lane / 4, q8 = 8 * (lane % 4);
     const unsigned r0 = min(m0 + g, M - 1), r1 = min(m0 + g + 8, M - 1);
     const char *w0 = w + (uint64_t)r0 * stride, *w1 = w + (uint64_t)r1 * stride;
@@ -1657,22 +1694,29 @@ static bool rows_tc_shape(unsigned type, unsigned T, unsigned K, unsigned M) {
     return type == 8 && (M < 65536 || T > 8) && (T > 4 || K < 1024);
 }
 
-/* A narrow matrix (few 16-row tiles) leaves most of the GPU idle, so its
+/* A narrow launch (few 16-row tiles) leaves most of the GPU idle, so its
  * K is split over 2 or 4 grid slices whose planes are then added in a
  * fixed order. */
-static int rows_tc_dispatch(float *out, const char *w, const float *x, unsigned T, unsigned K, unsigned M, unsigned type) {
-    const unsigned Tp = (T + 7) / 8 * 8, blocks = (M + 15) / 16;
-    unsigned splits = 1;
+static int rows_tc_dispatch(rows_projections projections, const float *x, unsigned T, unsigned K, unsigned type) {
+    const unsigned Tp = (T + 7) / 8 * 8;
+    unsigned splits = 1, blocks = 0;
+    uint64_t floats = 0;
+    for (unsigned i = 0; i < projections.n; i++) { blocks += projections.p[i].tiles; floats += (uint64_t)T*projections.p[i].M; }
     if (K >= 8192 && blocks <= 64) splits = 4;
     else if (type == 8 && K >= 1024 && blocks <= 40) splits = T > 16 ? 4 : 2;
-    __half *xh = (__half *)cuda_tmp_alloc((uint64_t)Tp*K*4+(splits > 1 ? (uint64_t)T*M*splits*4 : 0), "Qwen rows f16 activations");
+    __half *xh = (__half *)cuda_tmp_alloc((uint64_t)Tp*K*4+(splits > 1 ? floats*splits*4 : 0), "Qwen rows f16 activations");
     if (!xh) return 0;
     __half *xl = xh + (uint64_t)Tp * K;
-    float *part = splits > 1 ? (float *)(xl+(uint64_t)Tp*K) : out;
+    rows_projections parts = projections;
+    float *scratch = (float *)(xl+(uint64_t)Tp*K);
+    if (splits > 1) for (unsigned i = 0; i < projections.n; i++) {
+        parts.p[i].out = scratch;
+        scratch += (uint64_t)T*projections.p[i].M*splits;
+    }
     launch(split_rows_f16, (unsigned)(((uint64_t)Tp * K + 255) / 256), 256, 0, xh, xl, x, T, Tp, K);
 #define QWEN_ROWS_TC(N) \
-    if (type == 8) launch(rows_tc<N,8>,dim3(blocks,splits),512,0,part,w,xh,xl,T,K,M); \
-    else launch(rows_tc<N,1>,dim3(blocks,splits),512,0,part,w,xh,xl,T,K,M)
+    if (type == 8) launch(rows_tc<N,8>,dim3(blocks,splits),512,0,parts,xh,xl,T,K); \
+    else launch(rows_tc<N,1>,dim3(blocks,splits),512,0,parts,xh,xl,T,K)
     switch (Tp / 8) {
     case 1: QWEN_ROWS_TC(1); break;
     case 2: QWEN_ROWS_TC(2); break;
@@ -1680,7 +1724,9 @@ static int rows_tc_dispatch(float *out, const char *w, const float *x, unsigned 
     default: QWEN_ROWS_TC(4); break;
     }
 #undef QWEN_ROWS_TC
-    if (splits > 1) launch(rows_tc_reduce,(T*M+255)/256,256,0,out,part,T*M,splits);
+    if (splits > 1) for (unsigned i = 0; i < projections.n; i++)
+        launch(rows_tc_reduce,(T*projections.p[i].M+255)/256,256,0,
+            projections.p[i].out,parts.p[i].out,T*projections.p[i].M,splits);
     return launched();
 }
 
@@ -2611,8 +2657,11 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
-    if (rows_tc_shape(type,T,K,M) && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15)))
-        return rows_tc_dispatch((float *)out->ptr,w,(const float *)x->ptr,T,K,M,type);
+    if (rows_tc_shape(type,T,K,M) && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
+        rows_projections p = {};
+        p.n = 1; p.p[0] = {w,(float *)out->ptr,M,(M+15)/16};
+        return rows_tc_dispatch(p,(const float *)x->ptr,T,K,type);
+    }
     if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
     /* Decode batches of 9..31 rows (sessions, or sessions with drafts): the
      * row-batched GEMV in chunks of eight still reads the weights T / 8
@@ -2654,7 +2703,43 @@ extern "C" int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, con
 extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t T,
         uint32_t K, uint32_t N, ds4_gpu_tensor *const *outs, const void *map, uint64_t size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *rows) {
+    using namespace qwen4_cuda;
     if (!N || N > 4 || !outs || !offsets || !types || !rows) return 0;
+    rows_projections p = {};
+    if (T && T <= 3 && K && !(K%128) && tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15)) {
+        bool same_q8 = true;
+        unsigned blocks[2] = {};
+        rows_projections groups[2] = {};
+        for (unsigned i = 0; i < N; i++) {
+            if (types[i] != 8) { same_q8 = false; break; }
+            const char *w = weight(map,size,offsets[i],row_bytes(8,K)*rows[i]);
+            if (!w || !rows[i] || !tensor(outs[i],(uint64_t)T*rows[i]*4)) return 0;
+            const unsigned group = rows[i] <= 1536 && K >= 1024;
+            const unsigned tiles = group ? rows[i] : (rows[i]+3)/4;
+            groups[group].p[groups[group].n++] = {w,(float *)outs[i]->ptr,rows[i],tiles};
+            blocks[group] += tiles;
+        }
+        if (same_q8) {
+#define QWEN_MULTI(NT) \
+            if (groups[0].n) launch(multi_q8<NT,false>,blocks[0],128,0,groups[0],(const float *)x->ptr,T,K); \
+            if (groups[1].n) launch(multi_q8<NT,true>,blocks[1],256,0,groups[1],(const float *)x->ptr,T,K)
+            if (T == 1) { QWEN_MULTI(1); }
+            else if (T == 2) { QWEN_MULTI(2); }
+            else { QWEN_MULTI(4); }
+#undef QWEN_MULTI
+            return launched();
+        }
+    }
+    bool fuse = tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15);
+    for (unsigned i = 0; fuse && i < N; i++) {
+        fuse = types[i] == types[0] && rows_tc_shape(types[i],T,K,rows[i]);
+        if (!fuse) break;
+        const char *w = weight(map,size,offsets[i],row_bytes(types[i],K)*rows[i]);
+        if (!w || !tensor(outs[i],(uint64_t)T*rows[i]*4)) return 0;
+        fuse = types[i] == 8 || !((uintptr_t)w&15);
+        p.p[i] = {w,(float *)outs[i]->ptr,rows[i],(rows[i]+15)/16};
+    }
+    if (fuse) { p.n = N; return rows_tc_dispatch(p,(const float *)x->ptr,T,K,types[0]); }
     for (unsigned i = 0; i < N; i++)
         if (!ds4_gpu_qwen4_dense_mm_tensor(outs[i], x, map, size, offsets[i], types[i], T, K, rows[i])) return 0;
     return 1;
@@ -2663,9 +2748,11 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t
 extern "C" int ds4_gpu_qwen4_q8_pair_tensor(ds4_gpu_tensor *o0, ds4_gpu_tensor *o1,
         const void *map, uint64_t size, uint64_t w0, uint64_t w1, uint64_t K,
         uint64_t M0, uint64_t M1, const ds4_gpu_tensor *x, uint64_t T) {
-    if ((M0 & 1) || (M1 & 1)) return 0;
-    return ds4_gpu_qwen4_matmul_q8_0_tensor(o0, map, size, w0, K, M0, x, T) &&
-           ds4_gpu_qwen4_matmul_q8_0_tensor(o1, map, size, w1, K, M1, x, T);
+    if ((M0 & 1) || (M1 & 1) || K > UINT_MAX || M0 > UINT_MAX || M1 > UINT_MAX || T > UINT_MAX) return 0;
+    ds4_gpu_tensor *outs[] = {o0,o1};
+    const uint64_t offsets[] = {w0,w1};
+    const uint32_t types[] = {8,8}, rows[] = {(uint32_t)M0,(uint32_t)M1};
+    return ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,2,outs,map,size,offsets,types,rows);
 }
 
 extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
