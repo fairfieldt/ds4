@@ -118,6 +118,10 @@ static bool bulk_supported() {
  * run the plain kernels at every T as the byte-exact reference. */
 static bool presync_load(unsigned T) { return T <= 3; }
 
+/* Single-token decode lets the HC down projection after hc_norm launch only
+ * after the norm reduction (the MTP verify rows gained nothing from it). */
+static unsigned hc_norm_late(unsigned T) { return T == 1; }
+
 /* Reports the virtual architecture these kernels were compiled for. */
 __global__ void pdl_probe() {}
 
@@ -2644,11 +2648,14 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
 
 /* PRE loads this thread's gamma and injection weights of the first chunk
  * iteration before the dependency wait, so they are not queued behind the
- * weight copies of the HC down projection that follows. */
+ * weight copies of the HC down projection that follows.  With late, PRE
+ * lets that projection launch only after the norm reduction, so its weight
+ * copies overlap the second pass instead of both. */
 template<unsigned TYPE, bool COMBINE = false, bool PRE = false>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned E, unsigned hc,
-                        unsigned ni, float eps, float *next, const float *blk, const float *oldinj) {
+                        unsigned ni, float eps, float *next, const float *blk, const float *oldinj,
+                        unsigned late) {
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per), first = chunk * per + tid;
@@ -2667,8 +2674,9 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
                 }
             }
         }
-    }
-    pdl_enter();
+        pdl_wait();
+        if (!late) pdl_trigger();
+    } else pdl_enter();
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
     __shared__ float red[32];
     __shared__ float add_weight;
@@ -2693,6 +2701,7 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
         for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(r[k], r[k], ss);
     }
     const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    if (PRE && late) pdl_trigger();
     float acc[4] = {};
     for (unsigned i0 = first; i0 < end; i0 += 4 * nt) {
         float r[4], g[4], w[4][4];
@@ -3282,7 +3291,7 @@ static int qwen4_hc_norm(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
     }
 #define QWEN_HC_NORM(TYPE, PRE) launch(hc_norm<TYPE, false, PRE>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
         ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
-        (float *)nullptr, (const float *)nullptr, (const float *)nullptr)
+        (float *)nullptr, (const float *)nullptr, (const float *)nullptr, hc_norm_late(T))
     const bool pre = !ref && presync_load(T);
     if (type == 0) { if (pre) { QWEN_HC_NORM(0, true); } else { QWEN_HC_NORM(0, false); } }
     else if (type == 1) { if (pre) { QWEN_HC_NORM(1, true); } else { QWEN_HC_NORM(1, false); } }
@@ -3772,7 +3781,7 @@ static int qwen4_hc_combine_norm(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk
          * a grid barrier or an in-place read/write race. */
         launch(!ref && presync_load(T) ? hc_norm<1,true,true> : hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
             (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
-            (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr);
+            (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr,hc_norm_late(T));
         return launched();
     }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
