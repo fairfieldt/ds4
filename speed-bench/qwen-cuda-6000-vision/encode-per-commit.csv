@@ -1,0 +1,49 @@
+commit,change,image_tokens,round,first_call_ms,warm_median_ms,warm_min_ms
+e9de627,"before: scalar attention, cuBLAS projections",64,1,104.587,7.925,7.874
+e9de627,"before: scalar attention, cuBLAS projections",256,1,139.360,44.031,43.058
+e9de627,"before: scalar attention, cuBLAS projections",1024,1,590.105,506.241,503.557
+6aaaa91,flash attention,64,1,103.720,6.455,6.351
+6aaaa91,flash attention,256,1,114.572,15.400,15.048
+6aaaa91,flash attention,1024,1,164.024,75.813,68.600
+5ca6dc9,vis_mm projections,64,1,74.743,5.047,5.014
+5ca6dc9,vis_mm projections,256,1,73.278,13.134,12.908
+5ca6dc9,vis_mm projections,1024,1,118.339,67.001,60.436
+56b2ba2,patch and position embedding on the GPU,64,1,39.319,4.801,4.768
+56b2ba2,patch and position embedding on the GPU,256,1,45.278,12.767,12.662
+56b2ba2,patch and position embedding on the GPU,1024,1,88.165,65.433,57.523
+7d8abb5,scratch arena kept across encodes,64,1,35.868,4.228,4.218
+7d8abb5,scratch arena kept across encodes,256,1,44.396,11.938,11.837
+7d8abb5,scratch arena kept across encodes,1024,1,86.648,64.712,55.811
+not committed,experiment: 4-warp / 32-key flash blocks at every size,64,1,35.734,4.107,4.096
+not committed,experiment: 4-warp / 32-key flash blocks at every size,256,1,44.067,12.035,12.004
+not committed,experiment: 4-warp / 32-key flash blocks at every size,1024,1,88.915,69.567,59.352
+not committed,"experiment: same build, 8-warp / 64-key blocks",64,1,36.070,4.223,4.213
+not committed,"experiment: same build, 8-warp / 64-key blocks",256,1,44.524,11.915,11.861
+not committed,"experiment: same build, 8-warp / 64-key blocks",1024,1,86.924,64.927,55.702
+not committed,"experiment: 4-warp blocks up to 2,048 patches",64,1,36.192,4.101,4.089
+not committed,"experiment: 4-warp blocks up to 2,048 patches",256,1,44.882,12.070,11.996
+not committed,"experiment: 4-warp blocks up to 2,048 patches",1024,1,87.023,64.833,55.831
+not committed,"experiment: 4-warp blocks up to 2,048 patches",64,2,35.417,4.115,4.093
+not committed,"experiment: 4-warp blocks up to 2,048 patches",256,2,44.091,12.093,12.001
+not committed,"experiment: 4-warp blocks up to 2,048 patches",1024,2,86.916,64.865,56.024
+not committed,"experiment: same build, 8-warp / 64-key blocks",64,2,35.861,4.226,4.206
+not committed,"experiment: same build, 8-warp / 64-key blocks",256,2,46.058,11.960,11.874
+not committed,"experiment: same build, 8-warp / 64-key blocks",1024,2,86.663,64.885,56.088
+not committed,experiment: 4-warp / 32-key flash blocks at every size,64,2,35.888,4.110,4.102
+not committed,experiment: 4-warp / 32-key flash blocks at every size,256,2,45.009,11.877,11.815
+not committed,experiment: 4-warp / 32-key flash blocks at every size,1024,2,89.593,69.691,58.645
+7d8abb5,scratch arena kept across encodes,64,2,35.747,4.223,4.216
+7d8abb5,scratch arena kept across encodes,256,2,44.314,11.933,11.853
+7d8abb5,scratch arena kept across encodes,1024,2,87.125,64.999,55.940
+56b2ba2,patch and position embedding on the GPU,64,2,36.374,4.829,4.782
+56b2ba2,patch and position embedding on the GPU,256,2,44.823,12.839,12.716
+56b2ba2,patch and position embedding on the GPU,1024,2,87.475,65.784,57.168
+5ca6dc9,vis_mm projections,64,2,70.095,5.088,5.040
+5ca6dc9,vis_mm projections,256,2,74.530,13.152,12.921
+5ca6dc9,vis_mm projections,1024,2,118.280,67.444,60.979
+6aaaa91,flash attention,64,2,101.217,6.413,6.358
+6aaaa91,flash attention,256,2,115.293,15.488,15.076
+6aaaa91,flash attention,1024,2,165.051,76.489,68.252
+e9de627,"before: scalar attention, cuBLAS projections",64,2,102.825,7.952,7.899
+e9de627,"before: scalar attention, cuBLAS projections",256,2,141.255,44.352,43.076
+e9de627,"before: scalar attention, cuBLAS projections",1024,2,594.847,509.204,507.349
