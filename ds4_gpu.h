@@ -3710,6 +3710,12 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
         uint32_t n_embd, uint32_t n_hc, float eps);
+/* CUDA only: mtp_stage for n_tokens consecutive (e, R, cat) rows in one
+ * dispatch, byte-identical to one mtp_stage per row. */
+int ds4_gpu_qwen4_mtp_stage_rows_tensor(
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
+        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps);
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
