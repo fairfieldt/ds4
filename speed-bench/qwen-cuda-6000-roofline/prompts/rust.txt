@@ -1,0 +1,1 @@
+Write a Rust command-line program that reads a CSV file of transactions (date, account, amount, category), aggregates totals per account and per category per month, and prints a sorted report. Use only the standard library and include unit tests.

@@ -1,0 +1,19 @@
+run,prompt,mode,candidate,control_tps,candidate_tps,candidate_vs_control_pct,outputs_identical
+alloff-short-mtp,code,mtp,all listed switches,254.69,225.81,-11.34,yes
+alloff-short-mtp,prose,mtp,all listed switches,190.65,174.50,-8.47,yes
+alloff-short-plain,code,plain,all listed switches,170.64,140.42,-17.71,yes
+alloff-short-plain,prose,plain,all listed switches,169.91,139.96,-17.63,yes
+ev-a,code,mtp,depth-ev off,253.49,252.56,-0.37,yes
+ev-a,prose,mtp,depth-ev off,189.83,196.72,+3.63,yes
+ev-a,explain,mtp,depth-ev off,227.47,220.45,-3.09,yes
+ev-a,json,mtp,depth-ev off,268.32,268.19,-0.05,yes
+ev-a,math,mtp,depth-ev off,255.78,240.75,-5.88,yes
+ev-b,oped,mtp,depth-ev off,193.24,199.80,+3.39,yes
+ev-b,rust,mtp,depth-ev off,248.85,234.95,-5.58,yes
+ev-b,sql,mtp,depth-ev off,243.82,240.08,-1.53,yes
+ev-b,table,mtp,depth-ev off,260.49,245.13,-5.90,yes
+ev-b,translate,mtp,depth-ev off,201.61,207.30,+2.82,yes
+splitk-mtp,code,mtp,q8-split-k on,253.94,260.19,+2.46,yes
+splitk-mtp,prose,mtp,q8-split-k on,190.14,194.34,+2.21,yes
+splitk-plain,code,plain,q8-split-k on,170.24,172.23,+1.17,yes
+splitk-plain,prose,plain,q8-split-k on,169.57,171.55,+1.17,yes

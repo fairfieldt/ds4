@@ -1,0 +1,199 @@
+Review the following CUDA code and explain what each kernel does.
+
+/* Qwen3.8 Flash Next. Included by ds4_cuda.cu so model residency, streams
+ * and temporary allocations have the same lifetime as the other CUDA paths. */
+
+#include "ds4_qwen4_vision.h"
+
+namespace qwen4_cuda {
+
+/* Programmatic dependent launch. Each kernel waits for its predecessor
+ * before touching memory, then lets its successor be scheduled, so the
+ * next kernel's blocks are resident when this one finishes instead of
+ * being launched afterwards. Reads and writes keep their order. */
+__device__ __forceinline__ void pdl_enter() {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+static bool pdl_enabled() {
+    static int on = -1;   /* DS4_CUDA_NO_PDL=1 launches without it */
+    if (on < 0) {
+        int device = 0, major = 0;
+        on = getenv("DS4_CUDA_NO_PDL") == NULL && cudaGetDevice(&device) == cudaSuccess &&
+             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+             major >= 9;
+        (void)cudaGetLastError();
+    }
+    return on;
+}
+
+template<typename... KernelArgs, typename... Args>
+static void launch(void (*kernel)(KernelArgs...), dim3 grid, dim3 block, size_t smem, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr[1];
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = cuda_decode_stream();
+    if (pdl_enabled()) {
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+    }
+    (void)cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+}
+
+__device__ __forceinline__ float sum(float x);
+__device__ __forceinline__ float sigmoid(float x);
+template<unsigned TYPE>
+__device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
+        const uint64_t *grid = NULL, const uint8_t *signs = NULL);
+__device__ float injection(const float *inj, unsigned hc, unsigned stream);
+
+struct l2_prefetch { const char *p; uint64_t bytes; unsigned early; };
+static l2_prefetch attn_prefetch_pending;   /* consumed by the next attn_prep */
+
+struct rope_args { float freq[32], scale; unsigned nrot; };
+static float rope_freq[32];
+static float rope_scale = 1;
+static bool rope_set;
+
+static rope_args rope(unsigned nrot, float base) {
+    rope_args r = {};
+    r.nrot = nrot;
+    r.scale = rope_set ? rope_scale : 1;
+    for (unsigned i = 0; i < nrot / 2; i++)
+        r.freq[i] = rope_set ? rope_freq[i] : powf(base, -2.0f * i / nrot);
+    return r;
+}
+
+__device__ void apply_rope(float *row, const uint32_t *pos, rope_args r) {
+    const unsigned i = threadIdx.x;
+    if (i < r.nrot / 2) {
+        const float theta = (float)pos[i % 3] * r.freq[i];
+        const float c = cosf(theta) * r.scale, s = sinf(theta) * r.scale;
+        const float a = row[i], b = row[i + r.nrot / 2];
+        row[i] = a * c - b * s;
+        row[i + r.nrot / 2] = a * s + b * c;
+    }
+    __syncwarp();
+}
+
+__device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half *kc, __half *vc,
+        float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
+        const float *iq, const float *ik, const uint32_t *pos3,
+        const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
+        unsigned pos0, float eps, rope_args rp, unsigned t) {
+    const unsigned slot = blockIdx.x, pos = pos0 + t, lane = threadIdx.x;
+    __shared__ float row[256];
+    if (slot == H + Hkv + Hi) {
+        for (unsigned i = lane; i < Di; i += 32) ikc[(uint64_t)pos * Di + i] = ik[(uint64_t)t * Di + i];
+        return;
+    }
+    const bool isq = slot < H, isk = !isq && slot < H + Hkv;
+    const unsigned h = isq ? slot : isk ? slot - H : slot - H - Hkv;
+    const unsigned dim = isq || isk ? D : Di;
+    const float *src = isq ? qg + ((uint64_t)t * H + h) * 2 * D :
+                      isk ? kp + ((uint64_t)t * Hkv + h) * D : iq + ((uint64_t)t * Hi + h) * Di;
+    const float *gamma = isq ? gq : isk ? gk : giq;
+    const unsigned npt = dim / 32;
+    float ss = 0;
+    for (unsigned i = 0; i < npt; i++) { const float v = src[lane * npt + i]; ss += v * v; }
+    const float inv = rsqrtf(sum(ss) / dim + eps);
+    for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
+    __syncwarp();
+    apply_rope(row, pos3 + (uint64_t)pos * 4, rp);
+    for (unsigned i = lane; i < dim; i += 32) {
+        if (isq) {
+            qout[((uint64_t)t * H + h) * D + i] = row[i];
+            gate[((uint64_t)t * H + h) * D + i] = src[D + i];
+        } else if (isk) {
+            kc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(row[i]);
+            vc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(vp[((uint64_t)t * Hkv + h) * D + i]);
+        } else iqout[((uint64_t)t * Hi + h) * Di + i] = row[i];
+    }
+}
+
+/* Asks L2 for this thread's share (part of parts) of a weight range with
+ * bulk prefetches: fire and forget, nothing waits on them.  Only for memory
+ * no kernel writes, so it may run before the dependency wait. */
+__device__ __forceinline__ void l2_prefetch_part(const char *p, uint64_t bytes, unsigned part, unsigned parts) {
+#if __CUDA_ARCH__ >= 900
+    const uint64_t b0 = ((uint64_t)(uintptr_t)p + 15) & ~(uint64_t)15, e = ((uint64_t)(uintptr_t)p + bytes) & ~(uint64_t)15;
+    if (e <= b0) return;
+    const uint64_t per = ((e - b0 + parts - 1) / parts + 15) & ~(uint64_t)15;
+    const uint64_t s0 = b0 + (uint64_t)part * per, se = min(e, s0 + per);
+    for (uint64_t s = s0; s < se; s += 65536) {
+        const unsigned n = (unsigned)min(se - s, (uint64_t)65536);
+        asm volatile("{\n\t.reg .u64 g;\n\tcvta.to.global.u64 g, %0;\n\tcp.async.bulk.prefetch.L2.global [g], %1;\n\t}"
+                     :: "l"(s), "r"(n) : "memory");
+    }
+#endif
+}
+
+__global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
+        float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
+        const float *iq, const float *ik, const uint32_t *pos3,
+        const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
+        unsigned pos0, float eps, rope_args rp, const char *pf, uint64_t pf_bytes, unsigned pf_early) {
+    /* pf: the layer's output projection, pulled into L2 while the rest of
+     * the attention chain (selection, attention, merge) leaves DRAM idle */
+    const bool fetch = pf && !blockIdx.y;
+    if (fetch && pf_early) l2_prefetch_part(pf, pf_bytes, blockIdx.x * 32 + threadIdx.x, gridDim.x * 32);
+    pdl_enter();
+    if (fetch && !pf_early) l2_prefetch_part(pf, pf_bytes, blockIdx.x * 32 + threadIdx.x, gridDim.x * 32);
+    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,gq,gk,giq,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
+}
+
+__device__ __forceinline__ void block_key_body(__half *out, const float *ik, const uint32_t *pos3,
+        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+    const unsigned b = block0 + blockIdx.x, lane = threadIdx.x, npt = D / 32;
+    __shared__ float row[128];
+    float ss = 0, v[4];
+    for (unsigned i = 0; i < npt; i++) {
+        float a = 0;
+        for (unsigned t = 0; t < ratio; t++) a += ik[((uint64_t)b * ratio + t) * D + lane * npt + i];
+        v[i] = a / ratio;
+        ss += v[i] * v[i];
+    }
+    const float inv = rsqrtf(sum(ss) / D + eps);
+    for (unsigned i = 0; i < npt; i++) row[lane * npt + i] = v[i] * inv * gamma[lane * npt + i];
+    __syncwarp();
+    apply_rope(row, pos3 + (uint64_t)b * ratio * 4, rp);
+    for (unsigned i = lane; i < D; i += 32) out[(uint64_t)b * D + i] = __float2half_rn(row[i]);
+}
+
+__global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
+        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+    pdl_enter();
+    block_key_body(out,ik,pos3,gamma,block0,ratio,D,eps,rp);
+}
+
+__device__ __forceinline__ void idx_score_body(float *out, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio, unsigned t) {
+    const unsigned b = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (b >= N) return;
+    float score = 0;
+    if (b >= (pos0 + t + 1) / ratio) score = -3e38f;
+    else for (unsigned h = 0; h < H; h++) {
+        float a = 0;
+        for (unsigned i = lane; i < D; i += 32)
+            a += q[((uint64_t)t * H + h) * D + i] * __half2float(key[(uint64_t)b * D + i]);
+        score += fmaxf(sum(a), 0);
+    }
+    if (!lane) out[(uint64_t)t * N + b] = score;
+}
+
+__global__ void idx_score(float *out, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
+    pdl_enter();
+    idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
+}
+
+__global__ void tile_max(unsigned

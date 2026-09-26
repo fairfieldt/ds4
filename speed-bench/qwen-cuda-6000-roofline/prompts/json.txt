@@ -1,0 +1,1 @@
+Produce a JSON array of 15 fictional employees. Each object has the fields id (integer), name, email, department (one of Engineering, Sales, Finance, Support), title, start_date (YYYY-MM-DD) and manager_id (integer or null). Output only the JSON.

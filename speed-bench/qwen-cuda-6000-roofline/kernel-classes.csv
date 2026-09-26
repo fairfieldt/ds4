@@ -1,0 +1,63 @@
+capture,class,base_launches_per_token,base_us_per_token,base_us_per_launch,stack_launches_per_token,stack_us_per_token,stack_us_per_launch
+256,GDN qkv+gate (+ab/conv),48,1125.7,23.45,48,1151.9,24.00
+256,MoE gate/up,48,798.8,16.64,48,737.3,15.36
+256,HC norm,97,714.1,7.36,97,621.0,6.40
+256,Q8 2560x6144 GEMV (1 warp/row),49,672.4,13.72,49,674.7,13.77
+256,HC mix (up),97,594.7,6.13,97,294.5,3.04
+256,MoE down,48,563.8,11.75,48,461.3,9.61
+256,HC down (F16 320x10240),97,539.2,5.56,97,422.0,4.35
+256,output head (675 MB Q8),1,413.0,412.99,1,412.8,412.84
+256,router top-k,48,378.4,7.88,48,152.6,3.18
+256,GDN conv/prep/scan/out,144,373.2,2.59,108,206.1,1.91
+256,"attn q/k/v proj (Q8, 3072 blk)",12,270.9,22.57,12,270.2,22.52
+256,router GEMV,48,213.0,4.44,48,70.5,1.47
+256,attention (prep/core/merge),36,155.5,4.32,36,169.0,4.69
+256,GDN alpha/beta GEMV,72,147.0,2.04,,,
+256,MoE reduce,48,128.5,2.68,48,130.4,2.72
+256,"PLE/n-gram proj (Q8, 2560 blk)",1,50.4,50.43,1,20.1,20.15
+256,host/staging/argmax/ngram,2,25.5,12.73,5,30.2,6.04
+256,attn indexer (score/select/expand/key),3,8.7,2.62,3,8.7,2.63
+256,TOTAL incremental,899,7172.9,,794,5833.4,
+256,launch gaps (included in TOTAL),,220.6,,,41.7,
+4096,GDN qkv+gate (+ab/conv),48,1128.8,23.52,48,1154.1,24.04
+4096,MoE gate/up,48,798.6,16.64,48,737.9,15.37
+4096,HC norm,97,700.8,7.22,97,622.5,6.42
+4096,Q8 2560x6144 GEMV (1 warp/row),49,674.9,13.77,49,681.4,13.91
+4096,HC mix (up),97,596.5,6.15,97,311.0,3.21
+4096,MoE down,48,565.3,11.78,48,463.1,9.65
+4096,HC down (F16 320x10240),97,539.9,5.57,97,413.3,4.26
+4096,output head (675 MB Q8),1,413.6,413.58,1,414.0,414.00
+4096,router top-k,48,377.5,7.86,48,152.7,3.18
+4096,GDN conv/prep/scan/out,144,375.3,2.61,108,206.5,1.91
+4096,"attn q/k/v proj (Q8, 3072 blk)",12,271.2,22.60,12,269.5,22.46
+4096,attn indexer (score/select/expand/key),39,261.1,6.64,39,133.9,3.41
+4096,attention (prep/core/merge),36,237.7,6.60,36,241.7,6.71
+4096,router GEMV,48,213.7,4.45,48,71.1,1.48
+4096,GDN alpha/beta GEMV,72,148.2,2.06,,,
+4096,MoE reduce,48,128.3,2.67,48,130.9,2.73
+4096,"PLE/n-gram proj (Q8, 2560 blk)",1,48.8,48.78,1,20.1,20.07
+4096,host/staging/argmax/ngram,2,25.6,12.80,5,30.3,6.06
+4096,TOTAL incremental,935,7505.8,,830,6053.9,
+4096,launch gaps (included in TOTAL),,208.0,,,42.6,
+spec256,GDN qkv+gate (+ab/conv),49,1358.7,27.73,49,1392.9,28.43
+spec256,MoE gate/up,49,1379.4,28.15,49,1318.2,26.90
+spec256,Q8 2560x6144 GEMV (1 warp/row),50,1013.9,20.28,50,1029.2,20.58
+spec256,MoE down,49,853.8,17.42,49,791.1,16.14
+spec256,HC mix (up),149,717.8,4.82,149,405.6,2.72
+spec256,HC down (F16 320x10240),100,596.2,5.96,100,472.3,4.72
+spec256,HC norm,100,467.6,4.68,100,564.3,5.64
+spec256,GDN conv/prep/scan/out,144,451.0,3.13,108,265.3,2.46
+spec256,output head (675 MB Q8),1,416.7,416.73,1,420.7,420.74
+spec256,router top-k,49,387.3,7.90,49,159.3,3.25
+spec256,"attn q/k/v proj (Q8, 3072 blk)",13,348.6,26.81,13,349.4,26.88
+spec256,attention (prep/core/merge),39,282.8,7.25,39,285.2,7.31
+spec256,router GEMV,49,221.0,4.51,49,114.3,2.33
+spec256,GDN alpha/beta GEMV,72,160.4,2.23,,,
+spec256,MoE reduce,49,133.7,2.73,49,143.5,2.93
+spec256,other: matvec_q8 16384x1,1,111.0,111.01,1,111.7,111.66
+spec256,MTP stage/proj/rows,5,96.9,18.02,4,74.7,17.18
+spec256,"PLE/n-gram proj (Q8, 2560 blk)",1,69.7,69.67,1,25.2,25.17
+spec256,host/staging/argmax/ngram,6,34.3,5.72,7,36.6,5.22
+spec256,attn indexer (score/select/expand/key),7,19.4,2.63,7,20.1,2.73
+spec256,TOTAL incremental,983,9120.0,,875,7979.5,
+spec256,launch gaps (included in TOTAL),,146.1,,,99.8,
