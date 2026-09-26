@@ -2211,6 +2211,40 @@ static void test_host_argmax(void) {
     ds4_gpu_host_free(top);
     puts("  host argmax: mapped ids match the device rows passed");
 }
+
+/* Rows the host staged in mapped page-locked memory reach the device through
+ * the staging kernel byte for byte: queued behind other work, the host
+ * rewriting the staging only after end_commands (as the graph does), and
+ * misaligned or oversized spans rejected. */
+static void test_host_staging(void) {
+    const unsigned n = 3u * 10240u + 4u;
+    char *pin = ds4_gpu_host_alloc((uint64_t)n * sizeof(float) + 256u);
+    require_ok(pin != NULL, "mapped staging");
+    float *rows = (float *)pin;
+    ds4_gpu_tensor *x = upload(NULL, n + 8u), *slow = upload(NULL, n), *p3 = upload(NULL, 64);
+    for (unsigned round = 0; round < 3; round++) {
+        float *v = rand_vec(n, 1.f);
+        memcpy(rows, v, (size_t)n * sizeof(float));
+        require_ok(ds4_gpu_tensor_fill_f32(x, 17.25f, n + 8u) && ds4_gpu_begin_commands() &&
+                   ds4_gpu_tensor_fill_f32(slow, 1.f, n) &&
+                   ds4_gpu_qwen4_stage_host_tensor(x, 16u, rows, (uint64_t)n * sizeof(float)) &&
+                   ds4_gpu_end_commands(), "staged span");
+        float *back = malloc((size_t)(n + 8u) * sizeof(float));
+        require_ok(back && ds4_gpu_tensor_read(x, 0, back, (uint64_t)(n + 8u) * sizeof(float)), "staged read");
+        require_ok(memcmp(back + 4, v, (size_t)n * sizeof(float)) == 0, "staged row bytes");
+        for (unsigned j = 0; j < 4; j++) require_ok(back[j] == 17.25f && back[n + 4u + j] == 17.25f, "staging guards");
+        free(back);
+        free(v);
+    }
+    require_ok(!ds4_gpu_qwen4_stage_host_tensor(x, 4, rows, 64) &&
+               !ds4_gpu_qwen4_stage_host_tensor(x, 0, rows, 60) &&
+               !ds4_gpu_qwen4_stage_host_tensor(x, 0, rows + 1, 64) &&
+               !ds4_gpu_qwen4_stage_host_tensor(p3, 0, rows, 272) &&
+               !ds4_gpu_qwen4_stage_host_tensor(NULL, 0, rows, 64), "staging rejects bad spans");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(slow); ds4_gpu_tensor_free(p3);
+    ds4_gpu_host_free(pin);
+    puts("  host staging: mapped span staged byte for byte passed");
+}
 #endif
 
 /* The paired mixer must preserve both token rows and its partial-group guard. */
@@ -3896,6 +3930,7 @@ int main(void) {
 #ifndef __APPLE__
     test_argmax_rows();
     test_host_argmax();
+    test_host_staging();
 #endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);

@@ -58436,6 +58436,8 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
  * transients before the GPU read them.  A batched Qwen decode must therefore
  * be one forward over several rows, which is the shape these buffers already
  * have, and not two forwards sharing an arena. */
+#define DS4_QWEN4_PIN_ROWS 4u
+
 #define DS4_QWEN4_SCRATCH_FIELDS(X) \
     X(R) X(xn) X(lo) X(inj) X(inj_alt) X(mixed) X(blk) X(qkv) X(z) X(ga) \
     X(gb) X(lin_o) X(ple_emb) X(ple_key) X(ple_val) X(ple_gated) X(ple_normed) \
@@ -58529,11 +58531,14 @@ typedef struct ds4_qwen4_gpu_graph {
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
-    /* CUDA: mapped page-locked staging that the argmax kernels store the
-     * greedy ids straight into, so no readback waits for the host; one
-     * block, freed with the graph.  top_out, when set together with
-     * gpu_logits_only, receives the argmax row ids. */
+    /* CUDA: mapped page-locked staging for decode forwards (T <=
+     * DS4_QWEN4_PIN_ROWS).  A kernel on the decode stream copies the staged
+     * inputs in, and the argmax kernels store the greedy ids straight into
+     * it, so no copy waits for the host; one block, freed with the graph.
+     * top_out, when set together with gpu_logits_only, receives the argmax
+     * row ids. */
     void *pin_base;
+    float *pin_ngram;
     int32_t *pin_top;
     int32_t *top_out;
     ds4_gpu_tensor *steer_dirs;
@@ -58656,6 +58661,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     ds4_gpu_host_free(g->pin_base);
 #endif
     g->pin_base = NULL;
+    g->pin_ngram = NULL;
     g->pin_top = g->top_out = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
@@ -58902,8 +58908,15 @@ private_state:
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
 #ifndef DS4_HAS_QWEN4_METAL
-    g->pin_base = ds4_gpu_host_alloc(256u);
-    g->pin_top = g->pin_base;
+    {
+        const uint64_t ngram_b = (uint64_t)DS4_QWEN4_PIN_ROWS * E * sizeof(float);
+        g->pin_base = ds4_gpu_host_alloc(ngram_b + 256u);
+        if (g->pin_base) {
+            char *p = g->pin_base;
+            g->pin_ngram = (float *)p;
+            g->pin_top = (int32_t *)(p + ngram_b);
+        }
+    }
 #endif
     if (!ok) {
         fprintf(stderr, "ds4: Qwen3.8 graph allocation failed (ctx %u)\n", ctx_cap);
@@ -59574,6 +59587,20 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
+/* CUDA decode forwards read the PLE n-grams while layer 0 runs and stage
+ * them in mapped memory for a kernel queued behind it, without the
+ * device-wide syncs that the Metal command buffers need (the il == 1 flush
+ * and the layer-2 flush).  Wider forwards, and a graph whose mapped staging
+ * could not be allocated, keep both syncs and the pageable upload. */
+static bool qwen4_async_ngram(const ds4_qwen4_gpu_graph *g, uint32_t T) {
+#ifdef DS4_HAS_QWEN4_METAL
+    (void)g; (void)T;
+    return false;
+#else
+    return g->pin_ngram && T <= DS4_QWEN4_PIN_ROWS;
+#endif
+}
+
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T) {
@@ -59602,7 +59629,8 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                     const int *tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD;
-    float *row = g->host_row;
+    const bool async = qwen4_async_ngram(g, T);
+    float *row = async ? g->pin_ngram : g->host_row;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -59623,6 +59651,9 @@ static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             }
         }
     }
+#ifndef DS4_HAS_QWEN4_METAL
+    if (async) return ds4_gpu_qwen4_stage_host_tensor(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+#endif
     return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
@@ -59651,7 +59682,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission. */
-    uint32_t flush_layer = timing != 2 && n_trunk > 2u ? 2u : 0u;
+    const bool async_ngram = qwen4_async_ngram(g, T);
+    uint32_t flush_layer = timing != 2 && n_trunk > 2u && !async_ngram ? 2u : 0u;
     const char *flush_env = getenv("DS4_QWEN4_FLUSH_LAYER");
     if (timing != 2 && flush_env && flush_env[0]) {
         char *end = NULL;
@@ -59690,7 +59722,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         if (il == 1 && overlap_ngrams) {
-            ok = ds4_gpu_flush_commands() && qwen4_graph_stage_ngrams(g,m,tokens,T);
+            ok = (async_ngram || ds4_gpu_flush_commands()) && qwen4_graph_stage_ngrams(g,m,tokens,T);
             if (!ok) break;
         }
         const ds4_layer_weights *l = &w->layer[il];

@@ -2172,6 +2172,17 @@ __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigne
     }
 }
 
+/* Copies a span the host wrote into mapped page-locked memory before this
+ * launch.  No kernel writes that memory, so it is loaded before the
+ * dependency wait (hidden under the predecessor); only the store waits. */
+__global__ void stage_host(uint4 *dst, const uint4 *src, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint4 a = {};
+    if (i < n) a = __ldcv(src + i);
+    pdl_enter();
+    if (i < n) dst[i] = a;
+}
+
 __global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
         const float *pos, unsigned N, unsigned E) {
     pdl_enter();
@@ -3304,6 +3315,17 @@ extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *
 extern "C" int ds4_gpu_qwen4_argmax_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
         const ds4_gpu_tensor *logits, uint32_t N, uint32_t T) {
     return ds4_gpu_qwen4_argmax_rows_host_tensor(out, scratch, logits, N, T, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes) {
+    using namespace qwen4_cuda;
+    if (!dst || !src || !bytes || (bytes | off | (uintptr_t)src) % 16u ||
+        off > dst->bytes || bytes > dst->bytes - off) return 0;
+    const uint64_t n = bytes / 16u;
+    if (n > UINT32_MAX - 255u) return 0;
+    launch(stage_host, (unsigned)((n + 255u) / 256u), 256, 0,
+           (uint4 *)((char *)dst->ptr + off), (const uint4 *)src, (unsigned)n);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed,
