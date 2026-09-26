@@ -3450,6 +3450,61 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
 }
 
 #ifndef __APPLE__
+/* Shared-input Q8 projections of one to three rows run in one launch per
+ * block geometry; each output must equal its separate projection byte for
+ * byte (MTP verify rows keep the one-token arithmetic), guards included. */
+static void test_multi_q8_exact(arena_t *a) {
+    const unsigned K = 2560, M[] = {512,1537,1536,64}, type[] = {8,8,8,8};
+    uint64_t offsets[4];
+    for (unsigned i = 0; i < 4; i++) { double *sh; offsets[i] = arena_q8_0(a,M[i],K,&sh,.1f); free(sh); }
+    for (unsigned T = 1; T <= 3; T++) {
+        float *input = rand_vec(T*K,.1f);
+        ds4_gpu_tensor *x = upload(input,T*K), *ref[4], *out[4];
+        for (unsigned i = 0; i < 4; i++) {
+            ref[i] = upload(NULL,T*M[i]+16); out[i] = upload(NULL,T*M[i]+16);
+            require_ok(ds4_gpu_tensor_fill_f32(ref[i],17.25f,T*M[i]+16) &&
+                ds4_gpu_tensor_fill_f32(out[i],17.25f,T*M[i]+16) &&
+                ds4_gpu_qwen4_dense_mm_tensor(ref[i],x,a->base,a->size,offsets[i],8,T,K,M[i]),"multi Q8 reference");
+        }
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,4,out,a->base,a->size,offsets,type,M),"multi Q8 fused");
+        for (unsigned i = 0; i < 4; i++) {
+            same_bytes("multi Q8 exact",i,ref[i],0,out[i],0,(T*M[i]+16)*4);
+            ds4_gpu_tensor_free(ref[i]); ds4_gpu_tensor_free(out[i]);
+        }
+        ds4_gpu_tensor_free(x); free(input);
+    }
+    puts("  multi Q8: mixed narrow/wide projections at T=1/2/3 byte-exact with guards");
+}
+/* Four to 32 rows: the projections share one activation pack and one
+ * tensor-core launch, whose K split follows the combined tile count.  The
+ * four-projection set (229 tiles) runs unsplit; the narrow pair (36 tiles)
+ * splits K two ways at 8 rows and four ways above 16, with a scratch plane
+ * set and a reduce per projection. */
+static void test_multi_q8_rows(arena_t *a, uint32_t T, uint32_t N, const uint32_t *M) {
+    const uint32_t K = 2560, type[] = {8,8,8,8};
+    uint64_t offsets[4];
+    double *sh[4];
+    for (unsigned i = 0; i < N; i++) offsets[i] = arena_q8_0(a,M[i],K,&sh[i],.1f);
+    float *input = rand_vec((uint64_t)T*K,.1f);
+    ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *out[4];
+    for (unsigned i = 0; i < N; i++) out[i] = upload(NULL,(uint64_t)T*M[i]);
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,N,out,a->base,a->size,offsets,type,M),"multi Q8 rows");
+    for (unsigned i = 0; i < N; i++) {
+        double *ref = malloc((uint64_t)T*M[i]*sizeof(double));
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t r = 0; r < M[i]; r++) {
+                double acc = 0.0;
+                for (uint32_t k = 0; k < K; k++) acc += sh[i][(uint64_t)r*K+k]*input[(uint64_t)t*K+k];
+                ref[(uint64_t)t*M[i]+r] = acc;
+            }
+        char name[96];
+        snprintf(name,sizeof(name),"multi Q8 rows out%u rows %u T=%u",i,M[i],T);
+        check_tensor(name,out[i],ref,(uint64_t)T*M[i],3e-5);
+        free(ref); free(sh[i]); ds4_gpu_tensor_free(out[i]);
+    }
+    ds4_gpu_tensor_free(x); free(input);
+}
+
 /* Check half-operand expert tiles independently at every CUDA tile width.
  * The existing tests above still bound their error versus unrounded weights. */
 static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype, uint32_t F) {
@@ -3811,6 +3866,16 @@ int main(void) {
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
+#ifndef __APPLE__
+    test_multi_q8_exact(&arena);
+    {
+        static const uint32_t wide[] = {512,1537,1536,64}, narrow[] = {512,64};
+        test_multi_q8_rows(&arena, 8, 4, wide);
+        test_multi_q8_rows(&arena, 25, 4, wide);
+        test_multi_q8_rows(&arena, 8, 2, narrow);
+        test_multi_q8_rows(&arena, 25, 2, narrow);
+    }
+#endif
     printf("mtp\n");
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
