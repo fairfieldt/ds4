@@ -528,6 +528,11 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+/* Qwen3.8 vision encoder scratch (ds4_qwen4_cuda.cuh), kept and grown
+ * across encodes, released by ds4_gpu_cleanup.  Encodes are serialised like
+ * all other GPU work, see ds4_gpu_qwen4_vision_encode. */
+static ds4_gpu_tensor *g_qwen4_vision_scratch;
+extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 static void *g_tt_scratch;
 static uint64_t g_tt_scratch_bytes;
 static int g_tt_scratch_device = -1;
@@ -2987,6 +2992,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
     g_current_logical_tier = -1;
+    ds4_gpu_tensor_free(g_qwen4_vision_scratch);
+    g_qwen4_vision_scratch = NULL;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
