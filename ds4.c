@@ -74026,9 +74026,10 @@ static int ds4_engine_vision_encode_image(
 }
 
 int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const char *out_path,
-                          uint32_t min_image_tokens, uint32_t max_image_tokens) {
+                          uint32_t min_image_tokens, uint32_t max_image_tokens, uint32_t repeats) {
 #ifndef DS4_HAS_QWEN4_GPU
     (void)vision_path; (void)image_path; (void)out_path; (void)min_image_tokens; (void)max_image_tokens;
+    (void)repeats;
     fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
     return 0;
 #else
@@ -74046,8 +74047,18 @@ int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const
                                                           vm.size - vm.tensor_data_pos, vm.max_tensor_bytes);
     float *emb = NULL;
     ds4_image_patches patches = {0};
-    if (ok) ok = qwen4_vision_encode_image(&vm, &w, &image, min_image_tokens, max_image_tokens, &emb, &patches,
-                                           err, sizeof(err));
+    /* repeats > 1 times each call (preprocessing through the host copy of
+     * the embeddings) and keeps the last result */
+    for (uint32_t r = 0; ok && r < (repeats ? repeats : 1u); r++) {
+        free(emb);
+        emb = NULL;
+        ds4_image_patches_free(&patches);
+        const double t0 = now_sec();
+        ok = qwen4_vision_encode_image(&vm, &w, &image, min_image_tokens, max_image_tokens, &emb, &patches,
+                                       err, sizeof(err));
+        if (ok && repeats > 1) fprintf(stderr, "ds4: vision encode %u: %u image tokens, %.3f ms\n",
+                                      r, patches.image_token_count, 1e3 * (now_sec() - t0));
+    }
     if (!ok) fprintf(stderr, "ds4: %s\n", err);
     FILE *fp = ok ? fopen(out_path, "wb") : NULL;
     if (fp) {
