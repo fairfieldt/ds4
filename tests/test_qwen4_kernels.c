@@ -1721,6 +1721,44 @@ static void test_gdn_rows(arena_t *a) {
     ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); free(x); free(initial); free(history);
     puts("  GDN rows: reordered ragged sessions, first-token snapshots and guards byte-exact");
 }
+
+/* ds4_qwen4_cuda.cuh, tests only: the top-k through router() at every shape. */
+int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS);
+
+/* The router paths must reproduce the original router GEMV + router() byte
+ * for byte (logits, experts, weights, shared gate): router_pre against
+ * router() through the reference hook. */
+static void router_paths_run(arena_t *a, uint64_t woff, uint64_t goff, ds4_gpu_tensor *x, unsigned T,
+                             ds4_gpu_tensor *const *o, bool ref) {
+    const unsigned K = 2560, NE = 512, NS = 10;
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(o[0],x,a->base,a->size,woff,0u,T,K,NE) &&
+               (ref ? ds4_gpu_qwen4_router_topk_ref_tensor : ds4_gpu_qwen4_router_topk_tensor)(
+                   o[1],o[2],o[0],x,a->base,a->size,goff,0u,K,o[3],T,NE,NS),
+               "router");
+}
+
+static void test_router_paths(arena_t *a) {
+    const unsigned K = 2560, NE = 512, NS = 10;
+    double *sh;
+    const uint64_t woff = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t goff = arena_f32(a,K,&sh,-.05f,.05f); free(sh);
+    const unsigned Ts[] = {1,2,3,5,8,13};
+    for (unsigned ti = 0; ti < 6; ti++) {
+        const unsigned T = Ts[ti];
+        const uint64_t n[4] = {(uint64_t)T*NE,(uint64_t)T*NS,(uint64_t)T*NS,T};
+        float *input = rand_vec((uint64_t)T*K,1.0f);
+        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *o[2][4];
+        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 4; j++) o[v][j] = upload(NULL,n[j]);
+        router_paths_run(a,woff,goff,x,T,o[0],true);
+        router_paths_run(a,woff,goff,x,T,o[1],false);
+        for (unsigned j = 0; j < 4; j++) same_bytes("router preload",T,o[0][j],0,o[1][j],0,n[j]*4);
+        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 4; j++) ds4_gpu_tensor_free(o[v][j]);
+        ds4_gpu_tensor_free(x); free(input);
+    }
+    puts("  router: preloaded shared gate byte-exact at T=1..13");
+}
 #endif
 
 /* ---- routed experts ---- */
@@ -3868,6 +3906,7 @@ int main(void) {
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ROUTER")) { test_router_paths(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
@@ -3977,6 +4016,9 @@ int main(void) {
 #endif
     test_router(&arena, 512, 10, 3);
     test_router(&arena, 32, 10, 5);
+#ifndef __APPLE__
+    test_router_paths(&arena);
+#endif
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);

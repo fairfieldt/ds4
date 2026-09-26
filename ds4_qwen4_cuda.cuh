@@ -774,6 +774,84 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
 }
 
+/* router() with an F32 shared gate of K = 256 * KPT. Each thread's KPT gate
+ * values are loaded before the dependency wait (the weights are immutable),
+ * so the cold 10 KB row no longer arrives from DRAM one dependent load at a
+ * time after the router GEMV. Every value rounds as in router(): the gate
+ * dot keeps its per-thread order and block_sum, the maximum is exact in any
+ * order, and the softmax sum, division and selection are router()'s.
+ * Other gate types and widths keep router(). */
+template<unsigned KPT>
+__global__ void __launch_bounds__(256) router_pre(int *selected, float *weights, const float *logits,
+        const float *x, const float *gate, float *shared_gate, unsigned NE, unsigned NS) {
+    const unsigned t = blockIdx.x, tid = threadIdx.x;
+    float g[KPT];
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) g[j] = gate[tid + 256 * j];
+    pdl_enter();
+    __shared__ float p[512], red[32];
+    float l[2], xv[KPT];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        l[j] = tid + 256 * j < NE ? logits[(uint64_t)t * NE + tid + 256 * j] : -FLT_MAX;
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) xv[j] = x[(uint64_t)t * KPT * 256 + tid + 256 * j];
+    float sg = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) sg += g[j] * xv[j];
+    sg = block_sum(sg, red);
+    if (!tid) shared_gate[t] = sg;
+    float mx = fmaxf(fmaxf(-FLT_MAX, l[0]), l[1]);
+    for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
+    if (!(tid & 31)) red[tid / 32] = mx;
+    __syncthreads();
+    mx = red[0];
+    #pragma unroll
+    for (unsigned w = 1; w < 8; w++) mx = fmaxf(mx, red[w]);
+    __syncthreads();
+    float ps = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) {
+        const unsigned e = tid + 256 * j;
+        if (e < NE) { p[e] = expf(l[j] - mx); ps += p[e]; }
+    }
+    const float total = block_sum(ps, red);
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) if (tid + 256 * j < NE) p[tid + 256 * j] /= total;
+    __syncthreads();
+    if (tid < 32) {
+        float v[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) v[j] = tid + 32 * j < NE ? p[tid + 32 * j] : -1;
+        for (unsigned s = 0; s < NS; s++) {
+            float best = -1;
+            unsigned id = UINT_MAX;
+            #pragma unroll
+            for (unsigned j = 0; j < 16; j++) if (v[j] > best) { best = v[j]; id = tid + 32 * j; }
+            for (unsigned off = 16; off; off /= 2) {
+                const float ob = __shfl_xor_sync(0xffffffff, best, off);
+                const unsigned oi = __shfl_xor_sync(0xffffffff, id, off);
+                if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
+            }
+            if (id >= NE) { id = s; best = 0; }
+            #pragma unroll
+            for (unsigned j = 0; j < 16; j++) if (tid + 32 * j == id) v[j] = -1;
+            if (!tid) {
+                selected[(uint64_t)t * NS + s] = id;
+                weights[(uint64_t)t * NS + s] = best;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < NS) {
+        float denom = 0;
+        for (unsigned s = 0; s < NS; s++) denom += weights[(uint64_t)t * NS + s];
+        red[tid] = denom;
+    }
+    __syncthreads();
+    if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
+}
+
 /* SH is the shared expert's type when known at compile time, or SH_ANY. */
 enum : unsigned { SH_ANY = 255 };
 
@@ -3083,17 +3161,37 @@ extern "C" int ds4_gpu_qwen4_q8_pair_tensor(ds4_gpu_tensor *o0, ds4_gpu_tensor *
     return ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,2,outs,map,size,offsets,types,rows);
 }
 
-extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+/* pre: an F32 shared gate of K = 2560 takes router_pre<10>. */
+static int router_topk(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
-        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS,
+        bool pre) {
     using namespace qwen4_cuda;
     if (!T || !NE || NE > 512 || !NS || NS > NE || NS > 32 ||
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    launch(router, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
-        K ? (const float *)x->ptr : nullptr, wg, K ? (float *)sg->ptr : nullptr, NE, NS, K, type);
+    if (pre && K == 2560 && type == 0)
+        launch(router_pre<10>, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            (const float *)x->ptr, (const float *)wg, (float *)sg->ptr, NE, NS);
+    else
+        launch(router, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            K ? (const float *)x->ptr : nullptr, wg, K ? (float *)sg->ptr : nullptr, NE, NS, K, type);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+    return router_topk(sel, weights, logits, x, map, size, off, type, K, sg, T, NE, NS, true);
+}
+
+/* Tests only: the same top-k through router() for every gate, the reference
+ * that router_pre must match byte for byte. */
+extern "C" int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+    return router_topk(sel, weights, logits, x, map, size, off, type, K, sg, T, NE, NS, false);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
