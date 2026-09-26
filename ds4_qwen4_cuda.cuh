@@ -292,50 +292,71 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
     out[(uint64_t)t * tiles + tile] = v;
 }
 
+/* Inclusive prefix sums of a and b over the 256 threads of the block, in
+ * thread order: a warp shuffle scan, then the preceding warps' totals. */
+__device__ __forceinline__ void block_scan256(unsigned &a, unsigned &b, unsigned (*tot)[8]) {
+    const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    for (unsigned o = 1; o < 32; o <<= 1) {
+        const unsigned na = __shfl_up_sync(0xffffffffu, a, o), nb = __shfl_up_sync(0xffffffffu, b, o);
+        if (lane >= o) { a += na; b += nb; }
+    }
+    if (lane == 31) { tot[0][w] = a; tot[1][w] = b; }
+    __syncthreads();
+    for (unsigned i = 0; i < w; i++) { a += tot[0][i]; b += tot[1][i]; }
+    __syncthreads();
+}
+
 /* Exact radix threshold and stable gather, with the same greater-than then
- * equal-score ordering as Metal. No context-dependent candidate truncation. */
+ * equal-score ordering as Metal. No context-dependent candidate truncation.
+ * Block-parallel throughout: histogram increments are aggregated per warp
+ * (the first pass puts nearly all keys into two or three exponent bins),
+ * the digit walk is a suffix scan whose first bin reaching `need` is found
+ * with one __syncthreads_count, and the gather offsets are a block scan. */
 __device__ __forceinline__ void idx_select_body(int *out, const float *score, unsigned N, unsigned K, unsigned t) {
-    const unsigned tid = threadIdx.x;
-    __shared__ unsigned hist[256], gt[256], eq[256], threshold, need;
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    __shared__ unsigned hist[256], tot[2][8], threshold, need;
     const float *row = score + (uint64_t)t * N;
     if (!tid) { threshold = 0; need = K; }
-    __syncthreads();
     for (unsigned pass = 0; pass < 4; pass++) {
         const unsigned shift = 24 - 8 * pass, mask = pass ? (0xffffffffu << (shift + 8)) : 0;
         hist[tid] = 0;
         __syncthreads();
-        for (unsigned i = tid; i < N; i += 256) {
-            const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-            if ((key & mask) == threshold) atomicAdd(hist + ((key >> shift) & 255), 1u);
+        const unsigned thr = threshold;
+        for (unsigned base = w * 32; base < N; base += 256) {
+            const unsigned i = base + lane;
+            unsigned bin = 256;
+            if (i < N) {
+                const unsigned key = __float_as_uint(fmaxf(row[i], 0));
+                if ((key & mask) == thr) bin = (key >> shift) & 255;
+            }
+            const unsigned peers = __match_any_sync(0xffffffffu, bin);
+            if (bin < 256 && lane == (unsigned)__ffs(peers) - 1) atomicAdd(hist + bin, (unsigned)__popc(peers));
         }
         __syncthreads();
-        if (!tid) for (int d = 255; d >= 0; d--) {
-            if (hist[d] >= need) { threshold |= (unsigned)d << shift; break; }
-            need -= hist[d];
-        }
-        __syncthreads();
+        /* thread j holds digit 255 - j; incl counts the keys at digits >= it */
+        const unsigned h = hist[255 - tid], nd = need;
+        unsigned incl = h, unused = 0;
+        block_scan256(incl, unused, tot);
+        const unsigned first = __syncthreads_count(incl < nd);
+        if (first < 256) {
+            if (tid == first) { threshold = thr | (255 - tid) << shift; need = nd - (incl - h); }
+        } else if (tid == 255) need = nd - incl;
     }
+    __syncthreads();
+    const unsigned thr = threshold, nd = need;
     const unsigned chunk = (N + 255) / 256, begin = min(N, tid * chunk), end = min(N, begin + chunk);
     unsigned ng = 0, ne = 0;
     for (unsigned i = begin; i < end; i++) {
         const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        ng += key > threshold; ne += key == threshold;
+        ng += key > thr; ne += key == thr;
     }
-    gt[tid] = ng; eq[tid] = ne;
-    __syncthreads();
-    if (!tid) {
-        unsigned pg = 0, pe = 0;
-        for (unsigned i = 0; i < 256; i++) {
-            const unsigned g = gt[i], e = eq[i];
-            gt[i] = pg; eq[i] = pe; pg += g; pe += e;
-        }
-    }
-    __syncthreads();
-    unsigned g = gt[tid], e = eq[tid];
+    unsigned g = ng, e = ne;
+    block_scan256(g, e, tot);
+    g -= ng; e -= ne;
     for (unsigned i = begin; i < end; i++) {
         const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        if (key > threshold) out[(uint64_t)t * K + g++] = i;
-        else if (key == threshold) { if (e < need) out[(uint64_t)t * K + K - need + e] = i; e++; }
+        if (key > thr) out[(uint64_t)t * K + g++] = i;
+        else if (key == thr) { if (e < nd) out[(uint64_t)t * K + K - nd + e] = i; e++; }
     }
 }
 
