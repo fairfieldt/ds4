@@ -92,7 +92,7 @@ static int sync_prompt(ds4_session *session, const ds4_tokens *prompt,
 
 /* Score one official continuation among unrelated, independently advancing
  * sessions. Rotate row order to catch scratch/state ownership mistakes. */
-#define SCORE_MAX_SESSIONS 8
+#define SCORE_MAX_SESSIONS 16
 static int eval_with_companions(ds4_session **sessions, int count, int token,
                                 unsigned step, char *err, size_t errlen) {
     if (count == 1) return ds4_session_eval(sessions[0], token, err, errlen);
