@@ -2165,6 +2165,28 @@ static void test_qwen4_argmax(void) {
     printf("Qwen predictor argmax: CPU indices, ties, special values and guards passed\n");
 }
 
+#ifndef __APPLE__
+static void test_argmax_rows(void) {
+    const unsigned N = 8193, T = 3, guard = 8, chunks = (N+4095)/4096;
+    float *v = rand_vec(N*T,1.f);
+    v[4096] = v[8192] = 20;
+    for (unsigned j = 0; j < N; j++) v[N+j] = NAN;
+    v[2*N+8192] = 30;
+    ds4_gpu_tensor *x = upload(v,N*T), *out = upload(NULL,T+guard), *tmp = upload(NULL,T*chunks*2+guard);
+    require_ok(ds4_gpu_tensor_fill_f32(out,17.25f,T+guard) && ds4_gpu_tensor_fill_f32(tmp,17.25f,T*chunks*2+guard) &&
+        ds4_gpu_qwen4_argmax_rows_tensor(out,tmp,x,N,T),"argmax rows");
+    int got[3]; float tail[8];
+    require_ok(ds4_gpu_tensor_read(out,0,got,sizeof(got)) && got[0] == 4096 && got[1] == 0 && got[2] == 8192,"argmax row indices");
+    require_ok(ds4_gpu_tensor_read(out,T*4,tail,sizeof(tail)),"argmax row guard");
+    for (unsigned j = 0; j < guard; j++) require_ok(tail[j] == 17.25f,"argmax output row guard");
+    require_ok(ds4_gpu_tensor_read(tmp,T*chunks*8,tail,sizeof(tail)),"argmax scratch row guard");
+    for (unsigned j = 0; j < guard; j++) require_ok(tail[j] == 17.25f,"argmax scratch row guard");
+    require_ok(!ds4_gpu_qwen4_argmax_rows_tensor(out,tmp,x,N,T+1),"argmax rows rejects short input");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); free(v);
+    puts("  argmax rows: ties, chunk boundaries, NaNs, independent rows and guards passed");
+}
+#endif
+
 /* The paired mixer must preserve both token rows and its partial-group guard. */
 /* The prefetched F16 gate/mix must reproduce the plain kernel byte for byte
  * on every lane path: ranks that skip the eight-term rounds, that end in a
@@ -3784,7 +3806,7 @@ int main(void) {
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
-    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);
@@ -3845,6 +3867,9 @@ int main(void) {
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();
+#ifndef __APPLE__
+    test_argmax_rows();
+#endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
     test_moe_grouped(&arena);
