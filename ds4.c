@@ -59418,7 +59418,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
-    const bool shared_dense = false;
+    /* From eight rows on RTX PRO 6000; four-row batches were slower. */
+    const bool shared_dense = T >= 8u &&
+        qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+        qwen4_graph_dense_ok(l->ffn_down_shexp);
 #endif
     if (ok && shared_dense) {
         ok = qwen4_gemv_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp, g->mixed, T) &&
