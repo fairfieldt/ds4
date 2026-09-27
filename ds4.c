@@ -59362,9 +59362,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #ifdef DS4_HAS_QWEN4_METAL
     const uint32_t mm_min = 64u;
 #else
-    /* Small decode batches underfill the prefill expert tiles. A
-     * sixteen-session verification batch can contain 32 rows; retain
-     * FP32 activations through that width to match single-token experts. */
+    /* Small decode batches underfill the prefill expert tiles; the grouped
+     * decode kernels stay faster through 32 rows. A sixteen-session
+     * verification batch can contain 32 rows; retain FP32 activations
+     * through that width to match single-token experts. */
     const uint32_t mm_min = 32u;
 #endif
     const bool mm = T > mm_min &&
@@ -59431,11 +59432,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     /* Sixteen rows pick ten experts each but only a third as many distinct
      * ones: the grouped kernels read every expert once per four rows that
      * chose it instead of once per row, each row's arithmetic unchanged.
-     * DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
-#ifdef DS4_HAS_QWEN4_METAL
+     * On Metal, DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
     const bool grouped = shared_dense && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
-        getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
+        l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4
+#ifdef DS4_HAS_QWEN4_METAL
+        && getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL
+#endif
+        ;
     if (ok && grouped) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
                                                   DS4_N_EXPERT, g->cap_tokens) &&
@@ -59448,7 +59451,6 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
     } else
-#endif
     if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,

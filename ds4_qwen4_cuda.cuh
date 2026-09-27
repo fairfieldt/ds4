@@ -1002,6 +1002,97 @@ __global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
     }
 }
 
+/* A block belongs to a selected (token,slot), but only the first occurrence
+ * of that expert runs. Each pass reuses its unpacked weights across four
+ * tokens. The per-token K and warp reduction orders match the decode path. */
+template<bool DOWN>
+__global__ void moe_grouped(float *out, const float *x, const int *selected,
+        const int *lists, const int *counts, const char *w0, const char *w1,
+        unsigned NE, unsigned NS, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    pdl_enter();
+    extern __shared__ __align__(16) unsigned stage_all[];
+    __shared__ float lut[16];
+    if (DOWN) {
+        if (threadIdx.x < 16) {
+            const unsigned mag = threadIdx.x & 7;
+            const float v = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+            lut[threadIdx.x] = threadIdx.x & 8 ? -v : v;
+        }
+        __syncthreads();
+    }
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const unsigned pair = blockIdx.y, row0 = (blockIdx.x*4+warp)*(DOWN ? 2 : 1);
+    if (row0 >= M) return;
+    const int e = selected[pair];
+    if (e < 0 || (unsigned)e >= NE) {
+        if (!lane) for (unsigned r = 0; r < (DOWN ? 2u : 1u) && row0+r < M; r++)
+            out[(uint64_t)pair*M+row0+r] = 0;
+        return;
+    }
+    const int *list = lists + (uint64_t)e*cap;
+    const unsigned count = min((unsigned)counts[e],cap);
+    if (!count || (unsigned)list[0] != pair) return;
+    for (unsigned first = 0; first < count; first += 4) {
+        const unsigned n = min(4u,count-first);
+        float a[4][2] = {}, b[4] = {};
+        if (!DOWN) {
+            const uint64_t off = ((uint64_t)e*M+row0)*rb;
+            const cuda_block_q4_K *g = (const cuda_block_q4_K *)(w0+off), *u = (const cuda_block_q4_K *)(w1+off);
+            const unsigned c = lane/8, q4 = (lane%8)*4;
+            for (unsigned sb = 0; sb < K/256; sb++) {
+                const unsigned qg = *(const unsigned *)(g[sb].qs+c*32+q4), qu = *(const unsigned *)(u[sb].qs+c*32+q4);
+                float gs0,go0,gs1,go1,us0,uo0,us1,uo1;
+                q4k_group_pair(*(const uint4 *)(g+sb),c,gs0,go0,gs1,go1);
+                q4k_group_pair(*(const uint4 *)(u+sb),c,us0,uo0,us1,uo1);
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) if (j < n) {
+                    const float *xs = x+(uint64_t)(list[first+j]/NS)*K+sb*256+c*64+q4;
+                    const float4 x0 = *(const float4 *)xs, x1 = *(const float4 *)(xs+32);
+                    a[j][0] += q4k_dot8(qg,gs0,go0,gs1,go1,x0,x1);
+                    b[j] += q4k_dot8(qu,us0,uo0,us1,uo1,x0,x1);
+                }
+            }
+        } else {
+            const unsigned rw = rb/4, nr = min(2u,M-row0);
+            unsigned *stage = stage_all+warp*(2*rw+1);
+            const unsigned *src = (const unsigned *)(w0+((uint64_t)e*M+row0)*rb);
+            for (unsigned i = lane; i < nr*rw; i += 32) stage[i] = src[i];
+            __syncwarp();
+            const unsigned sub = lane%4;
+            for (unsigned blk = lane/4; blk < K/32; blk += 8) {
+                #pragma unroll
+                for (unsigned r = 0; r < 2; r++) if (r < nr) {
+                    const unsigned *sw = stage+r*rw, at = blk*17+1+4*sub;
+                    const unsigned q = __funnelshift_r(sw[at/4],sw[at/4+1],(at&3)*8);
+                    const unsigned eb = ((const uint8_t *)sw)[blk*17];
+                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb<<23);
+                    const float v[8] = {lut[q&15],lut[(q>>8)&15],lut[(q>>16)&15],lut[(q>>24)&15],
+                        lut[(q>>4)&15],lut[(q>>12)&15],lut[(q>>20)&15],lut[q>>28]};
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) if (j < n) {
+                        const float *xs = x+(uint64_t)list[first+j]*K+blk*32+4*sub;
+                        const float4 x0 = *(const float4 *)xs, x1 = *(const float4 *)(xs+16);
+                        float p = v[0]*x0.x;
+                        p += v[1]*x0.y; p += v[2]*x0.z; p += v[3]*x0.w;
+                        p += v[4]*x1.x; p += v[5]*x1.y; p += v[6]*x1.z; p += v[7]*x1.w;
+                        a[j][r] += p*scale;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) if (j < n) {
+            const float up = DOWN ? 0 : sum(b[j]);
+            #pragma unroll
+            for (unsigned r = 0; r < (DOWN ? 2u : 1u); r++) if (row0+r < M) {
+                const float v = sum(a[j][r]);
+                if (!lane) out[(uint64_t)list[first+j]*M+row0+r] = DOWN ? v : silu(v)*up;
+            }
+        }
+        if (DOWN) __syncwarp();
+    }
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
@@ -3056,6 +3147,39 @@ static int qwen4_moe_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     if (!w0 || (!down && !w1)) return 0;
     return matrix_dispatch((float *)out->ptr,(const float *)x->ptr,w0,w1,(const int *)lists->ptr,
         (const int *)counts->ptr,type,NE,T,NS,NO,K,M,cap,down);
+}
+
+static int qwen4_moe_grouped(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *sel,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t cap, const void *map, uint64_t size,
+        uint64_t o0, uint64_t o1, uint32_t type, uint32_t NE, uint32_t T, uint32_t NS,
+        uint32_t K, uint32_t M, bool down) {
+    using namespace qwen4_cuda;
+    const uint64_t rb = expert_row_bytes(type,K);
+    if (!T || !NS || NS > NE || NE > 512 || !M || cap < T || (down ? type != 39 || K%128 : type != 12 || K%256) ||
+        !tensor(out,(uint64_t)T*NS*M*4) || !tensor(x,(uint64_t)T*(down ? NS : 1)*K*4) ||
+        !tensor(sel,(uint64_t)T*NS*4) || !tensor(lists,(uint64_t)NE*cap*4) || !tensor(counts,(uint64_t)NE*4)) return 0;
+    const char *w0 = weight(map,size,o0,rb*M*NE), *w1 = down ? NULL : weight(map,size,o1,rb*M*NE);
+    if (!w0 || (!down && !w1)) return 0;
+    const dim3 grid((M+(down ? 7 : 3))/(down ? 8 : 4),T*NS);
+    if (down) launch(moe_grouped<true>,grid,128,4*(2*(rb/4)+1)*4,(float *)out->ptr,(const float *)x->ptr,
+        (const int *)sel->ptr,(const int *)lists->ptr,(const int *)counts->ptr,w0,w1,NE,NS,K,M,cap,rb);
+    else launch(moe_grouped<false>,grid,128,0,(float *)out->ptr,(const float *)x->ptr,
+        (const int *)sel->ptr,(const int *)lists->ptr,(const int *)counts->ptr,w0,w1,NE,NS,K,M,cap,rb);
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_moe_mid_grouped_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t cap,
+        const void *map, uint64_t size, uint64_t go, uint64_t uo, uint32_t type,
+        uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M) {
+    return qwen4_moe_grouped(out,x,sel,lists,counts,cap,map,size,go,uo,type,NE,T,NS,K,M,false);
+}
+
+extern "C" int ds4_gpu_qwen4_moe_down_grouped_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t cap,
+        const void *map, uint64_t size, uint64_t off, uint32_t type,
+        uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M) {
+    return qwen4_moe_grouped(out,x,sel,lists,counts,cap,map,size,off,0,type,NE,T,NS,K,M,true);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_mm_mid_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,

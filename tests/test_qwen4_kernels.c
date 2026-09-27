@@ -2238,7 +2238,6 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
-#ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
 static void test_moe_grouped(arena_t *a) {
@@ -2279,8 +2278,6 @@ static void test_moe_grouped(arena_t *a) {
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
     free(sel); free(x);
 }
-
-#endif
 
 static void test_hc_pair_groups(arena_t *a) {
     const uint32_t types[] = {1u, 0u, 8u}, widths[] = {9u, 64u, 2560u};
@@ -3807,6 +3804,7 @@ int main(void) {
     }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
@@ -3849,9 +3847,7 @@ int main(void) {
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
-#ifdef __APPLE__
     test_moe_grouped(&arena);
-#endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
