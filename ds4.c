@@ -80609,6 +80609,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
     g->R = R_save;
     g->mixed = mixed_save;
     if (ok) ok = qwen4_gemv(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count);
+#ifdef DS4_HAS_QWEN4_METAL
     for (int i = 0; ok && i < count; i++) {
         ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
         ds4_gpu_tensor *row = ds4_gpu_tensor_view(g->batch_logits, (uint64_t)i * DS4_N_VOCAB * sizeof(float),
@@ -80626,6 +80627,21 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         sg->mtp_pos = idx0[i] + committed[i];
         sg->mtp_last_rows = 0;
     }
+#else
+    /* one argmax launch pair and one read for every session's draft */
+    if (ok) ok = ds4_gpu_qwen4_argmax_rows_tensor(g->selected, g->router, g->batch_logits,
+                                                DS4_N_VOCAB, (uint32_t)count) != 0;
+    if (!ds4_gpu_end_commands()) ok = false;
+    int32_t top[QWEN4_BATCH_MAX_ROWS];
+    if (ok) ok = ds4_gpu_tensor_read(g->selected, 0, top, (uint64_t)count * sizeof(*top)) != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
+        ok = top[i] >= 0 && top[i] < (int32_t)DS4_N_VOCAB;
+        if (ok) drafts[i] = top[i];
+        sg->mtp_pos = idx0[i] + committed[i];
+        sg->mtp_last_rows = 0;
+    }
+#endif
     return ok;
 }
 
