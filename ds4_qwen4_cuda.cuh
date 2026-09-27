@@ -2086,15 +2086,20 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
     x[i] = t;
 }
 
-template<unsigned TYPE>
+template<unsigned TYPE, bool COMBINE = false>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned E, unsigned hc,
-                        unsigned ni, float eps) {
+                        unsigned ni, float eps, float *next, const float *blk, const float *oldinj) {
     pdl_enter();
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
     __shared__ float red[32];
+    __shared__ float add_weight;
+    if (COMBINE) {
+        if (!tid) add_weight = injection(oldinj + (uint64_t)tok * hc * hc * 8, hc, stream);
+        __syncthreads();
+    }
     const unsigned nt = blockDim.x;
     /* Load a batch of elements before accumulating them, in the original
      * order and with the same fused multiply-adds as hc_norm_prefill: one
@@ -2103,7 +2108,11 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     for (unsigned i0 = tid; i0 < E; i0 += 8 * nt) {
         float r[8];
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) r[k] = i0 + k * nt < E ? R[base + i0 + k * nt] : 0;
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = i0 + k * nt;
+            r[k] = i < E ? R[base + i] : 0;
+            if (COMBINE && i < E) r[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], r[k]);
+        }
         #pragma unroll
         for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(r[k], r[k], ss);
     }
@@ -2117,6 +2126,10 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
             const unsigned i = i0 + k * nt;
             if (i < end) {
                 r[k] = R[base + i];
+                if (COMBINE) {
+                    r[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], r[k]);
+                    next[base + i] = r[k];
+                }
                 g[k] = gamma[stream * E + i];
                 #pragma unroll
                 for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
@@ -2508,7 +2521,8 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
         return launched();
     }
 #define QWEN_HC_NORM(TYPE) launch(hc_norm<TYPE>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
-        ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps)
+        ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
+        (float *)nullptr, (const float *)nullptr, (const float *)nullptr)
     if (type == 0) { QWEN_HC_NORM(0); }
     else if (type == 1) { QWEN_HC_NORM(1); }
     else { QWEN_HC_NORM(8); }
@@ -2879,9 +2893,24 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
         const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
         const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
         uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+    using namespace qwen4_cuda;
     const uint64_t bytes = (uint64_t)T*E*hc*4;
     if (!qwen4_cuda::tensor(next,bytes) || !qwen4_cuda::tensor(R,bytes) || next->ptr == R->ptr ||
         !inj || !oldinj || inj->ptr == oldinj->ptr) return 0;
+    if (T <= 8 && T && E && hc && hc <= 4 && ni <= 4 && type == 1) {
+        if (!tensor(xn,bytes) || !tensor(blk,(uint64_t)T*E*4) ||
+            !tensor(oldinj,(uint64_t)T*hc*hc*8*4) || !tensor(inj,(uint64_t)T*hc*ni*8*4)) return 0;
+        const char *gamma = weight(map,size,go,(uint64_t)E*hc*4);
+        const char *wi = weight(map,size,io,(uint64_t)E*hc*ni*2);
+        if (!gamma || !wi) return 0;
+        /* Every chunk reads the old residual, then writes its disjoint piece
+         * of next. This folds the copy and combine into normalization without
+         * a grid barrier or an in-place read/write race. */
+        launch(hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
+            (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
+            (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr);
+        return launched();
+    }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
     return ds4_gpu_qwen4_hc_combine_tensor(next,blk,oldinj,T,E,hc) &&
            ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
