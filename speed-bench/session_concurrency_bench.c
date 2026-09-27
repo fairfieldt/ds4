@@ -40,6 +40,11 @@
 #include <mach/mach_host.h>
 #endif
 
+#if defined(__linux__)
+extern int cudaProfilerStart(void) __attribute__((weak));
+extern int cudaProfilerStop(void) __attribute__((weak));
+#endif
+
 #define BENCH "session-concurrency-bench"
 
 enum {
@@ -115,6 +120,8 @@ typedef struct {
     bool   verify_ok;
     double control_tps;
     double candidate_tps;
+    double control_wall_tps, candidate_wall_tps;
+    double tokens_per_cycle;
 } cell_result;
 
 static double now_sec(void) {
@@ -358,8 +365,17 @@ static int measure_decode(const bench_env *env,
     double eval_sec = 0.0;
     long produced = 0;
     const double wall_t0 = now_sec();
+#if defined(__linux__)
+    int profile_start = -1, profile_steps = 0;
+    const char *range = timed ? getenv("DS4_BENCH_CUDA_PROFILE_RANGE") : NULL;
+    if (range && (sscanf(range,"%d:%d",&profile_start,&profile_steps) != 2 ||
+                  profile_start < 0 || profile_steps <= 0)) return 1;
+#endif
 
     for (int step = 0; step < steps; step++) {
+#if defined(__linux__)
+        if (step == profile_start && cudaProfilerStart) (void)cudaProfilerStart();
+#endif
         for (int i = 0; i < count; i++) {
             ds4_session *s = sessions[i];
             if (ds4_session_pos(s) + (env->spec ? 2 : 1) >= ds4_session_ctx(s)) {
@@ -390,6 +406,10 @@ static int measure_decode(const bench_env *env,
             }
             produced += count;
         }
+#if defined(__linux__)
+        if (profile_start >= 0 && step+1 == profile_start+profile_steps && cudaProfilerStop)
+            (void)cudaProfilerStop();
+#endif
         const double elapsed = now_sec() - t0;
         eval_sec += elapsed;
         if (timed && step_ms) step_ms[step] = elapsed * 1e3;
@@ -792,29 +812,33 @@ static void run_cell(const bench_config *cfg,
                produced / ((double)concurrency * (double)cfg->gen));
     }
     if (cfg->candidate_env) {
-        double sec[2] = {0.0, 0.0}, tok[2] = {0.0, 0.0};
+        double sec[2] = {0.0, 0.0}, wall[2] = {0.0, 0.0}, tok[2] = {0.0, 0.0};
         for (int r = 0; r < cfg->repeat; r++) {
             /* ABBA: the second block reverses the order so any drift over the
              * pair cancels instead of favouring whichever ran first. */
             for (int slot = 0; slot < 2; slot++) {
                 const bool candidate = (r % 2 == 0) ? slot == 1 : slot == 0;
-                double block = 0.0;
+                double block = 0.0, block_wall = 0.0;
                 long block_tokens = 0;
                 if (select_variant(cfg, candidate) != 0 ||
                     measure_decode(env, sessions, concurrency, cfg->gen,
-                                   false, NULL, &block, NULL, NULL, &block_tokens) != 0) {
+                                   false, NULL, &block, &block_wall, NULL, &block_tokens) != 0) {
                     free(step_ms);
                     free_sessions(sessions, total_sessions);
                     return;
                 }
                 sec[candidate ? 1 : 0] += block;
+                wall[candidate ? 1 : 0] += block_wall;
                 tok[candidate ? 1 : 0] += (double)block_tokens;
             }
         }
         out->control_tps = sec[0] > 0.0 ? tok[0] / sec[0] : 0.0;
         out->candidate_tps = sec[1] > 0.0 ? tok[1] / sec[1] : 0.0;
+        out->control_wall_tps = wall[0] > 0.0 ? tok[0] / wall[0] : 0.0;
+        out->candidate_wall_tps = wall[1] > 0.0 ? tok[1] / wall[1] : 0.0;
         (void)select_variant(cfg, false);
     }
+    out->tokens_per_cycle = produced / ((double)concurrency * cfg->gen);
     out->decode_wall_tps = wall_sec > 0.0 ? produced / wall_sec : 0.0;
     out->step_ms_mean = mean(step_ms, cfg->gen);
     qsort(step_ms, (size_t)cfg->gen, sizeof(*step_ms), compare_double);
@@ -901,6 +925,8 @@ static void run_cell(const bench_config *cfg,
         printf("  %s: control %.1f tok/s, candidate %.1f tok/s, %.2fx\n",
                cfg->candidate_env, out->control_tps, out->candidate_tps,
                out->control_tps > 0.0 ? out->candidate_tps / out->control_tps : 0.0);
+        printf("  including selection: control %.1f tok/s, candidate %.1f tok/s\n",
+               out->control_wall_tps, out->candidate_wall_tps);
     }
     printf("  %.2f GiB of session state\n", out->footprint_gib);
     fflush(stdout);
@@ -921,13 +947,14 @@ static void write_csv(const char *path,
                     "decode_agg_tps,decode_stream_tps,decode_wall_tps,"
                     "step_ms_mean,step_ms_p50,step_ms_p95,step_ms_max,"
                     "mixed_step_ms_p50,mixed_step_ms_p95,mixed_decode_tps,"
-                    "mixed_prefill_tps,estimate_gib,predicted_gib,footprint_gib\n");
+                    "mixed_prefill_tps,estimate_gib,predicted_gib,footprint_gib,"
+                    "tokens_per_cycle,control_tps,candidate_tps,control_wall_tps,candidate_wall_tps\n");
     }
     for (int i = 0; i < count; i++) {
         const cell_result *c = &cells[i];
         fprintf(fp,
                 "%s,%d,%d,%s,%.2f,%.3f,%.2f,%.2f,%.2f,"
-                "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.3f,%.3f,%.3f,%.3f\n",
                 model, c->concurrency, c->ctx,
                 c->oom ? "nofit" : (c->ran ? "ok" : "error"),
                 c->prefill_tps, c->prefill_last_ttft_s,
@@ -937,7 +964,8 @@ static void write_csv(const char *path,
                 c->step_ms_mean, c->step_ms_p50, c->step_ms_p95, c->step_ms_max,
                 c->mixed_step_ms_p50, c->mixed_step_ms_p95,
                 c->mixed_decode_tps, c->mixed_prefill_tps,
-                c->estimate_gib, c->predicted_gib, c->footprint_gib);
+                c->estimate_gib, c->predicted_gib, c->footprint_gib, c->tokens_per_cycle,
+                c->control_tps, c->candidate_tps, c->control_wall_tps, c->candidate_wall_tps);
     }
     fclose(fp);
 }
