@@ -8,6 +8,7 @@ static void check_batch(ds4_engine *engine, const ds4_tokens *prompt, bool specu
     ds4_tokens frontier[N] = {0};
     ds4_session_snapshot snapshot = {0};
     float *saved_logits = xmalloc(DS4_N_VOCAB * sizeof(float));
+    float *current_logits = xmalloc(DS4_N_VOCAB * sizeof(float));
     int accepted[N][2], counts[N];
     char error[256] = {0};
     for (int i = 0; i < N; i++) {
@@ -57,11 +58,39 @@ static void check_batch(ds4_engine *engine, const ds4_tokens *prompt, bool specu
         for (int i = 0; i < N; i++) {
             ds4_session *s = items[i].session;
             assert(s->checkpoint_valid && s->qwen4_graph.pos == (uint32_t)s->checkpoint.len);
-            for (uint32_t j = 0; j < DS4_N_VOCAB; j++) assert(isfinite(s->logits[j]));
+            const int top = ds4_session_argmax(s);
+            assert(ds4_session_argmax_excluding(s,-1) == top);
+            assert(ds4_session_sample(s,0,0,1,0,NULL) == top);
+            if (s->qwen4_frontier_on_device) {
+                assert(ds4_gpu_tensor_read(s->qwen4_verify_device,
+                    (uint64_t)s->qwen4_frontier_row*DS4_N_VOCAB*sizeof(float),
+                    current_logits,(uint64_t)DS4_N_VOCAB*sizeof(float)));
+            } else memcpy(current_logits,s->logits,DS4_N_VOCAB*sizeof(float));
+            assert(top == sample_argmax(current_logits,DS4_N_VOCAB));
+            for (uint32_t j = 0; j < DS4_N_VOCAB; j++) assert(isfinite(current_logits[j]));
+            /* Leave one stream lazy across cycles and shared-arena reuse.
+             * Others exercise consumers which require the full frontier. */
+            if (i == N-1) continue;
+            if (step % 3 == 0) {
+                assert(ds4_session_argmax_excluding(s,top) ==
+                    argmax_f32_excluding_unrolled8(current_logits,DS4_N_VOCAB,top));
+            } else if (step % 3 == 1) {
+                ds4_token_score score, best;
+                assert(ds4_session_token_logprob(s,top,&score));
+                assert(score.id == top && score.logit == current_logits[top] && isfinite(score.logprob));
+                assert(ds4_session_top_logprobs(s,&best,1) == 1);
+                assert(best.id == top && best.logprob == score.logprob);
+            } else {
+                uint64_t rng1 = 1234567, rng2 = rng1;
+                assert(ds4_session_sample(s,0.7f,32,0.9f,0.05f,&rng1) ==
+                    ds4_sample_logits(current_logits,DS4_N_VOCAB,0.7f,32,0.9f,0.05f,&rng2));
+                assert(rng1 == rng2);
+            }
+            assert(!memcmp(s->logits,current_logits,DS4_N_VOCAB*sizeof(float)));
         }
         if (step == 1) {
-            assert(ds4_session_save_snapshot(sessions[0], &snapshot, error, sizeof(error)) == 0);
-            memcpy(saved_logits, sessions[0]->logits, DS4_N_VOCAB * sizeof(float));
+            assert(ds4_session_save_snapshot(items[N-1].session, &snapshot, error, sizeof(error)) == 0);
+            memcpy(saved_logits, items[N-1].session->logits, DS4_N_VOCAB * sizeof(float));
         }
         if (step == 6 && speculative) {
             for (int i = 0; i < N; i++) {
@@ -76,6 +105,7 @@ static void check_batch(ds4_engine *engine, const ds4_tokens *prompt, bool specu
     }
     ds4_session_snapshot_free(&snapshot);
     free(saved_logits);
+    free(current_logits);
     for (int i = 0; i < N; i++) {
         items[i] = (ds4_decode_item){sessions[i], ds4_session_argmax(sessions[i])};
         ds4_tokens_copy(&frontier[i], &sessions[i]->checkpoint);
@@ -142,6 +172,36 @@ static void check_arena_resize(ds4_engine *engine, const ds4_tokens *prompt) {
     ds4_session_free(large);
     assert(engine->qwen4_arena_users == 0);
     puts("Qwen shared arena: live growth fallback and idle replacement OK");
+}
+
+static void check_single_depth3(ds4_engine *engine, const ds4_tokens *prompt) {
+    ds4_session *live = NULL, *reference = NULL;
+    char error[256] = {0};
+    unsigned triples = 0;
+    assert(!setenv("DS4_QWEN4_MTP_DEPTH","3",1));
+    assert(ds4_session_create(&live,engine,256) == 0);
+    assert(ds4_session_create(&reference,engine,256) == 0);
+    assert(ds4_session_sync(live,prompt,error,sizeof(error)) == 0);
+    assert(ds4_session_sync(reference,prompt,error,sizeof(error)) == 0);
+    for (unsigned cycle = 0; cycle < 24; cycle++) {
+        const int token = ds4_session_argmax(live);
+        assert(token == ds4_session_argmax(reference));
+        int accepted[3];
+        if (cycle == 4 && live->glm_mtp_have) live->glm_mtp_draft = ds4_token_eos(engine);
+        if (cycle == 8 && live->glm_mtp_have2) live->glm_mtp_draft2 = ds4_token_eos(engine);
+        int n = ds4_session_eval_speculative_argmax(live,token,3,-1,accepted,3,error,sizeof(error));
+        assert(n >= 1 && n <= 3);
+        triples += n == 3;
+        for (int j = 0; j < n; j++) {
+            assert(accepted[j] == ds4_session_argmax(reference));
+            assert(ds4_session_eval(reference,accepted[j],error,sizeof(error)) == 0);
+        }
+        assert(ds4_session_argmax(live) == ds4_session_argmax(reference));
+    }
+    assert(triples > 0);
+    ds4_session_free(reference); ds4_session_free(live);
+    assert(!unsetenv("DS4_QWEN4_MTP_DEPTH"));
+    printf("Qwen single depth-3: %u three-token cycles, forced rejections, shared-arena reuse match plain greedy\n",triples);
 }
 
 /* A failed disk lookup must invalidate the recurrent frontier, including
@@ -214,6 +274,7 @@ int main(int argc, char **argv) {
     check_batch(engine, &prompt, false);
     check_batch(engine, &prompt, true);
     check_arena_resize(engine, &prompt);
+    check_single_depth3(engine, &prompt);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
     return 0;
