@@ -1467,12 +1467,11 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
 
 /* The rows kernels of the decode batch must reproduce the per-row dispatches
  * bit for bit: the caches written, the block key, scores, selection, token
- * list and output.  Rows: dense, dense completing a block, sparse completing
- * a block on the plain selector's width, sparse on the prefiltered width. */
-static void test_attention_rows(arena_t *a) {
-    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
+ * list and output.  Rows at pos_of[]: a row from sparse_pos = (k_blocks + 1)
+ * * ratio - 1 on selects k_blocks blocks. */
+static void test_attention_rows_at(arena_t *a, uint32_t k_blocks, const uint32_t pos_of[4]) {
+    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, ratio = 4, R = 4;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
-    const uint32_t pos_of[4] = { 5, 11, sparse_pos, 140 };
     const double base = 1.0e7, eps = 1e-6;
     const float scale = 1.0f / sqrtf((float)D);
     const uint32_t sel_stride = k_blocks * ratio + ratio;
@@ -1605,7 +1604,8 @@ static void test_attention_rows(arena_t *a) {
         same_bytes("selected tokens", r, selt[0], (uint64_t)r * sel_stride * 4, selt[1], (uint64_t)r * sel_stride * 4,
                    (uint64_t)n_sel_a * 4);
     }
-    printf("  attention rows: dense, block-completing and sparse rows byte-exact against the per-row kernels\n");
+    printf("  attention rows at %u/%u/%u/%u (sparse from %u): byte-exact against the per-row kernels\n",
+           pos_of[0], pos_of[1], pos_of[2], pos_of[3], sparse_pos);
 
     ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(part1);
     for (uint32_t r = 0; r < R; r++) {
@@ -1624,6 +1624,104 @@ static void test_attention_rows(arena_t *a) {
     free(ik); free(iq); free(vp); free(kp); free(qg);
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
+
+/* Dense, dense completing a block, sparse completing a block on the plain
+ * selector's width, sparse on the prefiltered width. */
+static void test_attention_rows(arena_t *a) {
+    const uint32_t pos_of[4] = { 5, 11, 19, 140 };
+    test_attention_rows_at(a, 4, pos_of);
+#ifndef __APPLE__
+    /* every row from 128 keys on: the rows take the grouped kernel, as each
+     * row's one-token decode does */
+    const uint32_t long_pos[4] = { 130, 203, 259, 300 };
+    test_attention_rows_at(a, 64, long_pos);
+#endif
+}
+
+#ifndef __APPLE__
+/* Each session's rows through the single-session kernels, as the batch did
+ * before the row kernels: the snapshot is the state after a row's first
+ * token, as the verify takes it. */
+static void gdn_rows_reference(arena_t *a, uint64_t wo, ds4_gpu_tensor *q, ds4_gpu_tensor *out,
+                               const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+                               const ds4_gpu_qwen4_gdn_row *rows, unsigned R,
+                               unsigned K, unsigned V, unsigned D, unsigned C, unsigned CK) {
+    for (unsigned r = 0; r < R; r++) {
+        const ds4_gpu_qwen4_gdn_row *g = &rows[r];
+        if (g->snap_hist && g->n_tok == 2) {
+            ds4_gpu_tensor *x0 = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)C*4);
+            ds4_gpu_tensor *x1 = ds4_gpu_tensor_view(q, (uint64_t)(g->row0+1)*C*4, (uint64_t)C*4);
+            require_ok(x0 && x1 &&
+                ds4_gpu_qwen4_conv_stream_tensor(x0, g->hist, a->base, a->size, wo, 1, C, CK, true) &&
+                ds4_gpu_tensor_copy(g->snap_hist, 0, g->hist, 0, ds4_gpu_tensor_bytes(g->hist)) &&
+                ds4_gpu_qwen4_conv_stream_tensor(x1, g->hist, a->base, a->size, wo, 1, C, CK, true),
+                "GDN reference conv with snapshot");
+            ds4_gpu_tensor_free(x0); ds4_gpu_tensor_free(x1);
+        } else {
+            ds4_gpu_tensor *xs = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)g->n_tok*C*4);
+            require_ok(xs && ds4_gpu_qwen4_conv_stream_tensor(xs, g->hist, a->base, a->size, wo, g->n_tok, C, CK, true),
+                       "GDN reference conv");
+            ds4_gpu_tensor_free(xs);
+        }
+        ds4_gpu_tensor *o = ds4_gpu_tensor_view(out, (uint64_t)g->row0*V*D*4, (uint64_t)g->n_tok*V*D*4);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)g->n_tok*C*4);
+        ds4_gpu_tensor *av = ds4_gpu_tensor_view(ga, (uint64_t)g->row0*V*4, (uint64_t)g->n_tok*V*4);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_view(gb, (uint64_t)g->row0*V*4, (uint64_t)g->n_tok*V*4);
+        require_ok(o && x && av && bv &&
+                   ds4_gpu_qwen4_gdn_scan_tensor(o, g->state, x, av, bv, g->n_tok, K, V, D, g->snap_state, 0u, NULL, 1u),
+                   "GDN reference scan");
+        ds4_gpu_tensor_free(o); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv);
+    }
+}
+
+static void test_gdn_rows(arena_t *a) {
+    const unsigned K = 2, V = 4, D = 128, C = (2*K+V)*D, N = 5, R = 3, CK = 4, guard = 32;
+    const unsigned row0[] = {3,0,1}, nt[] = {2,1,2};
+    const uint64_t ns = (uint64_t)V*D*D, nh = (CK-1)*C;
+    double *shadow;
+    const uint64_t wo = arena_f32(a,C*CK,&shadow,-.1f,.1f);
+    free(shadow);
+    float *x = rand_vec(N*C,.1f), *initial = rand_vec(ns,.01f), *history = rand_vec(nh,.1f);
+    float av[N*V], bv[N*V];
+    for (unsigned i = 0; i < N*V; i++) { av[i] = .9f; bv[i] = .2f; }
+    ds4_gpu_tensor *ga = upload(av,N*V), *gb = upload(bv,N*V), *q[2], *out[2];
+    ds4_gpu_qwen4_gdn_row rows[2][3];
+    for (unsigned path = 0; path < 2; path++) {
+        q[path] = upload(x,N*C); out[path] = upload(NULL,N*V*D+guard);
+        require_ok(ds4_gpu_tensor_fill_f32(out[path],17.25f,N*V*D+guard),"GDN output guards");
+        for (unsigned r = 0; r < R; r++) {
+            rows[path][r] = (ds4_gpu_qwen4_gdn_row){upload(NULL,ns+guard),upload(NULL,nh+guard),
+                upload(NULL,ns+guard),upload(NULL,nh+guard),row0[r],nt[r]};
+            ds4_gpu_tensor *t[] = {rows[path][r].state,rows[path][r].hist,rows[path][r].snap_state,rows[path][r].snap_hist};
+            for (unsigned j = 0; j < 4; j++) require_ok(ds4_gpu_tensor_fill_f32(t[j],17.25f,(j%2 ? nh : ns)+guard),"GDN state guards");
+            require_ok(ds4_gpu_tensor_write(t[0],0,initial,ns*4) && ds4_gpu_tensor_write(t[1],0,history,nh*4),"GDN initial state");
+        }
+        if (!path) {
+            gdn_rows_reference(a,wo,q[0],out[0],ga,gb,rows[0],R,K,V,D,C,CK);
+        } else {
+            ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((R+2)*DS4_GPU_QWEN4_GDN_ROW_BYTES);
+            require_ok(ds4_gpu_qwen4_gdn_rows_stage(table,2,rows[1],R) &&
+                ds4_gpu_qwen4_conv_stream_rows2_tensor(q[1],a->base,a->size,wo,table,2,rows[1],R,N,C,CK,C,1) &&
+                ds4_gpu_qwen4_gdn_scan_rows2_tensor(out[1],q[1],ga,gb,table,2,rows[1],R,N,K,V,D,C,V*D),"ragged GDN rows");
+            ds4_gpu_tensor_free(table);
+        }
+        require_ok(ds4_gpu_synchronize(),"GDN row sync");
+    }
+    same_bytes("GDN qkv",0,q[0],0,q[1],0,N*C*4);
+    same_bytes("GDN output",0,out[0],0,out[1],0,(N*V*D+guard)*4);
+    for (unsigned r = 0; r < R; r++) {
+        ds4_gpu_tensor *t0[] = {rows[0][r].state,rows[0][r].hist,rows[0][r].snap_state,rows[0][r].snap_hist};
+        ds4_gpu_tensor *t1[] = {rows[1][r].state,rows[1][r].hist,rows[1][r].snap_state,rows[1][r].snap_hist};
+        for (unsigned j = 0; j < 4; j++) {
+            same_bytes("GDN state/snapshot",r,t0[j],0,t1[j],0,((j%2 ? nh : ns)+guard)*4);
+            ds4_gpu_tensor_free(t0[j]); ds4_gpu_tensor_free(t1[j]);
+        }
+    }
+    for (unsigned p = 0; p < 2; p++) { ds4_gpu_tensor_free(q[p]); ds4_gpu_tensor_free(out[p]); }
+    ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); free(x); free(initial); free(history);
+    puts("  GDN rows: reordered ragged sessions, first-token snapshots and guards byte-exact");
+}
+#endif
 
 /* ---- routed experts ---- */
 
@@ -3689,6 +3787,7 @@ int main(void) {
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);
@@ -3799,6 +3898,9 @@ int main(void) {
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
     test_attention_rows(&arena);
+#ifndef __APPLE__
+    test_gdn_rows(&arena);
+#endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);

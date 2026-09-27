@@ -85,14 +85,13 @@ __device__ void apply_rope(float *row, const uint32_t *pos, rope_args r) {
     __syncwarp();
 }
 
-__global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
+__device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half *kc, __half *vc,
         float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
         const float *iq, const float *ik, const uint32_t *pos3,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
-        unsigned pos0, float eps, rope_args rp) {
-    pdl_enter();
-    const unsigned slot = blockIdx.x, t = blockIdx.y, pos = pos0 + t, lane = threadIdx.x;
+        unsigned pos0, float eps, rope_args rp, unsigned t) {
+    const unsigned slot = blockIdx.x, pos = pos0 + t, lane = threadIdx.x;
     __shared__ float row[256];
     if (slot == H + Hkv + Hi) {
         for (unsigned i = lane; i < Di; i += 32) ikc[(uint64_t)pos * Di + i] = ik[(uint64_t)t * Di + i];
@@ -122,9 +121,18 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
     }
 }
 
-__global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
-        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+__global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
+        float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
+        const float *iq, const float *ik, const uint32_t *pos3,
+        const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
+        unsigned pos0, float eps, rope_args rp) {
     pdl_enter();
+    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,gq,gk,giq,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
+}
+
+__device__ __forceinline__ void block_key_body(__half *out, const float *ik, const uint32_t *pos3,
+        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
     const unsigned b = block0 + blockIdx.x, lane = threadIdx.x, npt = D / 32;
     __shared__ float row[128];
     float ss = 0, v[4];
@@ -141,10 +149,15 @@ __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
     for (unsigned i = lane; i < D; i += 32) out[(uint64_t)b * D + i] = __float2half_rn(row[i]);
 }
 
-__global__ void idx_score(float *out, const float *q, const __half *key,
-        unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
+__global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
+        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
     pdl_enter();
-    const unsigned b = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, lane = threadIdx.x & 31;
+    block_key_body(out,ik,pos3,gamma,block0,ratio,D,eps,rp);
+}
+
+__device__ __forceinline__ void idx_score_body(float *out, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio, unsigned t) {
+    const unsigned b = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (b >= N) return;
     float score = 0;
     if (b >= (pos0 + t + 1) / ratio) score = -3e38f;
@@ -155,6 +168,12 @@ __global__ void idx_score(float *out, const float *q, const __half *key,
         score += fmaxf(sum(a), 0);
     }
     if (!lane) out[(uint64_t)t * N + b] = score;
+}
+
+__global__ void idx_score(float *out, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
+    pdl_enter();
+    idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
 }
 
 __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigned tiles) {
@@ -169,9 +188,8 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
 
 /* Exact radix threshold and stable gather, with the same greater-than then
  * equal-score ordering as Metal. No context-dependent candidate truncation. */
-__global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
-    pdl_enter();
-    const unsigned tid = threadIdx.x, t = blockIdx.x;
+__device__ __forceinline__ void idx_select_body(int *out, const float *score, unsigned N, unsigned K, unsigned t) {
+    const unsigned tid = threadIdx.x;
     __shared__ unsigned hist[256], gt[256], eq[256], threshold, need;
     const float *row = score + (uint64_t)t * N;
     if (!tid) { threshold = 0; need = K; }
@@ -215,15 +233,25 @@ __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K)
     }
 }
 
-__global__ void idx_expand(int *out, unsigned *count, const int *blocks,
-        unsigned K, unsigned ratio, unsigned pos0, unsigned stride) {
+__global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
     pdl_enter();
-    const unsigned t = blockIdx.x, pos = pos0 + t, tail = (pos + 1) / ratio * ratio;
+    idx_select_body(out,score,N,K,blockIdx.x);
+}
+
+__device__ __forceinline__ void idx_expand_body(int *out, unsigned *count, const int *blocks,
+        unsigned K, unsigned ratio, unsigned pos0, unsigned stride, unsigned t) {
+    const unsigned pos = pos0 + t, tail = (pos + 1) / ratio * ratio;
     for (unsigned i = threadIdx.x; i < K * ratio; i += blockDim.x)
         out[(uint64_t)t * stride + i] = blocks[(uint64_t)t * K + i / ratio] * ratio + i % ratio;
     for (unsigned i = tail + threadIdx.x; i <= pos; i += blockDim.x)
         out[(uint64_t)t * stride + K * ratio + i - tail] = i;
     if (!threadIdx.x) count[t] = K * ratio + pos + 1 - tail;
+}
+
+__global__ void idx_expand(int *out, unsigned *count, const int *blocks,
+        unsigned K, unsigned ratio, unsigned pos0, unsigned stride) {
+    pdl_enter();
+    idx_expand_body(out,count,blocks,K,ratio,pos0,stride,blockIdx.x);
 }
 
 /* Keys a row at pos attends, and the key splits its decode step takes
@@ -236,20 +264,13 @@ __host__ __device__ __forceinline__ unsigned attn_splits(unsigned keys) {
     return splits < 64 ? splits : 64;
 }
 
-/* Row t of a launch is the one-token step at pos0 + t. With partial scratch
- * (decode rows: a token or the MTP verify rows) its keys split by its own key
- * count and its partials sit at a fixed 64-split row stride, so every row
- * rounds exactly like a single-token decode at that position. Without it
- * (prefill) a row takes one split. */
 template<unsigned D>
-__global__ void attention(float *out, float *partial, const float *q, const float *gate,
+__device__ __forceinline__ void attention_body(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
-        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
-    const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
-    const unsigned keys = attn_keys(sparse, stride, pos0 + t), splits = partial ? attn_splits(keys) : 1;
-    const unsigned per = (keys + splits - 1) / splits;
-    if (h >= H || split >= splits) return;
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse,
+        unsigned splits, unsigned per, float scale, unsigned t) {
+    const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, split = blockIdx.z;
+    if (h >= H) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
     float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
     for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
@@ -292,20 +313,34 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
             out[p] = (denom > 0 ? acc[i] / denom : 0) * sigmoid(gate[p]);
         }
     } else {
-        float *dst = partial + ((uint64_t)t * H * 64 + (uint64_t)h * splits + split) * (D + 2);
+        float *dst = partial + (((uint64_t)t * H + h) * splits + split) * (D + 2);
         if (!lane) { dst[0] = m; dst[1] = denom; }
         for (unsigned i = 0; i < D / 32; i++) dst[2 + lane + 32 * i] = acc[i];
     }
 }
 
-/* Rows and splits as in attention<D>; a row of one split wrote its output. */
-__global__ void attn_merge(float *out, const float *partial, const float *gate,
-        unsigned H, unsigned D, unsigned pos0, unsigned stride, bool sparse) {
+/* Row t of a launch is the one-token step at pos0 + t. With partial scratch
+ * (decode rows: a token or the MTP verify rows) its keys split by its own key
+ * count and its partials sit at a fixed 64-split row stride, so every row
+ * rounds exactly like a single-token decode at that position. Without it
+ * (prefill) a row takes one split. */
+template<unsigned D>
+__global__ void attention(float *out, float *partial, const float *q, const float *gate,
+        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
     pdl_enter();
-    const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    const unsigned splits = attn_splits(attn_keys(sparse, stride, pos0 + t));
-    if (d >= D || splits == 1) return;
-    const float *p = partial + ((uint64_t)t * H * 64 + (uint64_t)h * splits) * (D + 2);
+    const unsigned t = blockIdx.y, keys = attn_keys(sparse,stride,pos0+t), splits = partial ? attn_splits(keys) : 1;
+    if (blockIdx.z >= splits) return;
+    attention_body<D>(out+(uint64_t)t*H*D,partial ? partial+(uint64_t)t*H*64*(D+2) : nullptr,
+        q+(uint64_t)t*H*D,gate+(uint64_t)t*H*D,kc,vc,sparse ? sel+(uint64_t)t*stride : nullptr,
+        sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,splits,(keys+splits-1)/splits,scale,0);
+}
+
+__device__ __forceinline__ void attn_merge_body(float *out, const float *partial, const float *gate,
+        unsigned H, unsigned D, unsigned splits, unsigned t) {
+    const unsigned h = blockIdx.x, d = threadIdx.x;
+    if (d >= D) return;
+    const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
     float m = -3e38f, denom = 0, acc = 0;
     for (unsigned s = 0; s < splits; s++) m = fmaxf(m, p[s * (D + 2)]);
     for (unsigned s = 0; s < splits; s++) {
@@ -315,6 +350,14 @@ __global__ void attn_merge(float *out, const float *partial, const float *gate,
     }
     const uint64_t i = ((uint64_t)t * H + h) * D + d;
     out[i] = (denom > 0 ? acc / denom : 0) * sigmoid(gate[i]);
+}
+
+__global__ void attn_merge(float *out, const float *partial, const float *gate,
+        unsigned H, unsigned D, unsigned pos0, unsigned stride, bool sparse) {
+    pdl_enter();
+    const unsigned t = blockIdx.y, splits = attn_splits(attn_keys(sparse,stride,pos0+t));
+    if (splits > 1) attn_merge_body(out+(uint64_t)t*H*D,partial+(uint64_t)t*H*64*(D+2),
+        gate+(uint64_t)t*H*D,H,D,splits,0);
 }
 
 /* The heads in a KV group share the same selected keys. Keep their output
@@ -2280,10 +2323,108 @@ __global__ void hc_rows(float *dst, const float *up, const float *xn, unsigned E
 
 namespace qwen4_cuda {
 
-__global__ void conv(float *x, float *history, const float *w, unsigned T,
+struct gdn_row { float *state, *hist, *snap_state, *snap_hist; unsigned row0, n_tok; };
+struct attn_row { __half *k, *v; float *ik; __half *block; const uint32_t *pos3; unsigned pos; int sparse; };
+static_assert(sizeof(gdn_row) <= 48u, "gdn_row must fit DS4_GPU_QWEN4_GDN_ROW_BYTES (ds4_gpu.h)");
+static_assert(sizeof(attn_row) <= 64u, "attn_row must fit DS4_GPU_QWEN4_ATTN_ROW_BYTES (ds4_gpu.h)");
+template<typename Row> struct row_batch { Row rows[128]; };
+template<typename Row>
+__global__ void stage_rows(Row *dst, row_batch<Row> src, unsigned n) {
+    pdl_enter();
+    if (threadIdx.x < n) dst[threadIdx.x] = src.rows[threadIdx.x];
+}
+
+struct row_slots { unsigned slot[128]; };
+
+__global__ void attn_prep_rows(float *q, float *gate, float *iqn, const float *qg,
+        const float *kp, const float *vp, const float *iq, const float *ik, const attn_row *rows,
+        const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di, float eps, rope_args rp) {
+    pdl_enter();
+    const unsigned r = blockIdx.y;
+    const attn_row row = rows[r];
+    attn_prep_body(q+(uint64_t)r*H*D,gate+(uint64_t)r*H*D,row.k,row.v,iqn+(uint64_t)r*Hi*Di,row.ik,
+        qg+(uint64_t)r*H*D*2,kp+(uint64_t)r*Hkv*D,vp+(uint64_t)r*Hkv*D,
+        iq+(uint64_t)r*Hi*Di,ik+(uint64_t)r*Di,row.pos3,gq,gk,giq,H,Hkv,D,Hi,Di,row.pos,eps,rp,0);
+}
+
+__global__ void block_key_rows(const attn_row *rows, const float *gamma, unsigned ratio,
+                              unsigned D, float eps, rope_args rp) {
+    pdl_enter();
+    const attn_row row = rows[blockIdx.y];
+    if ((row.pos+1)%ratio) return;
+    block_key_body(row.block,row.ik,row.pos3,gamma,row.pos/ratio,ratio,D,eps,rp);
+}
+
+__global__ void idx_score_rows(float *out, const float *q, const attn_row *rows,
+                              unsigned stride, unsigned H, unsigned D, unsigned ratio) {
+    pdl_enter();
+    const unsigned r = blockIdx.y;
+    const attn_row row = rows[r];
+    if (!row.sparse) return;
+    idx_score_body(out+(uint64_t)r*stride,q+(uint64_t)r*H*D,row.block,(row.pos+1)/ratio,H,D,row.pos,ratio,0);
+}
+
+__global__ void idx_select_rows(int *out, const float *score, const attn_row *rows,
+                               unsigned stride, unsigned K, unsigned ratio) {
+    pdl_enter();
+    const unsigned r = blockIdx.x;
+    const attn_row row = rows[r];
+    if (!row.sparse) return;
+    idx_select_body(out+(uint64_t)r*K,score+(uint64_t)r*stride,(row.pos+1)/ratio,K,0);
+}
+
+__global__ void idx_expand_rows(int *out, unsigned *count, const int *blocks, const attn_row *rows,
+                               unsigned K, unsigned ratio, unsigned stride) {
+    pdl_enter();
+    const unsigned r = blockIdx.x;
+    const attn_row row = rows[r];
+    if (!row.sparse) return;
+    idx_expand_body(out+(uint64_t)r*stride,count+r,blocks+(uint64_t)r*K,K,ratio,row.pos,stride,0);
+}
+
+template<unsigned D>
+__global__ void attention_rows(float *out, float *part, const float *q, const float *gate,
+        const int *sel, const unsigned *counts, const attn_row *rows,
+        unsigned H, unsigned Hkv, unsigned stride, float scale) {
+    pdl_enter();
+    const unsigned r = blockIdx.y;
+    const attn_row row = rows[r];
+    const unsigned keys = attn_keys(row.sparse,stride,row.pos), splits = attn_splits(keys);
+    if (blockIdx.z >= splits) return;
+    attention_body<D>(out+(uint64_t)r*H*D,part+(uint64_t)r*H*64*(D+2),
+        q+(uint64_t)r*H*D,gate+(uint64_t)r*H*D,row.k,row.v,
+        sel ? sel+(uint64_t)r*stride : nullptr,counts ? counts+r : nullptr,
+        H,Hkv,row.pos,stride,row.sparse,splits,(keys+splits-1)/splits,scale,0);
+}
+
+__global__ void attention_group_rows(float *out, float *part, const float *q, const float *gate,
+        const int *sel, const unsigned *counts, const attn_row *rows,
+        unsigned H, unsigned Hkv, unsigned stride, float scale) {
+    pdl_enter();
+    const unsigned r = blockIdx.y, D = 256;
+    const attn_row row = rows[r];
+    const unsigned keys = attn_keys(row.sparse,stride,row.pos), splits = attn_splits(keys);
+    if (blockIdx.z >= splits) return;
+    attention_group_body(out+(uint64_t)r*H*D,part+(uint64_t)r*H*64*(D+2),
+        q+(uint64_t)r*H*D,gate+(uint64_t)r*H*D,row.k,row.v,
+        sel ? sel+(uint64_t)r*stride : nullptr,counts ? counts+r : nullptr,
+        H,Hkv,row.pos,stride,row.sparse,scale,splits,(keys+splits-1)/splits,0);
+}
+
+__global__ void attn_merge_rows(float *out, const float *part, const float *gate,
+        const attn_row *rows, unsigned H, unsigned D, unsigned stride) {
+    pdl_enter();
+    const unsigned r = blockIdx.y;
+    const attn_row row = rows[r];
+    const unsigned splits = attn_splits(attn_keys(row.sparse,stride,row.pos));
+    if (splits > 1) attn_merge_body(out+(uint64_t)r*H*D,part+(uint64_t)r*H*64*(D+2),
+        gate+(uint64_t)r*H*D,H,D,splits,0);
+}
+
+__device__ __forceinline__ void conv_body(float *x, float *history, const float *w, unsigned T,
                      unsigned C, unsigned K, bool activate,
                      float *snap, unsigned snap_t, float *snap2, unsigned snap2_t) {
-    pdl_enter();
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float win[3], taps[4];
@@ -2301,6 +2442,26 @@ __global__ void conv(float *x, float *history, const float *w, unsigned T,
         if (snap2 && t == snap2_t) for (unsigned i = 0; i < K - 1; i++) snap2[(uint64_t)i * C + c] = win[i];
     }
     for (unsigned i = 0; i < K - 1; i++) history[(uint64_t)i * C + c] = win[i];
+}
+
+__global__ void conv(float *x, float *history, const float *w, unsigned T, unsigned C, unsigned K,
+        bool activate, float *snap, unsigned snap_t, float *snap2, unsigned snap2_t) {
+    pdl_enter();
+    conv_body(x,history,w,T,C,K,activate,snap,snap_t,snap2,snap2_t);
+}
+
+__global__ void conv_rows(float *x, const float *w, const gdn_row *table,
+        unsigned C, unsigned K, bool activate) {
+    pdl_enter();
+    const gdn_row r = table[blockIdx.y];
+    conv_body(x+(uint64_t)r.row0*C,r.hist,w,r.n_tok,C,K,activate,r.n_tok == 2 ? r.snap_hist : nullptr,0,NULL,0);
+}
+
+__global__ void conv_slots(float *x, float *history, const float *w, row_slots slots,
+        unsigned C, unsigned K, unsigned state_stride, bool activate) {
+    pdl_enter();
+    const unsigned r = blockIdx.y;
+    conv_body(x+(uint64_t)r*C,history+(uint64_t)slots.slot[r]*state_stride,w,1,C,K,activate,NULL,0,NULL,0);
 }
 
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
@@ -2324,11 +2485,10 @@ __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const f
 /* One warp owns a state row across the whole chunk. In particular, MTP
  * snapshots contain the state after the requested token, not the final row. */
 template<unsigned ROWS, unsigned D>
-__global__ void gdn_scan(float *out, float *state, const float *qkv,
+__device__ __forceinline__ void gdn_scan_body(float *out, float *state, const float *qkv,
                          const float *a, const float *b, unsigned T, unsigned Hk,
                          unsigned Hv, float *snap, unsigned st,
                          float *snap2, unsigned st2) {
-    pdl_enter();
     const unsigned dv = (blockIdx.x * 4 + threadIdx.x / 32)*ROWS, h = blockIdx.y;
     if (dv >= D) return;
     const unsigned npt = D / 32, k0 = (threadIdx.x & 31) * npt, kh = h % Hk;
@@ -2362,6 +2522,31 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
     for (unsigned r = 0; r < ROWS; r++)
         #pragma unroll
         for (unsigned i = 0; i < npt; i++) state[idx+(uint64_t)r*D+i] = s[r][i];
+}
+
+template<unsigned ROWS, unsigned D>
+__global__ void gdn_scan(float *out, float *state, const float *qkv, const float *a, const float *b,
+        unsigned T, unsigned Hk, unsigned Hv, float *snap, unsigned st, float *snap2, unsigned st2) {
+    pdl_enter();
+    gdn_scan_body<ROWS,D>(out,state,qkv,a,b,T,Hk,Hv,snap,st,snap2,st2);
+}
+
+template<unsigned D>
+__global__ void gdn_scan_rows(float *out, const float *qkv, const float *a, const float *b,
+        const gdn_row *table, unsigned Hk, unsigned Hv) {
+    pdl_enter();
+    const gdn_row r = table[blockIdx.z];
+    gdn_scan_body<1,D>(out+(uint64_t)r.row0*Hv*D,r.state,qkv+(uint64_t)r.row0*(2*Hk+Hv)*D,
+        a+(uint64_t)r.row0*Hv,b+(uint64_t)r.row0*Hv,r.n_tok,Hk,Hv,r.snap_state,0,NULL,0);
+}
+
+template<unsigned D>
+__global__ void gdn_scan_slots(float *out, float *state, const float *qkv, const float *a, const float *b,
+        row_slots slots, unsigned Hk, unsigned Hv, unsigned state_stride) {
+    pdl_enter();
+    const unsigned r = blockIdx.z;
+    gdn_scan_body<1,D>(out+(uint64_t)r*Hv*D,state+(uint64_t)slots.slot[r]*state_stride,
+        qkv+(uint64_t)r*(2*Hk+Hv)*D,a+(uint64_t)r*Hv,b+(uint64_t)r*Hv,1,Hk,Hv,NULL,0,NULL,0);
 }
 
 __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
@@ -3092,11 +3277,9 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
  * The session-batch driver in ds4.c stacks the rows of several sessions in
  * one arena: the weight products run once over all rows, while the steps
  * that touch a session's own state (convolution history, delta-net state,
- * KV and indexer caches) go through these row APIs.  CUDA serves them by
- * walking the rows and running the single-session kernels on views of the
- * batch transients, so every row computes exactly what its session would
- * alone.  The staged row tables are kept on the host: the kernels take each
- * row's buffers as ordinary arguments. */
+ * KV and indexer caches) go through these row APIs. Device descriptors put
+ * session index in the grid while retaining each session's recurrence order
+ * and private attention scratch. */
 
 /* Mirrors of ds4_gpu_qwen4_attn_row / ds4_gpu_qwen4_gdn_row (ds4_gpu.h). */
 typedef struct {
@@ -3116,10 +3299,10 @@ namespace qwen4_cuda {
 
 enum { ROWS_MAX = 128 };
 
-struct staged_attn { const void *table; uint64_t entry0; uint32_t n, ratio; ds4_gpu_qwen4_attn_row rows[ROWS_MAX]; };
-struct staged_gdn { const void *table; uint64_t entry0; uint32_t n; ds4_gpu_qwen4_gdn_row rows[ROWS_MAX]; };
+/* The selection and expansion row APIs take no row array: the staged
+ * table keeps its row count and block ratio on the host. */
+struct staged_attn { const void *table; uint64_t entry0; uint32_t n, ratio; };
 static staged_attn g_staged_attn[64];
-static staged_gdn g_staged_gdn[64];
 
 static staged_attn *find_attn(const ds4_gpu_tensor *table, uint64_t entry0, bool create) {
     staged_attn *free_slot = NULL;
@@ -3134,28 +3317,6 @@ static staged_attn *find_attn(const ds4_gpu_tensor *table, uint64_t entry0, bool
     return free_slot;
 }
 
-static staged_gdn *find_gdn(const ds4_gpu_tensor *table, uint64_t entry0, bool create) {
-    staged_gdn *free_slot = NULL;
-    for (staged_gdn &s : g_staged_gdn) {
-        if (s.table == table && s.entry0 == entry0 && s.n) return &s;
-        if (!s.n && !free_slot) free_slot = &s;
-    }
-    if (!create) return NULL;
-    if (!free_slot) free_slot = &g_staged_gdn[entry0 % 64];
-    free_slot->table = table;
-    free_slot->entry0 = entry0;
-    return free_slot;
-}
-
-/* A view of rows [row0, row0 + n) of a buffer with `width` floats per row. */
-struct row_view {
-    ds4_gpu_tensor *t;
-    row_view(const ds4_gpu_tensor *base, uint64_t row0, uint64_t n, uint64_t width, uint64_t elem = 4)
-        : t(base ? ds4_gpu_tensor_view(base, row0 * width * elem, n * width * elem) : NULL) {}
-    ~row_view() { if (t) ds4_gpu_tensor_free(t); }
-    operator ds4_gpu_tensor *() const { return t; }
-};
-
 } // namespace qwen4_cuda
 
 extern "C" int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
@@ -3163,10 +3324,18 @@ extern "C" int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t ent
     using namespace qwen4_cuda;
     if (!rows || !n_rows || n_rows > ROWS_MAX || !ratio) return 0;
     staged_attn *s = find_attn(table, entry0, true);
-    memcpy(s->rows, rows, n_rows * sizeof(rows[0]));
     s->n = n_rows;
     s->ratio = ratio;
-    return 1;
+    if (!tensor(table,(entry0+n_rows)*sizeof(attn_row))) return 0;
+    row_batch<attn_row> batch = {};
+    for (unsigned i = 0; i < n_rows; i++) {
+        if (!rows[i].k_cache || !rows[i].v_cache || !rows[i].ik_cache || !rows[i].block_key || !rows[i].pos3) return 0;
+        batch.rows[i] = {(__half *)rows[i].k_cache->ptr,(__half *)rows[i].v_cache->ptr,
+            (float *)rows[i].ik_cache->ptr,(__half *)rows[i].block_key->ptr,
+            (const uint32_t *)rows[i].pos3->ptr,rows[i].pos,rows[i].use_sel};
+    }
+    launch(stage_rows<attn_row>,1,128,0,(attn_row *)table->ptr+entry0,batch,n_rows);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_attn_prep_rows_tensor(
@@ -3177,31 +3346,41 @@ extern "C" int ds4_gpu_qwen4_attn_prep_rows_tensor(
         const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
         uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot, uint32_t Hi, uint32_t Di, float base, float eps) {
     using namespace qwen4_cuda;
-    (void)table; (void)entry0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const uint32_t cap = (uint32_t)(ds4_gpu_tensor_bytes(rows[i].k_cache) / ((uint64_t)Hkv * D * 2));
-        row_view q(q_out, i, 1, (uint64_t)H * D), gate(gate_out, i, 1, (uint64_t)H * D),
-                 iqo(iq_out, i, 1, (uint64_t)Hi * Di), qgi(qg, i, 1, 2ull * H * D),
-                 kp(kproj, i, 1, (uint64_t)Hkv * D), vp(vproj, i, 1, (uint64_t)Hkv * D),
-                 iqi(iq, i, 1, (uint64_t)Hi * Di), iki(ik, i, 1, Di);
-        if (!ds4_gpu_qwen4_attn_prep_tensor(q, gate, rows[i].k_cache, rows[i].v_cache, iqo, rows[i].ik_cache,
-                                            qgi, kp, vp, iqi, iki, rows[i].pos3, map, size, qo, ko, io,
-                                            1, H, Hkv, D, nrot, Hi, Di, rows[i].pos, cap, base, eps)) return 0;
+    const uint64_t qn = (uint64_t)n_rows*H*D*4, kn = (uint64_t)n_rows*Hkv*D*4, in = (uint64_t)n_rows*Hi*Di*4;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !H || !Hkv || H%Hkv || !Hi ||
+        !D || D > 256 || D%32 || !Di || Di > 128 || Di%32 || nrot > D || nrot > Di || nrot > 64 || nrot%2 ||
+        !tensor(table,(entry0+n_rows)*sizeof(attn_row)) || !tensor(q_out,qn) || !tensor(gate_out,qn) ||
+        !tensor(qg,qn*2) || !tensor(kproj,kn) || !tensor(vproj,kn) || !tensor(iq_out,in) || !tensor(iq,in) ||
+        !tensor(ik,(uint64_t)n_rows*Di*4)) return 0;
+    for (unsigned i = 0; i < n_rows; i++) {
+        const uint64_t cap = (uint64_t)rows[i].pos+1;
+        if (!tensor(rows[i].k_cache,cap*Hkv*D*2) || !tensor(rows[i].v_cache,cap*Hkv*D*2) ||
+            !tensor(rows[i].ik_cache,cap*Di*4) || !tensor(rows[i].pos3,cap*16)) return 0;
     }
-    return 1;
+    const float *gq = (const float *)weight(map,size,qo,(uint64_t)D*4), *gk = (const float *)weight(map,size,ko,(uint64_t)D*4),
+                *giq = (const float *)weight(map,size,io,(uint64_t)Di*4);
+    if (!gq || !gk || !giq) return 0;
+    launch(attn_prep_rows,dim3(H+Hkv+Hi+1,n_rows),32,0,(float *)q_out->ptr,(float *)gate_out->ptr,(float *)iq_out->ptr,
+        (const float *)qg->ptr,(const float *)kproj->ptr,(const float *)vproj->ptr,(const float *)iq->ptr,(const float *)ik->ptr,
+        (const attn_row *)table->ptr+entry0,gq,gk,giq,H,Hkv,D,Hi,Di,eps,rope(nrot,base));
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_idx_block_key_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         const void *map, uint64_t size, uint64_t iko,
         uint32_t ratio, uint32_t Di, uint32_t nrot, float base, float eps) {
-    (void)table; (void)entry0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        if ((rows[i].pos + 1u) % ratio) continue;   /* this token completes a block */
-        if (!ds4_gpu_qwen4_idx_block_key_tensor(rows[i].block_key, rows[i].ik_cache, rows[i].pos3, map, size, iko,
-                                                rows[i].pos / ratio, 1, ratio, Di, nrot, base, eps)) return 0;
+    using namespace qwen4_cuda;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !ratio || !Di || Di > 128 || Di%32 ||
+        nrot > Di || nrot > 64 || nrot%2 || !tensor(table,(entry0+n_rows)*sizeof(attn_row))) return 0;
+    for (unsigned i = 0; i < n_rows; i++) if ((rows[i].pos+1)%ratio == 0) {
+        const uint64_t cap = (uint64_t)rows[i].pos+1;
+        if (!tensor(rows[i].block_key,cap/ratio*Di*2) || !tensor(rows[i].ik_cache,cap*Di*4) || !tensor(rows[i].pos3,cap*16)) return 0;
     }
-    return 1;
+    const float *gamma = (const float *)weight(map,size,iko,(uint64_t)Di*4);
+    if (!gamma) return 0;
+    launch(block_key_rows,dim3(1,n_rows),32,0,(const attn_row *)table->ptr+entry0,gamma,ratio,Di,eps,rope(nrot,base));
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_idx_score_rows_tensor(
@@ -3209,15 +3388,17 @@ extern "C" int ds4_gpu_qwen4_idx_score_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         uint32_t n_block_stride, uint32_t Hi, uint32_t Di, uint32_t ratio) {
     using namespace qwen4_cuda;
-    (void)table; (void)entry0;
     (void)tile_max;   /* CUDA selection scans the scores; the tile maxima are Metal's */
-    for (uint32_t i = 0; i < n_rows; i++) {
-        if (!rows[i].use_sel) continue;
-        const uint32_t N = (rows[i].pos + 1u) / ratio;
-        row_view s(score, i, 1, n_block_stride), q(iq, i, 1, (uint64_t)Hi * Di);
-        if (!ds4_gpu_qwen4_idx_score_tensor(s, NULL, q, rows[i].block_key, 1, N, Hi, Di, rows[i].pos, ratio)) return 0;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !ratio || !Hi || !Di || Di > 128 || Di%32 || !n_block_stride ||
+        !tensor(table,(entry0+n_rows)*sizeof(attn_row)) || !tensor(score,(uint64_t)n_rows*n_block_stride*4) ||
+        !tensor(iq,(uint64_t)n_rows*Hi*Di*4)) return 0;
+    for (unsigned i = 0; i < n_rows; i++) if (rows[i].use_sel) {
+        const uint64_t N = ((uint64_t)rows[i].pos+1)/ratio;
+        if (N > n_block_stride || !tensor(rows[i].block_key,N*Di*2)) return 0;
     }
-    return 1;
+    launch(idx_score_rows,dim3((n_block_stride+3)/4,n_rows),128,0,(float *)score->ptr,(const float *)iq->ptr,
+        (const attn_row *)table->ptr+entry0,n_block_stride,Hi,Di,ratio);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_idx_select_rows_tensor(
@@ -3226,15 +3407,17 @@ extern "C" int ds4_gpu_qwen4_idx_select_rows_tensor(
         uint32_t n_block_stride, uint32_t top_k) {
     using namespace qwen4_cuda;
     (void)tile_max;
-    const staged_attn *st = find_attn(table, entry0, false);
-    if (!st) return 0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        if (!rows[i].use_sel) continue;
-        const uint32_t N = (rows[i].pos + 1u) / st->ratio;
-        row_view out(sel, i, 1, top_k), s(score, i, 1, n_block_stride);
-        if (!ds4_gpu_qwen4_idx_select_tensor(out, s, NULL, N, 1, top_k)) return 0;
+    const staged_attn *meta = find_attn(table,entry0,false);
+    if (!meta || !rows || !n_rows || n_rows > meta->n || !top_k ||
+        !tensor(table,(entry0+n_rows)*sizeof(attn_row)) || !tensor(score,(uint64_t)n_rows*n_block_stride*4) ||
+        !tensor(sel,(uint64_t)n_rows*top_k*4)) return 0;
+    for (unsigned i = 0; i < n_rows; i++) if (rows[i].use_sel) {
+        const unsigned N = (rows[i].pos+1)/meta->ratio;
+        if (top_k > N || N > n_block_stride) return 0;
     }
-    return 1;
+    launch(idx_select_rows,n_rows,256,0,(int *)sel->ptr,(const float *)score->ptr,
+        (const attn_row *)table->ptr+entry0,n_block_stride,top_k,meta->ratio);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_idx_expand_rows_tensor(
@@ -3242,15 +3425,14 @@ extern "C" int ds4_gpu_qwen4_idx_expand_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows,
         uint32_t n_sel_blocks, uint32_t ratio, uint32_t sel_stride) {
     using namespace qwen4_cuda;
-    const staged_attn *st = find_attn(table, entry0, false);
-    if (!st || st->n < n_rows) return 0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        if (!st->rows[i].use_sel) continue;
-        row_view tok(sel_tokens, i, 1, sel_stride), cnt(n_sel, i, 1, 1), blk(sel_blocks, i, 1, n_sel_blocks);
-        if (!ds4_gpu_qwen4_idx_expand_tensor(tok, cnt, blk, 1, n_sel_blocks, ratio, st->rows[i].pos, sel_stride))
-            return 0;
-    }
-    return 1;
+    const staged_attn *meta = find_attn(table,entry0,false);
+    if (!meta || !n_rows || n_rows > meta->n || !ratio || !n_sel_blocks ||
+        (uint64_t)n_sel_blocks*ratio+ratio > sel_stride || !tensor(table,(entry0+n_rows)*sizeof(attn_row)) ||
+        !tensor(sel_tokens,(uint64_t)n_rows*sel_stride*4) || !tensor(n_sel,(uint64_t)n_rows*4) ||
+        !tensor(sel_blocks,(uint64_t)n_rows*n_sel_blocks*4)) return 0;
+    launch(idx_expand_rows,n_rows,256,0,(int *)sel_tokens->ptr,(unsigned *)n_sel->ptr,(const int *)sel_blocks->ptr,
+        (const attn_row *)table->ptr+entry0,n_sel_blocks,ratio,sel_stride);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_attn_decode_rows_tensor(
@@ -3259,16 +3441,36 @@ extern "C" int ds4_gpu_qwen4_attn_decode_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         uint32_t H, uint32_t Hkv, uint32_t D, uint32_t sel_stride, float scale) {
     using namespace qwen4_cuda;
-    (void)table; (void)entry0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const bool sparse = rows[i].use_sel != 0;
-        row_view o(out, i, 1, (uint64_t)H * D), qi(q, i, 1, (uint64_t)H * D), g(gate, i, 1, (uint64_t)H * D),
-                 tok(sel_tokens, sparse ? i : 0, 1, sel_stride), cnt(n_sel, sparse ? i : 0, 1, 1);
-        /* rows run in stream order, so they share the split scratch */
-        if (!ds4_gpu_qwen4_attn_decode_tensor(o, qi, g, rows[i].k_cache, rows[i].v_cache, tok, cnt, part,
-                                              1, H, Hkv, D, rows[i].pos, sparse, sel_stride, scale)) return 0;
+    const uint64_t n = (uint64_t)n_rows*H*D*4;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !H || !Hkv || H%Hkv || (D != 32 && D != 128 && D != 256) ||
+        !tensor(out,n) || !tensor(q,n) || !tensor(gate,n) || !tensor(part,(uint64_t)n_rows*H*64*(D+2)*4) ||
+        !tensor(table,(entry0+n_rows)*sizeof(attn_row))) return 0;
+    unsigned max_splits = 1, min_keys = UINT_MAX;
+    bool aligned = true;
+    for (unsigned i = 0; i < n_rows; i++) {
+        const uint64_t cb = ((uint64_t)rows[i].pos+1)*Hkv*D*2;
+        const unsigned keys = attn_keys(rows[i].use_sel,sel_stride,rows[i].pos);
+        max_splits = std::max(max_splits,attn_splits(keys));
+        min_keys = std::min(min_keys,keys);
+        if (!tensor(rows[i].k_cache,cb) || !tensor(rows[i].v_cache,cb) || (rows[i].use_sel &&
+            (!sel_stride || !tensor(sel_tokens,(uint64_t)n_rows*sel_stride*4) || !tensor(n_sel,(uint64_t)n_rows*4)))) return 0;
+        aligned = aligned && !((uintptr_t)rows[i].k_cache->ptr&15) && !((uintptr_t)rows[i].v_cache->ptr&15);
     }
-    return 1;
+#define QWEN_ATTN_ROWS(DIM) launch(attention_rows<DIM>,dim3((H+3)/4,n_rows,max_splits),128,0, \
+    (float *)out->ptr,(float *)part->ptr,(const float *)q->ptr,(const float *)gate->ptr, \
+    sel_tokens ? (const int *)sel_tokens->ptr : nullptr,n_sel ? (const unsigned *)n_sel->ptr : nullptr, \
+    (const attn_row *)table->ptr+entry0,H,Hkv,sel_stride,scale)
+    if (D == 256 && H/Hkv <= 16 && aligned && ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode &&
+        min_keys >= 128 && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
+        launch(attention_group_rows,dim3(Hkv,n_rows,max_splits),256,0,
+            (float *)out->ptr,(float *)part->ptr,(const float *)q->ptr,(const float *)gate->ptr,
+            sel_tokens ? (const int *)sel_tokens->ptr : nullptr,n_sel ? (const unsigned *)n_sel->ptr : nullptr,
+            (const attn_row *)table->ptr+entry0,H,Hkv,sel_stride,scale);
+    } else if (D == 32) { QWEN_ATTN_ROWS(32); } else if (D == 128) { QWEN_ATTN_ROWS(128); } else { QWEN_ATTN_ROWS(256); }
+#undef QWEN_ATTN_ROWS
+    launch(attn_merge_rows,dim3(H,n_rows),D,0,(float *)out->ptr,(const float *)part->ptr,(const float *)gate->ptr,
+        (const attn_row *)table->ptr+entry0,H,D,sel_stride);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
@@ -3276,10 +3478,18 @@ extern "C" int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entr
     using namespace qwen4_cuda;
     if (!rows || !n_rows || n_rows > ROWS_MAX) return 0;
     for (uint32_t i = 0; i < n_rows; i++) if (!rows[i].n_tok || rows[i].n_tok > 2u) return 0;
-    staged_gdn *s = find_gdn(table, entry0, true);
-    memcpy(s->rows, rows, n_rows * sizeof(rows[0]));
-    s->n = n_rows;
-    return 1;
+    if (!tensor(table,(entry0+n_rows)*sizeof(gdn_row))) return 0;
+    row_batch<gdn_row> batch = {};
+    for (unsigned i = 0; i < n_rows; i++) {
+        if (!rows[i].state || !rows[i].hist) return 0;
+        batch.rows[i] = {(float *)rows[i].state->ptr,(float *)rows[i].hist->ptr,
+            rows[i].snap_state ? (float *)rows[i].snap_state->ptr : nullptr,
+            rows[i].snap_hist ? (float *)rows[i].snap_hist->ptr : nullptr,rows[i].row0,rows[i].n_tok};
+    }
+    /* Kernel parameters own the host values until consumed. No pageable
+     * H2D copy or staging-buffer lifetime fence is needed between layers. */
+    launch(stage_rows<gdn_row>,1,128,0,(gdn_row *)table->ptr+entry0,batch,n_rows);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_conv_stream_rows2_tensor(
@@ -3287,24 +3497,18 @@ extern "C" int ds4_gpu_qwen4_conv_stream_rows2_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
         uint32_t n_batch_rows, uint32_t C, uint32_t conv_kernel, uint32_t x_stride, int apply_silu) {
     using namespace qwen4_cuda;
-    (void)table; (void)entry0; (void)n_batch_rows;
     if (x_stride != C) return 0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const ds4_gpu_qwen4_gdn_row &r = rows[i];
-        if (r.snap_hist && r.n_tok == 2u) {
-            /* the snapshot is the history after the row's first token */
-            row_view x0(x, r.row0, 1, C), x1(x, r.row0 + 1u, 1, C);
-            if (!ds4_gpu_qwen4_conv_stream_tensor(x0, r.hist, map, size, woff, 1, C, conv_kernel, apply_silu != 0) ||
-                !ds4_gpu_tensor_copy(r.snap_hist, 0, r.hist, 0, ds4_gpu_tensor_bytes(r.hist)) ||
-                !ds4_gpu_qwen4_conv_stream_tensor(x1, r.hist, map, size, woff, 1, C, conv_kernel, apply_silu != 0))
-                return 0;
-        } else {
-            row_view xs(x, r.row0, r.n_tok, C);
-            if (!ds4_gpu_qwen4_conv_stream_tensor(xs, r.hist, map, size, woff, r.n_tok, C, conv_kernel,
-                                                  apply_silu != 0)) return 0;
-        }
-    }
-    return 1;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !C || conv_kernel < 2 || conv_kernel > 4 ||
+        !tensor(x,(uint64_t)n_batch_rows*C*4) || !tensor(table,(entry0+n_rows)*sizeof(gdn_row))) return 0;
+    const uint64_t hb = (uint64_t)(conv_kernel-1)*C*4;
+    for (unsigned i = 0; i < n_rows; i++)
+        if (rows[i].row0 > n_batch_rows || rows[i].n_tok > n_batch_rows-rows[i].row0 ||
+            !tensor(rows[i].hist,hb) || (rows[i].snap_hist && !tensor(rows[i].snap_hist,hb))) return 0;
+    const char *w = weight(map,size,woff,(uint64_t)C*conv_kernel*4);
+    if (!w) return 0;
+    launch(conv_rows,dim3((C+255)/256,n_rows),256,0,(float *)x->ptr,(const float *)w,
+        (const gdn_row *)table->ptr+entry0,C,conv_kernel,apply_silu != 0);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
@@ -3312,15 +3516,21 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
         uint32_t n_batch_rows, uint32_t K, uint32_t V, uint32_t D, uint32_t qkv_stride, uint32_t out_stride) {
     using namespace qwen4_cuda;
-    (void)table; (void)entry0; (void)n_batch_rows;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const ds4_gpu_qwen4_gdn_row &r = rows[i];
-        row_view o(out, r.row0, r.n_tok, out_stride), q(qkv, r.row0, r.n_tok, qkv_stride),
-                 a(ga, r.row0, r.n_tok, V), b(gb, r.row0, r.n_tok, V);
-        if (!ds4_gpu_qwen4_gdn_scan_tensor(o, r.state, q, a, b, r.n_tok, K, V, D, r.snap_state, 0u, NULL, 1u))
-            return 0;
-    }
-    return 1;
+    if (!rows || !n_rows || n_rows > ROWS_MAX || !K || !V || V%K || D < 32 || D > 128 || D%32 ||
+        qkv_stride != (2*K+V)*D || out_stride != V*D ||
+        !tensor(out,(uint64_t)n_batch_rows*out_stride*4) || !tensor(qkv,(uint64_t)n_batch_rows*qkv_stride*4) ||
+        !tensor(ga,(uint64_t)n_batch_rows*V*4) || !tensor(gb,(uint64_t)n_batch_rows*V*4) ||
+        !tensor(table,(entry0+n_rows)*sizeof(gdn_row))) return 0;
+    const uint64_t sb = (uint64_t)V*D*D*4;
+    for (unsigned i = 0; i < n_rows; i++)
+        if (rows[i].row0 > n_batch_rows || rows[i].n_tok > n_batch_rows-rows[i].row0 ||
+            !tensor(rows[i].state,sb) || (rows[i].snap_state && !tensor(rows[i].snap_state,sb))) return 0;
+#define QWEN_SCAN_ROWS(DIM) case DIM: launch(gdn_scan_rows<DIM>,dim3(DIM/4,V,n_rows),128,0, \
+    (float *)out->ptr,(const float *)qkv->ptr,(const float *)ga->ptr,(const float *)gb->ptr, \
+    (const gdn_row *)table->ptr+entry0,K,V); break
+    switch (D) { QWEN_SCAN_ROWS(32); QWEN_SCAN_ROWS(64); QWEN_SCAN_ROWS(96); QWEN_SCAN_ROWS(128); }
+#undef QWEN_SCAN_ROWS
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_conv_stream_rows_tensor(
@@ -3329,11 +3539,18 @@ extern "C" int ds4_gpu_qwen4_conv_stream_rows_tensor(
         uint32_t state_stride, uint32_t x_stride, int apply_silu) {
     using namespace qwen4_cuda;
     if (x_stride != C) return 0;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        row_view xs(x, i, 1, C), h(hist_pool, slots[i], 1, state_stride);
-        if (!ds4_gpu_qwen4_conv_stream_tensor(xs, h, map, size, woff, 1, C, conv_kernel, apply_silu != 0)) return 0;
+    if (!slots || !n_rows || n_rows > ROWS_MAX || !C || conv_kernel < 2 || conv_kernel > 4 ||
+        state_stride < (conv_kernel-1)*C || !tensor(x,(uint64_t)n_rows*C*4)) return 0;
+    row_slots rs = {};
+    for (unsigned i = 0; i < n_rows; i++) {
+        if (!tensor(hist_pool,((uint64_t)slots[i]*state_stride+(conv_kernel-1)*C)*4)) return 0;
+        rs.slot[i] = slots[i];
     }
-    return 1;
+    const char *w = weight(map,size,woff,(uint64_t)C*conv_kernel*4);
+    if (!w) return 0;
+    launch(conv_slots,dim3((C+255)/256,n_rows),256,0,(float *)x->ptr,(float *)hist_pool->ptr,
+        (const float *)w,rs,C,conv_kernel,state_stride,apply_silu != 0);
+    return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_scan_rows_tensor(
@@ -3342,12 +3559,21 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_rows_tensor(
         const uint32_t *slots, uint32_t n_rows, uint32_t K, uint32_t V, uint32_t D,
         uint32_t state_stride, uint32_t qkv_stride, uint32_t out_stride) {
     using namespace qwen4_cuda;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        row_view o(out, i, 1, out_stride), s(state_pool, slots[i], 1, state_stride), q(qkv, i, 1, qkv_stride),
-                 a(ga, i, 1, V), b(gb, i, 1, V);
-        if (!ds4_gpu_qwen4_gdn_scan_tensor(o, s, q, a, b, 1, K, V, D, NULL, 0u, NULL, 1u)) return 0;
+    if (!slots || !n_rows || n_rows > ROWS_MAX || !K || !V || V%K || D < 32 || D > 128 || D%32 ||
+        qkv_stride != (2*K+V)*D || out_stride != V*D || state_stride < V*D*D ||
+        !tensor(out,(uint64_t)n_rows*out_stride*4) || !tensor(qkv,(uint64_t)n_rows*qkv_stride*4) ||
+        !tensor(ga,(uint64_t)n_rows*V*4) || !tensor(gb,(uint64_t)n_rows*V*4)) return 0;
+    row_slots rs = {};
+    for (unsigned i = 0; i < n_rows; i++) {
+        if (!tensor(state_pool,((uint64_t)slots[i]*state_stride+V*D*D)*4)) return 0;
+        rs.slot[i] = slots[i];
     }
-    return 1;
+#define QWEN_SCAN_SLOTS(DIM) case DIM: launch(gdn_scan_slots<DIM>,dim3(DIM/4,V,n_rows),128,0, \
+    (float *)out->ptr,(float *)state_pool->ptr,(const float *)qkv->ptr,(const float *)ga->ptr, \
+    (const float *)gb->ptr,rs,K,V,state_stride); break
+    switch (D) { QWEN_SCAN_SLOTS(32); QWEN_SCAN_SLOTS(64); QWEN_SCAN_SLOTS(96); QWEN_SCAN_SLOTS(128); }
+#undef QWEN_SCAN_SLOTS
+    return launched();
 }
 
 /* The batch driver's Q8 tile (8 or 16 rows, padding rows included) is the
