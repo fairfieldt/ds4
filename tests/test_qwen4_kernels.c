@@ -999,8 +999,8 @@ static void test_attn_groups(void) {
 /* MTP verify rows must round exactly like plain decode: each row of a 2- or
  * 3-row decode equals, byte for byte, the one-token decode at its own
  * position on the same caches.  Positions cover one split, the split count
- * stepping at 32 keys, the keys-per-split step under the 64-split cap and
- * sparse rows. */
+ * stepping at 32 keys, rows straddling the scalar/grouped switch at 128
+ * keys, the keys-per-split step under the 64-split cap and sparse rows. */
 static void test_attn_decode_rows_exact(uint32_t H, uint32_t D, uint32_t pos0, uint32_t T,
                                         bool sparse, uint32_t stride) {
     const uint32_t Hkv = 2, cap = pos0 + T;
