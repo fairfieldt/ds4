@@ -2408,7 +2408,15 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+#ifndef __APPLE__
+    struct qwen4_ngram_pool *ngram_pool;
+#endif
 } ds4_model;
+
+#ifndef __APPLE__
+static struct qwen4_ngram_pool *qwen4_ngram_pool_new(void);
+static void qwen4_ngram_pool_free(struct qwen4_ngram_pool *p);
+#endif
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -2631,6 +2639,9 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 
 static void model_close(ds4_model *m) {
     if (!m) return;
+#ifndef __APPLE__
+    qwen4_ngram_pool_free(m->ngram_pool);
+#endif
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
@@ -2848,6 +2859,9 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     m->size = table->abs_offset;
     m->ngram_fd = fd;
     m->ngram_tensor = table;
+#ifndef __APPLE__
+    m->ngram_pool = qwen4_ngram_pool_new();
+#endif
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
@@ -58191,14 +58205,95 @@ static void qwen4_ngram_part(void *context, size_t part) {
 
 #ifndef __APPLE__
 typedef struct {
-    qwen4_ngram_batch *batch;
+    struct qwen4_ngram_pool *pool;
     size_t part;
-} qwen4_ngram_reader;
+} qwen4_ngram_worker;
 
-static void *qwen4_ngram_thread(void *context) {
-    qwen4_ngram_reader *reader = context;
-    qwen4_ngram_part(reader->batch,reader->part);
+/* The model owns the pool, so no reader can retain a closed fd. Submitters
+ * serialize jobs; workers only retain the current caller's stack batch until
+ * the completion barrier. Thread exhaustion reduces the partition count. */
+typedef struct qwen4_ngram_pool {
+    pthread_mutex_t submit, mutex;
+    pthread_cond_t work, done;
+    pthread_t threads[15];
+    qwen4_ngram_worker workers[15];
+    qwen4_ngram_batch *batch;
+    uint64_t generation;
+    size_t started, pending;
+    bool initialized, stop;
+} qwen4_ngram_pool;
+
+static void *qwen4_ngram_pool_worker(void *context) {
+    qwen4_ngram_worker *w = context;
+    qwen4_ngram_pool *p = w->pool;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&p->mutex);
+    for (;;) {
+        while (!p->stop && seen == p->generation) pthread_cond_wait(&p->work,&p->mutex);
+        if (p->stop) break;
+        seen = p->generation;
+        qwen4_ngram_batch *batch = p->batch;
+        pthread_mutex_unlock(&p->mutex);
+        qwen4_ngram_part(batch,w->part);
+        pthread_mutex_lock(&p->mutex);
+        if (--p->pending == 0) pthread_cond_signal(&p->done);
+    }
+    pthread_mutex_unlock(&p->mutex);
     return NULL;
+}
+
+static qwen4_ngram_pool *qwen4_ngram_pool_new(void) {
+    qwen4_ngram_pool *p = calloc(1,sizeof(*p));
+    if (!p) return NULL;
+    if (pthread_mutex_init(&p->submit,NULL)) { free(p); return NULL; }
+    if (pthread_mutex_init(&p->mutex,NULL)) { pthread_mutex_destroy(&p->submit); free(p); return NULL; }
+    if (pthread_cond_init(&p->work,NULL)) {
+        pthread_mutex_destroy(&p->mutex); pthread_mutex_destroy(&p->submit); free(p); return NULL;
+    }
+    if (pthread_cond_init(&p->done,NULL)) {
+        pthread_cond_destroy(&p->work); pthread_mutex_destroy(&p->mutex); pthread_mutex_destroy(&p->submit); free(p); return NULL;
+    }
+    return p;
+}
+
+static void qwen4_ngram_pool_run(qwen4_ngram_pool *p, qwen4_ngram_batch *batch) {
+    if (!p) { batch->readers = 1; qwen4_ngram_part(batch,0); return; }
+    pthread_mutex_lock(&p->submit);
+    pthread_mutex_lock(&p->mutex);
+    if (!p->initialized) {
+        p->initialized = true;
+        for (size_t i = 0; i < 15; i++) {
+            p->workers[i] = (qwen4_ngram_worker){p,i+1};
+            if (pthread_create(&p->threads[i],NULL,qwen4_ngram_pool_worker,&p->workers[i])) break;
+            p->started++;
+        }
+    }
+    batch->readers = p->started+1;
+    p->batch = batch;
+    p->pending = p->started;
+    p->generation++;
+    pthread_cond_broadcast(&p->work);
+    pthread_mutex_unlock(&p->mutex);
+    qwen4_ngram_part(batch,0);
+    pthread_mutex_lock(&p->mutex);
+    while (p->pending) pthread_cond_wait(&p->done,&p->mutex);
+    p->batch = NULL;
+    pthread_mutex_unlock(&p->mutex);
+    pthread_mutex_unlock(&p->submit);
+}
+
+static void qwen4_ngram_pool_free(qwen4_ngram_pool *p) {
+    if (!p) return;
+    pthread_mutex_lock(&p->submit);
+    pthread_mutex_lock(&p->mutex);
+    p->stop = true;
+    pthread_cond_broadcast(&p->work);
+    pthread_mutex_unlock(&p->mutex);
+    for (size_t i = 0; i < p->started; i++) if (pthread_join(p->threads[i],NULL)) abort();
+    pthread_mutex_unlock(&p->submit);
+    pthread_cond_destroy(&p->done); pthread_cond_destroy(&p->work);
+    pthread_mutex_destroy(&p->mutex); pthread_mutex_destroy(&p->submit);
+    free(p);
 }
 #endif
 
@@ -58241,19 +58336,7 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
         dispatch_apply_f(batch.readers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                          &batch, qwen4_ngram_part);
 #else
-        pthread_t threads[15];
-        qwen4_ngram_reader readers[15];
-        size_t started = 0;
-        for (size_t part = 1; part < batch.readers; part++) {
-            readers[started] = (qwen4_ngram_reader){&batch,part};
-            if (pthread_create(&threads[started],NULL,qwen4_ngram_thread,&readers[started])) break;
-            started++;
-        }
-        qwen4_ngram_part(&batch, 0);
-        /* Thread exhaustion reduces concurrency; every partition still runs. */
-        for (size_t part = started+1; part < batch.readers; part++) qwen4_ngram_part(&batch,part);
-        for (size_t part = 0; part < started; part++)
-            if (pthread_join(threads[part],NULL)) abort();
+        qwen4_ngram_pool_run(m->ngram_pool,&batch);
 #endif
         for (size_t i = 0; i < batch.readers; i++) {
             if (batch.error[i]) { errno = batch.error[i]; ok = false; break; }

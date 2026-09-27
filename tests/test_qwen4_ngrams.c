@@ -83,6 +83,8 @@ int main(void) {
 #ifndef __APPLE__
     const int budgets[] = {0,1,7};
     for (size_t bi = 0; bi < sizeof(budgets)/sizeof(*budgets); bi++) {
+        qwen4_ngram_pool_free(m.ngram_pool);
+        m.ngram_pool = qwen4_ngram_pool_new();
         thread_budget = budgets[bi];
         memset(out,0xff,(size_t)N*160*sizeof(*out));
         assert(qwen4_ngram_read(&m,rows,N,out));
