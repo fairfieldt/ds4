@@ -1,0 +1,278 @@
+run,kernel,launches,duration_sum_ms
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",4346,125.561886
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1568,55.785392
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1568,46.142263
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3853,37.234504
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3200,37.078927
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1568,34.304468
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3130,30.312508
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::hc_norm<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",3136,19.131987
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1568,18.636743
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)8, (unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",1588,11.223824
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",416,8.996353
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::attention<(unsigned int)256>(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, unsigned int, float)",416,8.451337
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1568,8.413311
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",416,8.28417
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",1152,8.138448
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",416,7.892276
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,7.200829
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",1152,6.186085
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,5.448525
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",70,4.621199
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",416,2.218637
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",416,2.187847
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::tile_max(unsigned int *, const float *, unsigned int, unsigned int)",416,1.250993
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",203,1.161013
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.987447
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::mtp_stage(float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",45,0.967542
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",32,0.820118
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::q8_rows_tc<(unsigned int)1>(float *, const char *, const __half *, const __half *, unsigned int, unsigned int, unsigned int, unsigned long)",45,0.750937
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",45,0.69401
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",70,0.58134
+nsys-sessions-baseline-1-mtp,"qwen4_cuda::mtp_combine(float *, const float *, unsigned int, unsigned int)",45,0.531097
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)8, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",76,0.389276
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::hc_norm<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",64,0.284158
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::argmax<(bool)0>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",32,0.279166
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",19,0.186333
+nsys-sessions-baseline-1-mtp,"void qwen4_cuda::argmax<(bool)1>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",32,0.094623
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::matvec_q8<(unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",4320,99.865081
+nsys-sessions-baseline-1-plain,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,41.950285
+nsys-sessions-baseline-1-plain,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,37.080665
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3840,34.983927
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,34.555446
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,28.893048
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::hc_norm<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",3072,18.839228
+nsys-sessions-baseline-1-plain,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,18.069667
+nsys-sessions-baseline-1-plain,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,11.936393
+nsys-sessions-baseline-1-plain,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",384,9.218085
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::matvec_split<(unsigned int)8, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",1536,8.361828
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::attention<(unsigned int)256>(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, unsigned int, float)",384,7.766348
+nsys-sessions-baseline-1-plain,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",384,6.920599
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",1152,6.633111
+nsys-sessions-baseline-1-plain,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",384,6.562206
+nsys-sessions-baseline-1-plain,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,6.548274
+nsys-sessions-baseline-1-plain,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",1152,5.353667
+nsys-sessions-baseline-1-plain,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,3.829623
+nsys-sessions-baseline-1-plain,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1536,3.220411
+nsys-sessions-baseline-1-plain,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",384,2.04452
+nsys-sessions-baseline-1-plain,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",384,1.988269
+nsys-sessions-baseline-1-plain,"qwen4_cuda::tile_max(unsigned int *, const float *, unsigned int, unsigned int)",384,1.140177
+nsys-sessions-baseline-1-plain,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.900409
+nsys-sessions-baseline-1-plain,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",32,0.814329
+nsys-sessions-baseline-1-plain,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",96,0.543834
+nsys-sessions-baseline-1-plain,"void qwen4_cuda::hc_norm<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",32,0.137536
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1538,173.944895
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1538,119.383935
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",3288,102.078622
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::q8_rows_tc<(unsigned int)1>(float *, const char *, const __half *, const __half *, unsigned int, unsigned int, unsigned int, unsigned long)",5466,102.060887
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",2914,87.930618
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3306,75.430072
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",3288,75.311055
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::attention<(unsigned int)256>(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, unsigned int, float)",3288,74.236691
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",9216,57.306583
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",9792,51.704723
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",4083,45.180045
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1538,36.803687
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",5838,33.974965
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",32,27.553403
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::hc_norm<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",2882,22.887636
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1538,21.362691
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",3288,20.799736
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",3288,16.985367
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1538,12.680584
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::q8_rows_tc<(unsigned int)2>(float *, const char *, const __half *, const __half *, unsigned int, unsigned int, unsigned int, unsigned long)",372,11.413032
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",3288,10.484902
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::tile_max(unsigned int *, const float *, unsigned int, unsigned int)",3288,9.564665
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,6.11725
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,5.094325
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",796,3.813276
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::matvec_rows<(unsigned int)1, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",392,3.506792
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::hc_lo(float *, const float *, unsigned long, unsigned int)",196,3.306139
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::hc_norm_prefill<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",194,2.562588
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",256,2.018474
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.904596
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::mtp_stage(float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",24,0.754072
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::hc_rows(float *, const float *, const float *, unsigned int, unsigned int)",196,0.65321
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::hc_norm<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",32,0.206719
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::argmax<(bool)0>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",16,0.103198
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::argmax<(bool)1>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",16,0.065471
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::pack_half_components<(unsigned int)8>(float *, __half *, __half *, const char *, unsigned int, unsigned long)",4,0.060671
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::pack_half_components<(unsigned int)0>(float *, __half *, __half *, const char *, unsigned int, unsigned long)",2,0.040352
+nsys-sessions-baseline-8-mtp,nvjet_sm120_hss_mma_64x104x64_4_16x104x64_tmaAB_alignCD4_splitK_TNNN,3,0.033024
+nsys-sessions-baseline-8-mtp,nvjet_sm120_hss_mma_64x56x128_3_16x56x128_tmaAB_alignCD4_splitK_TNNN,3,0.027295
+nsys-sessions-baseline-8-mtp,nvjet_sm120_hss_mma_128x80x64_3_32x40x64_tmaAB_alignCD4_splitK_TNNN,3,0.026431
+nsys-sessions-baseline-8-mtp,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",12,0.02544
+nsys-sessions-baseline-8-mtp,nvjet_sm120_hss_mma_64x56x64_6_16x56x64_tmaAB_alignCD4_splitK_TNNN,3,0.023328
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::mtp_combine(float *, const float *, unsigned int, unsigned int)",24,0.022848
+nsys-sessions-baseline-8-mtp,"void qwen4_cuda::hc_norm_prefill<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",2,0.021376
+nsys-sessions-baseline-8-mtp,"qwen4_cuda::dense_rescale2(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",4,0.008128
+nsys-sessions-baseline-8-plain,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,165.90461
+nsys-sessions-baseline-8-plain,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,113.978763
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::q8_rows_tc<(unsigned int)1>(float *, const char *, const __half *, const __half *, unsigned int, unsigned int, unsigned int, unsigned long)",5824,108.472227
+nsys-sessions-baseline-8-plain,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",3072,94.38369
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,93.422677
+nsys-sessions-baseline-8-plain,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",3072,70.767013
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::attention<(unsigned int)256>(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, unsigned int, float)",3072,69.6621
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,67.765241
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",9216,54.907502
+nsys-sessions-baseline-8-plain,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",9216,51.116698
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3840,42.514273
+nsys-sessions-baseline-8-plain,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1536,35.523293
+nsys-sessions-baseline-8-plain,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",5824,33.36947
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::matvec_q8<(unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",32,27.483299
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::hc_norm<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",3072,24.145989
+nsys-sessions-baseline-8-plain,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,21.403678
+nsys-sessions-baseline-8-plain,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",3072,19.525829
+nsys-sessions-baseline-8-plain,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",3072,16.218423
+nsys-sessions-baseline-8-plain,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,12.793877
+nsys-sessions-baseline-8-plain,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",3072,9.945086
+nsys-sessions-baseline-8-plain,"qwen4_cuda::tile_max(unsigned int *, const float *, unsigned int, unsigned int)",3072,8.925736
+nsys-sessions-baseline-8-plain,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,6.203365
+nsys-sessions-baseline-8-plain,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,4.843056
+nsys-sessions-baseline-8-plain,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",768,3.396123
+nsys-sessions-baseline-8-plain,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",256,1.997997
+nsys-sessions-baseline-8-plain,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.882488
+nsys-sessions-baseline-8-plain,"void qwen4_cuda::hc_norm<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",32,0.220857
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",2042,63.904605
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1568,55.944363
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::multi_q8<(unsigned int)2, (bool)0>(qwen4_cuda::rows_projections, const float *, unsigned int, unsigned int)",1152,47.972407
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1568,46.3927
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3200,37.216861
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1568,34.41257
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3853,33.782649
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)2>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3130,30.3954
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::hc_norm<(unsigned int)1, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",3136,19.179885
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1568,18.672618
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",416,8.911039
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",416,8.573354
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1568,8.488543
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",416,8.383756
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",1152,8.258605
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::attention<(unsigned int)256>(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, unsigned int, float)",397,8.11163
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,7.299245
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::multi_q8<(unsigned int)2, (bool)1>(qwen4_cuda::rows_projections, const float *, unsigned int, unsigned int)",397,6.661922
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",1152,6.263011
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,5.525738
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",70,4.626002
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",416,2.441642
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",416,2.214663
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",203,1.181905
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::mtp_stage(float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",45,1.018967
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.987288
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",32,0.825882
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::rows_tc<(unsigned int)1, (unsigned int)8>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",45,0.764184
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::argmax<(bool)0>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",64,0.744409
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",45,0.744405
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",70,0.583579
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::mtp_combine(float *, const float *, unsigned int, unsigned int)",45,0.541724
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::hc_norm<(unsigned int)0, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",64,0.284478
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::argmax<(bool)1>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",64,0.241119
+nsys-sessions-candidate-1-mtp,"qwen4_cuda::attention_group(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, float, unsigned int, unsigned int)",19,0.231102
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::multi_q8<(unsigned int)1, (bool)1>(qwen4_cuda::rows_projections, const float *, unsigned int, unsigned int)",19,0.215294
+nsys-sessions-candidate-1-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",19,0.19344
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::matvec_q8<(unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",2016,49.64088
+nsys-sessions-candidate-1-plain,"qwen4_cuda::moe_down_mxfp4(float *, const float *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,42.007605
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::multi_q8<(unsigned int)1, (bool)0>(qwen4_cuda::rows_projections, const float *, unsigned int, unsigned int)",1152,40.487412
+nsys-sessions-candidate-1-plain,"qwen4_cuda::moe_gate_up_q4k(float *, const float *, const int *, const char *, const char *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long)",1536,37.109786
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3840,36.991878
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,34.562101
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::matvec_split<(unsigned int)1, (unsigned int)1>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,32.70992
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::hc_norm<(unsigned int)1, (bool)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",1536,30.800782
+nsys-sessions-candidate-1-plain,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,18.076191
+nsys-sessions-candidate-1-plain,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,11.941147
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::hc_norm<(unsigned int)1, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",1536,9.915843
+nsys-sessions-candidate-1-plain,"qwen4_cuda::idx_select(int *, const float *, unsigned int, unsigned int)",384,7.188792
+nsys-sessions-candidate-1-plain,"qwen4_cuda::idx_expand(int *, unsigned int *, const int *, unsigned int, unsigned int, unsigned int, unsigned int)",384,7.02748
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::gdn_scan<(unsigned int)1, (unsigned int)128>(float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",1152,6.700586
+nsys-sessions-candidate-1-plain,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,6.564532
+nsys-sessions-candidate-1-plain,"qwen4_cuda::attn_merge(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",384,6.086886
+nsys-sessions-candidate-1-plain,"qwen4_cuda::conv(float *, float *, const float *, unsigned int, unsigned int, unsigned int, bool, float *, unsigned int, float *, unsigned int)",1152,5.360682
+nsys-sessions-candidate-1-plain,"qwen4_cuda::attention_group(float *, float *, const float *, const float *, const __half *, const __half *, const int *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, bool, float, unsigned int, unsigned int)",384,4.689808
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::multi_q8<(unsigned int)1, (bool)1>(qwen4_cuda::rows_projections, const float *, unsigned int, unsigned int)",384,4.618193
+nsys-sessions-candidate-1-plain,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,3.859211
+nsys-sessions-candidate-1-plain,"qwen4_cuda::idx_score(float *, const float *, const __half *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",384,2.045516
+nsys-sessions-candidate-1-plain,"qwen4_cuda::attn_prep(float *, float *, __half *, __half *, float *, float *, const float *, const float *, const float *, const float *, const float *, const unsigned int *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",384,2.009992
+nsys-sessions-candidate-1-plain,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.894264
+nsys-sessions-candidate-1-plain,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",32,0.80815
+nsys-sessions-candidate-1-plain,"qwen4_cuda::block_key(__half *, const float *, const unsigned int *, const float *, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",96,0.54969
+nsys-sessions-candidate-1-plain,"void qwen4_cuda::hc_norm<(unsigned int)0, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",32,0.137053
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::moe_grouped<(bool)0>(float *, const float *, const int *, const int *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long)",1538,145.196775
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::moe_grouped<(bool)1>(float *, const float *, const int *, const int *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long)",1538,143.520383
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::rows_tc<(unsigned int)1, (unsigned int)8>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",6546,107.837626
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",10100,51.139275
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",4083,47.386064
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1538,43.42399
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",2914,41.858118
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::matvec_q8<(unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",32,28.233273
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::rows_tc_reduce(float *, const float *, unsigned int, unsigned int)",3882,27.960974
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::gdn_scan_rows<(unsigned int)128>(float *, const float *, const float *, const float *, const qwen4_cuda::gdn_row *, unsigned int, unsigned int)",1152,24.858733
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::hc_norm<(unsigned int)1, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",2882,23.679493
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::rows_tc<(unsigned int)1, (unsigned int)1>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",2914,23.346771
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1538,21.929094
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::attention_group_rows(float *, float *, const float *, const float *, const int *, const unsigned int *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int, float)",386,19.286615
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1538,16.056673
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::attn_merge_rows(float *, const float *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",386,10.596016
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::idx_select_rows(int *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",386,9.837941
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::rows_tc<(unsigned int)2, (unsigned int)8>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",444,9.244732
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::idx_expand_rows(int *, unsigned int *, const int *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",386,9.157464
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,9.038729
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::stage_rows<qwen4_cuda::gdn_row>(T1 *, qwen4_cuda::row_batch<T1>, unsigned int)",1152,8.714664
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::expert_lists(int *, int *, const int *, unsigned int, unsigned int, unsigned int)",1538,6.197212
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::conv_rows(float *, const float *, const qwen4_cuda::gdn_row *, unsigned int, unsigned int, bool)",1152,5.674181
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,4.772657
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::matvec_rows<(unsigned int)1, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",392,3.721884
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::block_key_rows(const qwen4_cuda::attn_row *, const float *, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",386,3.413146
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::idx_score_rows(float *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int, unsigned int)",386,3.138661
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::attn_prep_rows(float *, float *, float *, const float *, const float *, const float *, const float *, const float *, const qwen4_cuda::attn_row *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",386,2.711648
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::hc_norm_prefill<(unsigned int)1>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",194,2.630788
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",256,2.031814
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::rows_tc<(unsigned int)2, (unsigned int)1>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",196,1.412945
+nsys-sessions-candidate-8-mtp,"swiglu_kernel(float *, const float *, const float *, unsigned int, float, float)",1538,1.401958
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.981303
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::argmax<(bool)0>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",34,0.954038
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::stage_rows<qwen4_cuda::attn_row>(T1 *, qwen4_cuda::row_batch<T1>, unsigned int)",386,0.857722
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::mtp_stage(float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",24,0.757912
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::hc_rows(float *, const float *, const float *, unsigned int, unsigned int)",196,0.687129
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::argmax<(bool)1>(int *, qwen4_cuda::max_pair *, const float *, unsigned int)",34,0.263259
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::hc_lo(float *, const float *, unsigned long, unsigned int)",196,0.242685
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::hc_norm<(unsigned int)0, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",32,0.205664
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::pack_half_components<(unsigned int)8>(float *, __half *, __half *, const char *, unsigned int, unsigned long)",4,0.061887
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::pack_half_components<(unsigned int)0>(float *, __half *, __half *, const char *, unsigned int, unsigned long)",2,0.040768
+nsys-sessions-candidate-8-mtp,nvjet_sm120_hss_mma_64x104x64_4_16x104x64_tmaAB_alignCD4_splitK_TNNN,3,0.028992
+nsys-sessions-candidate-8-mtp,nvjet_sm120_hss_mma_64x56x128_3_16x56x128_tmaAB_alignCD4_splitK_TNNN,3,0.027712
+nsys-sessions-candidate-8-mtp,nvjet_sm120_hss_mma_128x80x64_3_32x40x64_tmaAB_alignCD4_splitK_TNNN,3,0.027072
+nsys-sessions-candidate-8-mtp,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",12,0.025695
+nsys-sessions-candidate-8-mtp,nvjet_sm120_hss_mma_64x56x64_6_16x56x64_tmaAB_alignCD4_splitK_TNNN,3,0.023744
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::mtp_combine(float *, const float *, unsigned int, unsigned int)",24,0.023072
+nsys-sessions-candidate-8-mtp,"void qwen4_cuda::hc_norm_prefill<(unsigned int)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float)",2,0.02096
+nsys-sessions-candidate-8-mtp,"qwen4_cuda::dense_rescale2(float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",4,0.008127
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::moe_grouped<(bool)0>(float *, const float *, const int *, const int *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long)",1536,136.544073
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::moe_grouped<(bool)1>(float *, const float *, const int *, const int *, const int *, const char *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long)",1536,134.622477
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::rows_tc<(unsigned int)1, (unsigned int)8>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",8128,119.934246
+nsys-sessions-candidate-8-plain,"qwen4_cuda::split_rows_f16(__half *, __half *, const float *, unsigned int, unsigned int, unsigned int)",11232,57.969994
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::hc_mix<(unsigned int)1>(float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, unsigned long)",3104,43.722183
+nsys-sessions-candidate-8-plain,"qwen4_cuda::hc_combine(float *, const float *, const float *, unsigned int, unsigned int)",1536,42.638032
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::matvec_split<(unsigned int)0, (unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",3840,41.202228
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::matvec_q8<(unsigned int)8>(float *, const char *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)",32,28.294364
+nsys-sessions-candidate-8-plain,"qwen4_cuda::rows_tc_reduce(float *, const float *, unsigned int, unsigned int)",3872,26.227082
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::hc_norm<(unsigned int)1, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",3072,24.377312
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::gdn_scan_slots<(unsigned int)128>(float *, float *, const float *, const float *, const float *, qwen4_cuda::row_slots, unsigned int, unsigned int, unsigned int)",1152,23.576502
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::rows_tc<(unsigned int)1, (unsigned int)1>(qwen4_cuda::rows_projections, const __half *, const __half *, unsigned int, unsigned int)",3104,23.218243
+nsys-sessions-candidate-8-plain,"qwen4_cuda::router(int *, float *, const float *, const float *, const char *, float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,21.593796
+nsys-sessions-candidate-8-plain,"qwen4_cuda::attention_group_rows(float *, float *, const float *, const float *, const int *, const unsigned int *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int, float)",384,18.382225
+nsys-sessions-candidate-8-plain,"qwen4_cuda::moe_reduce(float *, float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)",1536,16.014988
+nsys-sessions-candidate-8-plain,"qwen4_cuda::conv_slots(float *, float *, const float *, qwen4_cuda::row_slots, unsigned int, unsigned int, unsigned int, bool)",1152,10.549192
+nsys-sessions-candidate-8-plain,"qwen4_cuda::attn_merge_rows(float *, const float *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",384,10.34815
+nsys-sessions-candidate-8-plain,"qwen4_cuda::idx_select_rows(int *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",384,9.367942
+nsys-sessions-candidate-8-plain,"qwen4_cuda::idx_expand_rows(int *, unsigned int *, const int *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int)",384,8.962062
+nsys-sessions-candidate-8-plain,"qwen4_cuda::expert_lists(int *, int *, const int *, unsigned int, unsigned int, unsigned int)",1536,6.062442
+nsys-sessions-candidate-8-plain,"qwen4_cuda::gdn_prep(float *, float *, float *, const float *, const float *, unsigned int, unsigned int, unsigned int)",1152,5.80012
+nsys-sessions-candidate-8-plain,"qwen4_cuda::gdn_out(float *, const float *, const float *, unsigned int, unsigned int, float)",1152,4.498015
+nsys-sessions-candidate-8-plain,"qwen4_cuda::idx_score_rows(float *, const float *, const qwen4_cuda::attn_row *, unsigned int, unsigned int, unsigned int, unsigned int)",384,3.63923
+nsys-sessions-candidate-8-plain,"qwen4_cuda::attn_prep_rows(float *, float *, float *, const float *, const float *, const float *, const float *, const float *, const qwen4_cuda::attn_row *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",384,2.574317
+nsys-sessions-candidate-8-plain,"qwen4_cuda::ngram_conv(float *, const float *, const float *, float *, const char *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float *, unsigned int, float *, unsigned int)",256,2.003178
+nsys-sessions-candidate-8-plain,"swiglu_kernel(float *, const float *, const float *, unsigned int, float, float)",1536,1.374177
+nsys-sessions-candidate-8-plain,"qwen4_cuda::ngram_gate(float *, float *, const float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, float)",32,0.984316
+nsys-sessions-candidate-8-plain,"qwen4_cuda::block_key_rows(const qwen4_cuda::attn_row *, const float *, unsigned int, unsigned int, float, qwen4_cuda::rope_args)",96,0.823923
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::stage_rows<qwen4_cuda::attn_row>(T1 *, qwen4_cuda::row_batch<T1>, unsigned int)",384,0.79862
+nsys-sessions-candidate-8-plain,"void qwen4_cuda::hc_norm<(unsigned int)0, (bool)0>(float *, float *, const float *, const float *, const char *, unsigned int, unsigned int, unsigned int, float, float *, const float *, const float *)",32,0.212252

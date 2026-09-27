@@ -1,0 +1,1 @@
+Write a Python module that parses ISO-8601 durations (like P3Y6M4DT12H30M5S and PT0.5S) into a dataclass, supports addition of two durations, and includes a thorough pytest test suite. Output only the code.

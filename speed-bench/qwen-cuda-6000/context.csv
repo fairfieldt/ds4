@@ -1,0 +1,5 @@
+run,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+bench-long-baseline-0,4096,4096,3097.13,256,122.68,7.841,255,123.46,0
+bench-long-baseline-3,4096,4096,3095.44,256,128.85,7.819,255,129.76,0
+bench-long-candidate-1,4096,4096,3113.05,256,128.96,7.549,255,130.82,0
+bench-long-candidate-2,4096,4096,3111.47,256,133.60,7.540,255,134.59,0

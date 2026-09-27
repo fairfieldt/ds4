@@ -1,0 +1,4 @@
+rows,layer_samples,pairs,distinct_experts,groups_of_four,peak_reuse
+1,384,10,10,10,1
+8,384,80,52.416666666666664,54.46875,8
+16,384,160,78.59635416666667,88.7109375,16

@@ -1,0 +1,11 @@
+pilot,concurrency,context,change,without_tps,with_tps
+fused-projections,1,256,shared-input decode projections in one launch,135.6,138.6
+grouped-decode-attention,1,256,one-token decode on the split grouped attention from 128 keys,138.5,140.6
+grouped-decode-attention,1,4096,one-token decode on the split grouped attention from 128 keys,127.3,128.6
+grouped-verify-attention-shared-split,1,4096,MTP verify rows also on the grouped attention (before per-row splits),159.8,158.0
+hc-combine-norm,1,256,residual combine folded into the HC norm,124.4,124.6
+ngram-overlap,1,256,n-gram rows read while the first layer runs,124.5,124.5
+expert-crossover-plain,24,256,grouped decode experts through 32 rows instead of the expert GEMM from 25,616.8,619.3
+expert-crossover-plain,25,256,grouped decode experts through 32 rows instead of the expert GEMM from 25,437.2,605.7
+expert-crossover-plain,32,256,grouped decode experts through 32 rows instead of the expert GEMM from 25,512.2,678.2
+expert-crossover-mtp,16,256,grouped decode experts through 32 rows instead of the expert GEMM from 25,524.1,541.9
