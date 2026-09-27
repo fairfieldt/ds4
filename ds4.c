@@ -59576,6 +59576,13 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
         !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
         return false;
+    return true;
+}
+
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                    const int *tokens, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    float *row = g->host_row;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -59635,6 +59642,15 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     const double t0 = timing ? now_sec() : 0.0;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    /* Read the n-gram rows while the GPU runs the first trunk layer, which
+     * does not use them: submit that layer, then read (as the session batch
+     * does).  The PLE layer itself must not be the first. */
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool overlap_ngrams = false;
+#else
+    const bool overlap_ngrams = n_trunk > 1 && !ds4_qwen4_layer_is_ple(0);
+#endif
+    if (!overlap_ngrams && !qwen4_graph_stage_ngrams(g,m,tokens,T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -59653,6 +59669,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         } \
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
+        if (il == 1 && overlap_ngrams) {
+            ok = ds4_gpu_flush_commands() && qwen4_graph_stage_ngrams(g,m,tokens,T);
+            if (!ok) break;
+        }
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
