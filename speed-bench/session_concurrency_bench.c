@@ -434,9 +434,14 @@ static bool verify_spec_matches_plain(const bench_env *env,
     int accepted[MAX_STREAMS][2], n_accepted[MAX_STREAMS];
     char err[256] = {0};
     int *seq = calloc((size_t)count * (size_t)cycles * 2u, sizeof(int));
+    bool *drafted = calloc((size_t)count * (size_t)cycles * 2u, sizeof(bool));
     int len[MAX_STREAMS] = {0};
     long committed = 0;
-    if (!seq) return false;
+    if (!seq || !drafted) {
+        free(seq);
+        free(drafted);
+        return false;
+    }
     for (int c = 0; c < cycles; c++) {
         for (int i = 0; i < count; i++) {
             items[i].session = spec[i];
@@ -445,10 +450,14 @@ static bool verify_spec_matches_plain(const bench_env *env,
         if (ds4_sessions_eval_batch_speculative_argmax(items, count, accepted, n_accepted, err, sizeof(err)) != 0) {
             fprintf(stderr, BENCH ": speculative batch failed: %s\n", err);
             free(seq);
+            free(drafted);
             return false;
         }
         for (int i = 0; i < count; i++) {
-            for (int k = 0; k < n_accepted[i]; k++) seq[(size_t)i * cycles * 2 + len[i]++] = accepted[i][k];
+            for (int k = 0; k < n_accepted[i]; k++) {
+                drafted[(size_t)i * cycles * 2 + len[i]] = k > 0;
+                seq[(size_t)i * cycles * 2 + len[i]++] = accepted[i][k];
+            }
             committed += n_accepted[i];
         }
     }
@@ -456,14 +465,19 @@ static bool verify_spec_matches_plain(const bench_env *env,
     /* The reference is the plain batch of the same sessions, so every
      * stream stays in it until the longest is checked: a stream checked in
      * full keeps decoding its own greedy tokens, and each reference step has
-     * the width of the speculative cycles it is compared with. */
+     * the width of the speculative cycles it is compared with.  Each token
+     * is picked by the rule that committed it: a cycle's fed token is the
+     * argmax without EOS, as here, but a draft is accepted when it is the
+     * full argmax, so an accepted draft can be EOS. */
     int max_len = 0;
     for (int i = 0; i < count; i++) if (len[i] > max_len) max_len = len[i];
     bool ok = true;
     for (int k = 0; k < max_len && ok; k++) {
         int n = 0;
         for (int i = 0; i < count; i++) {
-            const int token = ds4_session_argmax_excluding(reference[i], env->eos);
+            const bool draft = k < len[i] && drafted[(size_t)i * cycles * 2 + k];
+            const int token = draft ? ds4_session_argmax(reference[i])
+                                    : ds4_session_argmax_excluding(reference[i], env->eos);
             const int want = k < len[i] ? seq[(size_t)i * cycles * 2 + k] : token;
             if (token != want) {
                 fprintf(stderr, BENCH ": spec verify failed: stream %d token %d: speculative %d, plain %d\n",
@@ -481,6 +495,7 @@ static bool verify_spec_matches_plain(const bench_env *env,
         }
     }
     free(seq);
+    free(drafted);
     return ok;
 }
 
