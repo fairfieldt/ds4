@@ -321,13 +321,12 @@ __global__ void attn_merge(float *out, const float *partial, const float *gate,
  * accumulators in registers and use tensor cores for both products. Scaled
  * residual components retain the fine part of the FP32 queries/probabilities;
  * K and V are already half, so neither requires further rounding. */
-__global__ void attention_group(float *out, const float *q, const float *gate,
+__device__ __forceinline__ void attention_group_body(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
-        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale, unsigned splits, unsigned per, unsigned t) {
 #if __CUDA_ARCH__ >= 800
     const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32;
-    const unsigned t = blockIdx.y, kh = blockIdx.x, group = H/Hkv;
+    const unsigned kh = blockIdx.x, group = H/Hkv;
     const unsigned qr = tid/16, col = tid%16, h = kh*group+qr;
     const unsigned n = sparse ? counts[t] : pos0+t+1;
     __shared__ __align__(32) __half qh[16][264], ql[16][264], kv[32][264];
@@ -349,10 +348,11 @@ __global__ void attention_group(float *out, const float *q, const float *gate,
     }
     float result[4][4] = {};
     __syncthreads();
-    for (unsigned j0 = 0; j0 < n; j0 += 32) {
+    const unsigned end = min(n,(blockIdx.z+1)*per);
+    for (unsigned j0 = blockIdx.z*per; j0 < end; j0 += 32) {
         if (tid < 32) {
             const unsigned j = j0+tid;
-            const unsigned p = j < n ? (sparse ? (unsigned)sel[(uint64_t)t*stride+j] : j) : UINT_MAX;
+            const unsigned p = j < end ? (sparse ? (unsigned)sel[(uint64_t)t*stride+j] : j) : UINT_MAX;
             positions[tid] = p <= pos0+t ? p : UINT_MAX;
         }
         __syncthreads();
@@ -438,11 +438,29 @@ __global__ void attention_group(float *out, const float *q, const float *gate,
             const unsigned r = tt_mma_c_i(lane,i), d = warp*32+tile*8+tt_mma_c_j(lane,i);
             if (r < group) {
                 const uint64_t dst = ((uint64_t)t*H+kh*group+r)*D+d;
-                out[dst] = (denom[r] > 0 ? result[tile][i]/denom[r] : 0)*sigmoid(gate[dst]);
+                if (splits == 1) out[dst] = (denom[r] > 0 ? result[tile][i]/denom[r] : 0)*sigmoid(gate[dst]);
+                else {
+                    float *p = partial+(((uint64_t)t*H+kh*group+r)*splits+blockIdx.z)*(D+2);
+                    if (!d) { p[0] = max_score[r]; p[1] = denom[r]; }
+                    p[2+d] = result[tile][i];
+                }
             }
         }
     }
 #endif
+}
+
+/* Rows and splits as in attention<D>. */
+__global__ void attention_group(float *out, float *partial, const float *q, const float *gate,
+        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+    pdl_enter();
+    const unsigned t = blockIdx.y, D = 256, keys = attn_keys(sparse,stride,pos0+t),
+        splits = partial ? attn_splits(keys) : 1;
+    if (blockIdx.z >= splits) return;
+    attention_group_body(out+(uint64_t)t*H*D,partial ? partial+(uint64_t)t*H*64*(D+2) : nullptr,
+        q+(uint64_t)t*H*D,gate+(uint64_t)t*H*D,kc,vc,sparse ? sel+(uint64_t)t*stride : nullptr,
+        sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,scale,splits,(keys+splits-1)/splits,0);
 }
 
 static bool tensor(const ds4_gpu_tensor *t, uint64_t bytes) {
@@ -3030,33 +3048,41 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     if (!T || !H || !Hkv || H % Hkv || (D != 32 && D != 128 && D != 256) ||
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
-    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
-        !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
-        ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
-        launch(attention_group, dim3(Hkv,T), 256, 0, (float *)out->ptr,
-            (const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
-            sparse ? (const int *)sel->ptr : nullptr,sparse ? (const unsigned *)count->ptr : nullptr,
-            H,Hkv,pos0,stride,sparse,scale);
-        return launched();
-    }
-    /* With partial scratch these are decode rows: row t splits its keys like
-     * the one-token decode at pos0 + t, so MTP verify rows round exactly like
-     * plain decode. Dense key counts grow with the row, so the last row takes
-     * the most splits. */
-    const unsigned max_splits = partial ? attn_splits(attn_keys(sparse, stride, pos0 + T - 1)) : 1;
-    if (partial && !tensor(partial, ((uint64_t)(T - 1) * 64 + max_splits) * H * (D + 2) * 4)) return 0;
-    const dim3 grid((H + 3) / 4, T, max_splits);
-#define QWEN_ATTN(DIM) launch(attention<DIM>, grid, 128, 0, (float *)out->ptr, \
-        partial ? (float *)partial->ptr : nullptr, (const float *)q->ptr, (const float *)gate->ptr, \
-        (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : nullptr, \
-        sparse ? (const unsigned *)count->ptr : nullptr, H, Hkv, pos0, stride, sparse, scale)
-    if (D == 32) { QWEN_ATTN(32); }
-    else if (D == 128) { QWEN_ATTN(128); }
-    else { QWEN_ATTN(256); }
+    /* With partial scratch these are decode rows: row t takes the kernel
+     * and key split of the one-token decode at pos0 + t (grouped from 128
+     * keys), so MTP verify rows round exactly like plain decode. Prefill
+     * batches of 32+ rows take the grouped kernel. Rows [0, g0) run scalar,
+     * rows [g0, T) grouped; dense key counts grow with the row. */
+    const bool split = partial != nullptr;
+    const unsigned max_splits = split ? attn_splits(attn_keys(sparse,stride,pos0+T-1)) : 1;
+    if (split && !tensor(partial, ((uint64_t)(T-1)*64+max_splits)*H*(D+2)*4)) return 0;
+    const bool group_ok = D == 256 && H/Hkv <= 16 && !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
+        ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM");
+    unsigned g0 = T;
+    if (group_ok && !split && T >= 32) g0 = 0;
+    if (group_ok && split)
+        for (g0 = 0; g0 < T && attn_keys(sparse,stride,pos0+g0) < 128; g0++) {}
+    float *o = (float *)out->ptr, *part = split ? (float *)partial->ptr : nullptr;
+    const float *qp = (const float *)q->ptr, *gp = (const float *)gate->ptr;
+    const __half *kp = (const __half *)kc->ptr, *vp = (const __half *)vc->ptr;
+    const int *sp = sparse ? (const int *)sel->ptr : nullptr;
+    const unsigned *cp = sparse ? (const unsigned *)count->ptr : nullptr;
+    if (g0) {
+        const dim3 grid((H + 3) / 4, g0, split ? attn_splits(attn_keys(sparse,stride,pos0+g0-1)) : 1);
+#define QWEN_ATTN(DIM) launch(attention<DIM>, grid, 128, 0, o, part, qp, gp, kp, vp, sp, cp, H, Hkv, pos0, stride, sparse, scale)
+        if (D == 32) { QWEN_ATTN(32); }
+        else if (D == 128) { QWEN_ATTN(128); }
+        else { QWEN_ATTN(256); }
 #undef QWEN_ATTN
+    }
+    if (g0 < T) {
+        const uint64_t r = (uint64_t)g0*H*D;
+        launch(attention_group, dim3(Hkv,T-g0,max_splits), 256, 0, o+r,
+            part ? part+(uint64_t)g0*H*64*(D+2) : nullptr, qp+r, gp+r, kp, vp,
+            sp ? sp+(uint64_t)g0*stride : nullptr, cp ? cp+g0 : nullptr, H, Hkv, pos0+g0, stride, sparse, scale);
+    }
     if (!launched()) return 0;
-    if (max_splits > 1) launch(attn_merge, dim3(H, T), D, 0, (float *)out->ptr,
-        (const float *)partial->ptr, (const float *)gate->ptr, H, D, pos0, stride, sparse);
+    if (max_splits > 1) launch(attn_merge, dim3(H, T), D, 0, o, part, gp, H, D, pos0, stride, sparse);
     return launched();
 }
 
