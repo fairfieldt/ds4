@@ -956,6 +956,61 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
 }
 
+/* Warp-wide maximum and minimum of unsigned values (one redux on sm_80+). */
+__device__ __forceinline__ unsigned warp_max_u32(unsigned v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_max_sync(0xffffffffu, v);
+#else
+    for (unsigned off = 16; off; off /= 2) v = max(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+#endif
+}
+
+__device__ __forceinline__ unsigned warp_min_u32(unsigned v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(0xffffffffu, v);
+#else
+    for (unsigned off = 16; off; off /= 2) v = min(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+#endif
+}
+
+/* router()'s selection of NS experts from the softmax row p[NE] (NE <= 512)
+ * by warp 0, on integer keys: each pick is the greatest probability, ties
+ * to the lowest expert, NaN never, and expert s with weight 0 when nothing
+ * is left.  The key of p is its bits plus one (p is in [0, 1], so the key
+ * order is the float order), 0 for NaN or no expert; the winner's
+ * probability and expert come from one max and one min reduction instead
+ * of a compare-and-swap shuffle round per level, with the same result. */
+__device__ __forceinline__ void router_select_keys(int *selected, float *weights, const float *p,
+        unsigned NE, unsigned NS, unsigned t) {
+    const unsigned tid = threadIdx.x;
+    unsigned key[16];
+    #pragma unroll
+    for (unsigned j = 0; j < 16; j++) {
+        const float v = tid + 32 * j < NE ? p[tid + 32 * j] : -1;
+        key[j] = v >= 0 ? __float_as_uint(v) + 1 : 0;
+    }
+    for (unsigned s = 0; s < NS; s++) {
+        unsigned best = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) best = max(best, key[j]);
+        best = warp_max_u32(best);
+        unsigned id = UINT_MAX;
+        #pragma unroll
+        for (unsigned j = 16; j-- > 0;) if (key[j] == best) id = tid + 32 * j;
+        id = warp_min_u32(id);
+        float w = __uint_as_float(best - 1);
+        if (!best) { id = s; w = 0; }
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (tid + 32 * j == id) key[j] = 0;
+        if (!tid) {
+            selected[(uint64_t)t * NS + s] = id;
+            weights[(uint64_t)t * NS + s] = w;
+        }
+    }
+}
+
 /* router() with an F32 shared gate of K = 256 * KPT. Each thread's KPT gate
  * values are loaded before the dependency wait (the weights are immutable),
  * so the cold 10 KB row no longer arrives from DRAM one dependent load at a
@@ -1001,29 +1056,7 @@ __global__ void __launch_bounds__(256) router_pre(int *selected, float *weights,
     #pragma unroll
     for (unsigned j = 0; j < 2; j++) if (tid + 256 * j < NE) p[tid + 256 * j] /= total;
     __syncthreads();
-    if (tid < 32) {
-        float v[16];
-        #pragma unroll
-        for (unsigned j = 0; j < 16; j++) v[j] = tid + 32 * j < NE ? p[tid + 32 * j] : -1;
-        for (unsigned s = 0; s < NS; s++) {
-            float best = -1;
-            unsigned id = UINT_MAX;
-            #pragma unroll
-            for (unsigned j = 0; j < 16; j++) if (v[j] > best) { best = v[j]; id = tid + 32 * j; }
-            for (unsigned off = 16; off; off /= 2) {
-                const float ob = __shfl_xor_sync(0xffffffff, best, off);
-                const unsigned oi = __shfl_xor_sync(0xffffffff, id, off);
-                if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
-            }
-            if (id >= NE) { id = s; best = 0; }
-            #pragma unroll
-            for (unsigned j = 0; j < 16; j++) if (tid + 32 * j == id) v[j] = -1;
-            if (!tid) {
-                selected[(uint64_t)t * NS + s] = id;
-                weights[(uint64_t)t * NS + s] = best;
-            }
-        }
-    }
+    if (tid < 32) router_select_keys(selected, weights, p, NE, NS, t);
     __syncthreads();
     if (tid < NS) {
         float denom = 0;
