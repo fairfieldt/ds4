@@ -1926,7 +1926,45 @@ static void test_router_paths(arena_t *a) {
         same_bytes("GDN gate bf16",T,ref,0,out,0,(uint64_t)T*G*4);
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(x); free(input);
     }
-    puts("  router: preload and BF16 gates byte-exact at T=1..13; GDN gates BF16 at T=1..31");
+    /* Ties and non-finite rows through the preload selection: the top
+     * probability shared by a fifth of the experts, every expert equal,
+     * three experts above a floor of zeros, -inf logits at every even
+     * expert, and a row that is all NaN (one NaN logit makes the softmax
+     * sum NaN, so a NaN row selects experts 0..NS-1 with weight 0). */
+    {
+        const unsigned T = 5;
+        float *logits = malloc((uint64_t)T * NE * sizeof(float));
+        for (unsigned e = 0; e < NE; e++) {
+            logits[e] = (float)(e % 5) * 0.75f;
+            logits[NE + e] = 0.5f;
+            logits[2 * NE + e] = e == 7 || e == 300 || e == 511 ? 2.0f : -1e30f;
+            logits[3 * NE + e] = e % 2 ? (float)(e % 13) : -INFINITY;
+            logits[4 * NE + e] = nanf("");
+        }
+        float *input = rand_vec((uint64_t)T * K, 1.0f);
+        ds4_gpu_tensor *x = upload(input, (uint64_t)T * K), *gl = upload(logits, (uint64_t)T * NE), *o[2][3];
+        for (unsigned v = 0; v < 2; v++) {
+            o[v][0] = upload(NULL, (uint64_t)T * NS); o[v][1] = upload(NULL, (uint64_t)T * NS); o[v][2] = upload(NULL, T);
+            require_ok((v ? ds4_gpu_qwen4_router_topk_tensor : ds4_gpu_qwen4_router_topk_ref_tensor)(
+                           o[v][0], o[v][1], gl, x, a->base, a->size, goff, 0u, K, o[v][2], T, NE, NS), "router ties");
+        }
+        same_bytes("router ties: experts", T, o[0][0], 0, o[1][0], 0, (uint64_t)T * NS * 4);
+        same_bytes("router ties: weights", T, o[0][1], 0, o[1][1], 0, (uint64_t)T * NS * 4);
+        same_bytes("router ties: shared gate", T, o[0][2], 0, o[1][2], 0, (uint64_t)T * 4);
+        int32_t sel[5 * 10];
+        require_ok(NS == 10 && ds4_gpu_tensor_read(o[1][0], 0, sel, sizeof(sel)), "router ties read");
+        for (unsigned i = 0; i < NS; i++) {
+            require_ok(sel[i] == (int32_t)(4 + 5 * i), "router ties: lowest experts among equals");
+            require_ok(sel[NS + i] == (int32_t)i, "router ties: all equal picks the first experts");
+            require_ok(sel[3 * NS + i] % 2 == 1, "router ties: zero probabilities after the finite ones");
+            require_ok(sel[4 * NS + i] == (int32_t)i, "router ties: all NaN falls back to the slot");
+        }
+        require_ok(sel[2 * NS] == 7 && sel[2 * NS + 1] == 300 && sel[2 * NS + 2] == 511 && sel[2 * NS + 3] == 0,
+                   "router ties: zeros after the finite experts");
+        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 3; j++) ds4_gpu_tensor_free(o[v][j]);
+        ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(x); free(input); free(logits);
+    }
+    puts("  router: preload and BF16 gates byte-exact at T=1..13; GDN gates BF16 at T=1..31; ties and NaN rows exact");
 }
 #endif
 
