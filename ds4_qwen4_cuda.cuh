@@ -101,6 +101,24 @@ __device__ __forceinline__ void bulk_wait(uint64_t *bar) {
 #endif
 }
 
+/* Further phases of a barrier bulk_start() initialized: each phase expects
+ * one more copy's bytes, and bulk_wait_phase(bar, i) waits for phase i. */
+__device__ __forceinline__ void bulk_expect(uint64_t *bar, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(smem_addr(bar)), "r"(bytes) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void bulk_wait_phase(uint64_t *bar, unsigned phase) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("{\n\t.reg .pred p;\n"
+                 "WAIT%=:\n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+                 "@!p bra WAIT%=;\n}" :: "r"(smem_addr(bar)), "r"(phase & 1u) : "memory");
+#endif
+}
+
 /* Dynamic shared memory a launch may request without opting in through
  * cudaFuncSetAttribute(MaxDynamicSharedMemorySize) is 48 KiB less the
  * kernel's static shared memory.  SPLIT_BULK_STATIC_SMEM bounds that of
@@ -128,6 +146,20 @@ static bool bulk_supported() {
  * occupancy across several waves.  The tests-only *_ref_tensor entry points
  * run the plain kernels at every T as the byte-exact reference. */
 static bool presync_load(unsigned T) { return T <= 3; }
+
+/* Pieces each matvec_q8_bulk block's copy goes out in: one row at a time
+ * (2) by default, so at most half of a projection's 16.7 MB is in flight
+ * at once and the latency-bound kernels running under it keep their
+ * memory latency; DS4_QWEN4_BULK_PHASES=1 or 4 overrides (4 is slower). */
+static unsigned bulk_phases() {
+    static int phases = -1;
+    if (phases < 0) {
+        const char *env = getenv("DS4_QWEN4_BULK_PHASES");
+        const int v = env && env[0] ? atoi(env) : 2;
+        phases = v == 1 || v == 4 ? v : 2;
+    }
+    return (unsigned)phases;
+}
 
 /* Single-token decode lets the HC down projection after hc_norm launch only
  * after the norm reduction (the MTP verify rows gained nothing from it). */
@@ -2057,20 +2089,32 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
  * are resident, and its rows stream, while those latency-bound kernels run.
  * Two rows per block keep every block of a 2560-row projection resident
  * at once.  Same per-lane order and fused multiply-adds as matvec_q8.
- * 2 * stride bytes of dynamic shared memory; rows are 16-byte multiples. */
+ * 2 * stride bytes of dynamic shared memory; rows are 16-byte multiples.
+ * The copy goes out in `phases` sequential pieces (each issued when the
+ * previous one has landed) when that divides it into 16-byte multiples,
+ * which bounds the bytes the whole grid has in flight at once. */
 template<unsigned ROWS>
 __global__ void __launch_bounds__(64) matvec_q8_bulk(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned phases) {
     extern __shared__ __align__(16) unsigned char wsm[];
     __shared__ __align__(8) uint64_t bar;
     const unsigned row0 = blockIdx.x * 2, nr = min(2u, M - row0), lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const unsigned bytes = (unsigned)(nr * stride);
+    unsigned ph = phases;
+    while (ph > 1 && bytes % (16u * ph)) ph >>= 1;
     if (!threadIdx.x) {
-        bulk_start(&bar, (unsigned)(nr * stride));
-        bulk_copy(wsm, w + (uint64_t)row0 * stride, (unsigned)(nr * stride), &bar);
+        const unsigned chunk = bytes / ph;
+        bulk_start(&bar, chunk);
+        bulk_copy(wsm, w + (uint64_t)row0 * stride, chunk, &bar);
+        for (unsigned i = 1; i < ph; i++) {
+            bulk_wait_phase(&bar, i - 1);
+            bulk_expect(&bar, chunk);
+            bulk_copy(wsm + i * chunk, w + (uint64_t)row0 * stride + i * chunk, chunk, &bar);
+        }
     }
     pdl_enter();
     __syncthreads();
-    bulk_wait(&bar);
+    bulk_wait_phase(&bar, ph - 1);
     if (warp >= nr) return;
     float acc[ROWS] = {};
     q8_row_acc<ROWS>(acc, (const char *)wsm + warp * stride, x, T, K);
@@ -2498,7 +2542,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
          * head (330 waves of blocks) keeps the plain kernel */
         if (!ref && presync_load(T) && M < 65536 && bulk_supported() && !(stride & 15) && !((uintptr_t)w & 15) &&
             2 * stride + 64 <= BULK_DYN_SMEM_LIMIT) {
-#define QWEN_Q8_BULK(N) launch(matvec_q8_bulk<N>, (M+1)/2, 64, (size_t)stride * 2, out,w,x,T,K,M,stride)
+#define QWEN_Q8_BULK(N) launch(matvec_q8_bulk<N>, (M+1)/2, 64, (size_t)stride * 2, out,w,x,T,K,M,stride,bulk_phases())
             if (T == 1) { QWEN_Q8_BULK(1); }
             else if (T == 2) { QWEN_Q8_BULK(2); }
             else { QWEN_Q8_BULK(4); }
