@@ -87,3 +87,67 @@ Both nsys captures of main show the session bench stalling 0.4–0.5 ms per toke
 - End to end: `rf-xab A B --rounds 1 --pairs 2 [--mtp] --prompt-file ...`, i.e. A, B, B, A processes, each a warm-up block then 2 pairs; the table reports the mean of each build's two processes.
 - Profiles: `rf-nsys` (session bench, 1 stream, 64 generated after 16 warm-up, PDL on, 32 captured steps), per-kernel incremental cost from `timeline.py`.
 - GPU runs held an exclusive gpuq lease; the model server was stopped.
+
+# Second series: paced copies and router keys
+
+Two more commits on top of `c120d4a`, measured on the same GPU after its move to bare metal (host `voyage`: RTX PRO 6000 Blackwell Workstation Edition at 450 W, NVMe, 96 GB; the tables above were taken in the `inf` VM, so absolute t/s differ slightly and nothing below is compared across hosts). Both changes are bit-identical by construction and the greedy output is unchanged on every prompt; the kernel tests pass.
+
+| Commit | Change |
+|---|---|
+| paced copies | `matvec_q8_bulk` issues each block's copy as two sequential mbarrier phases (one weight row each) instead of one 13 KB copy, so at most half of a projection's 16.7 MB is in flight at once (`DS4_QWEN4_BULK_PHASES` selects 1, 2 or 4). |
+| router keys | `router_pre` selects the ten experts on integer keys (`float_as_uint(p) + 1`, 0 for NaN or none) with one `__reduce_max_sync` and one `__reduce_min_sync` per pick instead of a five-round compare-and-swap shuffle; the same total order (probability descending, expert ascending, NaN never, slot index with weight 0 when nothing is left). |
+
+## End to end
+
+Cross-binary ABBA as in the first series, two rounds of A, B, B, A processes with 2 pairs each; raw data in [`end-to-end.csv`](end-to-end.csv), `final-voyage` rows.
+
+| Prompt | Plain series → stack t/s | Change | MTP series → stack t/s | Change |
+|---|---:|---:|---:|---:|
+| code | 177.60 → 178.25 | +0.36% | 261.42 → 263.94 | +0.96% |
+| prose | 177.06 → 177.80 | +0.42% | 206.19 → 207.51 | +0.64% |
+| longcode (~3K tokens, sparse attention) | 171.98 → 172.20 | +0.13% | 212.11 → 213.49 | +0.65% |
+| longdoc (~3K tokens, sparse attention) | 171.54 → 171.81 | +0.16% | 219.09 → 220.42 | +0.60% |
+
+
+Each change alone, one round, same host (`end-to-end.csv`, rows named by the change):
+
+| Change (A → B) | code plain | prose plain | code MTP | prose MTP | longcode plain | longdoc plain | longcode MTP | longdoc MTP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| paced copies, 2 phases (series tip → +pace) | −0.04% | −0.04% | +0.70% | +0.34% | −0.20% | −0.14% | +0.23% | +0.25% |
+| router keys (attention-tile build → +router) | +0.43% | +0.43% | +0.24% | +0.27% | | | | |
+
+## Per-kernel cost
+
+Nsight Systems as before (session bench, one stream, 29 steady tokens, incremental cost per token), series tip and stack captured in the same job on `voyage`; raw data in [`kernel-classes-voyage.csv`](kernel-classes-voyage.csv).
+
+The stack's per-token totals are 5612.8 µs at ctx 256 and 5811.9 at ctx 4096. The series-tip captures of this job were cold (0.3–0.7 ms per token of n-gram page reads in `stage_host`, which also lands on the `hc_norm_pre` row), so their totals are not comparable; the warm series-tip captures of the earlier jobs on this host read 5593.7 and 5791.2. The classes that moved, µs per launch, series tip → stack:
+
+| Kernel | ctx 256 series | ctx 256 stack | ctx 4096 series | ctx 4096 stack | Note |
+|---|---:|---:|---:|---:|---|
+| GDN / attention output projection (`matvec_q8_bulk`, 2560 rows; the 12288-row q projection shares the class) | 7.62 | 11.77 | 7.76 | 11.79 | its copy lands in two round trips |
+| `router_pre` | 3.17 | 2.64 | 3.18 | 2.65 | key-based selection |
+| `attn_prep` | 10.62 | 6.60 | 6.83 | 4.92 | under the attention output projection's stream |
+| `gdn_prep` | 3.21 | 1.90 | 2.97 | 1.72 | under the GDN output projection's stream |
+| `gdn_scan` | 4.09 | 3.74 | 4.04 | 3.69 | same |
+| `gdn_out` | 1.31 | 1.19 | 1.30 | 1.19 | same |
+| `attention_group` | 8.22 | 8.01 | 12.08 | 11.40 | its key/value tiles under the stream |
+| `idx_select` |  |  | 7.43 | 6.73 | sparse path only |
+| `attn_merge` | 2.27 | 2.07 | 5.26 | 5.18 |  |
+
+The profile and the end-to-end numbers disagree by about 20 µs per token on the sign: in the profile the projection's +250 µs per token is paid back by the kernels under its stream and by the router only within the capture noise, while the ABBA, which is the arbiter, is positive on every prompt and mode.
+
+
+## What pacing moves
+
+Two phases per block halve the bytes in flight. At ctx 256 the kernels running under the attention output projection's stream recover most of what the first series charged them: `attn_prep` 10.2 → 6.3 µs per launch, `gdn_prep` 3.8 → 1.9, `gdn_scan` 4.1 → 3.7, `attention_group` 8.2 → 7.9; the projection itself rises from 7.6 to 11.8 µs per launch, because its own copy now takes two round trips and the window in front of it (the GDN chain, 5.6 µs) no longer hides all of it. Net −14 µs per token at ctx 256 and +7 at ctx 4096 in the profiles; end to end within ±0.2% plain and +0.23 to +0.70% MTP, whose verify rows run more of the small kernels under the stream. Four phases recover more (`attn_prep` 4.3, `gdn_prep` 1.2) but cost the projection 14.0 µs per launch: +7 µs per token at ctx 256 against the series tip, dropped.
+
+## Exactness
+
+- `tests/test_qwen4_cuda` passes. `test_router_paths` compares `router_pre` with the reference `router()` byte for byte at T = 1..13 and now also on tie rows: the top probability shared by a fifth of the experts, every expert equal, three experts above a floor of zeros, −inf logits at every even expert, and an all-NaN row (one NaN logit makes the softmax sum NaN, so both kernels select experts 0..9 with weight 0). `test_presync_load` compares the paced copies with the plain kernel byte for byte at the three phase counts.
+- Every ABBA block of every prompt gives the same 256-token hash on the series tip and on the stack, plain and MTP.
+
+## Tried and dropped
+
+- **The attention value tile requested together with the key tile** (`attention_group`: a second 16.5 KB tile, so the key and value rows of a tile go out as two `cp.async` groups and the tile costs one DRAM round trip; 55 KB per block with the static part, dynamic shared memory with the opt-in above 48 KiB). Byte-identical, but no faster: at ctx 256 the kernel went from 8.5 to 8.2 µs per launch (−10 µs per token in the profile, ±0.0% end to end), and at ctx 4096 it first went from 12.3 to 16.0 µs. The request order is not the reason: a build that selects it per launch (values after the softmax as before, both before the query scaling, both after it) gives 196.4, 195.6 and 195.4 µs per token, all the same. The reason is the L1/shared-memory carveout: for a 55 KB block the driver picks a smaller carveout than the one the staged projections beside it run under (up to seven 13 KB blocks per SM), and the SM reconfigures between the two kernels; with `cudaFuncAttributePreferredSharedMemoryCarveout = cudaSharedmemCarveoutMaxShared` on the kernel the cost returns to 12.5 µs per launch. Even so the 55 KB footprint halves the resident blocks once the MTP verify rows' grid exceeds the SM count (3 rows × 2 KV heads × 64 splits), and the full ABBA against the series tip sums negative: ±0.0% plain and +0.16/+0.17% MTP on the short prompts, −0.04/−0.08% plain and −0.54/−0.63% MTP on the ~3K-token prompts (`end-to-end.csv`, `kv-carveout-voyage`; the `kv-no-carveout-inf` rows are the same change before the carveout fix, −0.5% plain and −0.9% MTP on the long prompts). The carveout lesson stands for any decode kernel above 48 KB of shared memory.
+- **The indexer's three launches as one** (`idx_fused`: 256-thread blocks score eight pooled block keys each, count their arrival, and the last block to arrive runs the radix select and the expansion, reading the scores through L2). Byte-identical to the three kernels, but the one launch costs 12.6 µs at ctx 4096 against 7.2 + 2.5 + 2.0 for the three: the select starts only after the last scoring block's fence and atomic, where before it was resident and waiting at its dependency; end to end −0.12/−0.33% plain and −0.09/−0.09% MTP on the ~3K-token prompts (`fused-indexer-voyage` rows).
+- **Four copy phases**: see above.
