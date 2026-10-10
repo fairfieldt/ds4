@@ -2390,6 +2390,10 @@ typedef struct {
     uint64_t bytes;
 } ds4_tensor;
 
+/* Qwen n-gram rows: original BF16, or 8-bit rows of an F32 scale followed by
+ * 160 E4M3 or int8 codes, stored as a GGUF I8 tensor. */
+enum { DS4_NGRAM_BF16, DS4_NGRAM_E4M3_ROW, DS4_NGRAM_I8_ROW };
+
 typedef struct ds4_model {
     int fd;
     const uint8_t *map;
@@ -2408,6 +2412,8 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    uint32_t ngram_width, ngram_row_bytes;
+    uint8_t ngram_encoding;
 #ifndef __APPLE__
     struct qwen4_ngram_pool *ngram_pool;
 #endif
@@ -2815,14 +2821,23 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "qwen4exp")) return;
     const ds4_tensor *table = NULL;
+    ds4_str encoding = {0};
+    uint8_t format = DS4_NGRAM_BF16;
+    if (model_get_string(m, "qwen4exp.ple.ngram_encoding", &encoding)) {
+        if (ds4_streq(encoding, "e4m3_f32row")) format = DS4_NGRAM_E4M3_ROW;
+        else if (ds4_streq(encoding, "i8_f32row")) format = DS4_NGRAM_I8_ROW;
+        else ds4_die("unsupported Qwen n-gram encoding");
+    }
     uint64_t resident_end = m->tensor_data_pos;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
-            if (table || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
-                !t->dim[0] || t->dim[0] > 160 || !t->dim[1] || t->dim[1] > UINT32_MAX)
-                ds4_die("Qwen requires original BF16 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+            const bool bf16 = format == DS4_NGRAM_BF16;
+            if (table || t->type != (bf16 ? DS4_TENSOR_BF16 : DS4_TENSOR_I8) || t->ndim != 2 ||
+                t->dim[0] < (bf16 ? 1u : 5u) || t->dim[0] > (bf16 ? 160u : 164u) ||
+                !t->dim[1] || t->dim[1] > UINT32_MAX)
+                ds4_die("Qwen requires BF16 or 8-bit row n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
             table = t;
         } else {
             if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
@@ -2845,13 +2860,16 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
         close(fd);
         ds4_die("Qwen GGUF changed while opening its n-grams");
     }
+    /* The 8-bit tables are half the size so they can stay in the page cache;
+     * only the BF16 table bypasses or deprioritizes it. */
 #ifdef __APPLE__
-    if (fcntl(fd, F_NOCACHE, 1) || fcntl(fd, F_RDAHEAD, 0))
+    if ((format == DS4_NGRAM_BF16 && fcntl(fd, F_NOCACHE, 1)) || fcntl(fd, F_RDAHEAD, 0))
         ds4_die_errno("cannot configure n-gram disk reads", path);
 #elif defined(POSIX_FADV_RANDOM)
     (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_RANDOM);
 #ifdef POSIX_FADV_NOREUSE
-    (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
+    if (format == DS4_NGRAM_BF16)
+        (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
 #endif
 #endif
     if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
@@ -2859,6 +2877,9 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     m->size = table->abs_offset;
     m->ngram_fd = fd;
     m->ngram_tensor = table;
+    m->ngram_encoding = format;
+    m->ngram_row_bytes = (uint32_t)(format == DS4_NGRAM_BF16 ? table->dim[0] * 2u : table->dim[0]);
+    m->ngram_width = (uint32_t)(format == DS4_NGRAM_BF16 ? table->dim[0] : table->dim[0] - 4u);
 #ifndef __APPLE__
     m->ngram_pool = qwen4_ngram_pool_new();
 #endif
@@ -5540,11 +5561,13 @@ static void weights_validate_qwen4_layout(
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_BF16) {
-            fprintf(stderr, "ds4: n-gram embeddings must use original BF16, got type %u\n", t);
+        if (t != DS4_TENSOR_BF16 && t != DS4_TENSOR_I8) {
+            fprintf(stderr, "ds4: n-gram embeddings must use BF16 or 8-bit rows, got type %u\n", t);
             exit(1);
         }
-        if (w->ple_embd->ndim != 2 || w->ple_embd->dim[0] != DS4_N_PLE_HEAD_DIM ||
+        /* The loader already matched an I8 table to its encoding: F32 scale, then codes. */
+        const uint64_t width = w->ple_embd->dim[0] - (t == DS4_TENSOR_I8 ? 4u : 0u);
+        if (w->ple_embd->ndim != 2 || width != DS4_N_PLE_HEAD_DIM ||
             w->ple_embd->dim[1] < g_ds4_qwen4_ple.n_rows) {
             fprintf(stderr, "ds4: per_layer_token_embd layout [%" PRIu64 ", %" PRIu64 "] does not "
                     "cover %u x %" PRIu64 " hash rows\n",
@@ -58132,15 +58155,28 @@ static int generate_glm_metal_argmax(
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
+/* E4M3FN: bias 7, no infinities, 0x7f and 0xff are NaN. */
+static float qwen4_e4m3(uint8_t byte) {
+    const uint32_t exponent = (byte >> 3) & 15u, mantissa = byte & 7u;
+    float value;
+    if (exponent) {
+        const uint32_t bits = (exponent + 120u) << 23 | mantissa << 20;
+        memcpy(&value, &bits, sizeof(value));
+    } else {
+        value = (float)mantissa * 0x1p-9f;
+    }
+    return byte & 128 ? -value : value;
+}
+
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
-        t->type != DS4_TENSOR_BF16 || !t->dim[0] || t->dim[0] > 160) {
+        !m->ngram_width || m->ngram_width > 160 || m->ngram_row_bytes > 320) {
         errno = EINVAL;
         return false;
     }
     uint8_t raw[320];
-    const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
+    const uint32_t bytes = m->ngram_row_bytes;
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
@@ -58151,6 +58187,29 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
             return false;
         }
         done += (uint32_t)n;
+    }
+    if (m->ngram_encoding != DS4_NGRAM_BF16) {
+        float scale;
+        uint32_t bits = (uint32_t)raw[0] | (uint32_t)raw[1] << 8 |
+                        (uint32_t)raw[2] << 16 | (uint32_t)raw[3] << 24;
+        memcpy(&scale, &bits, sizeof(scale));
+        if (!(scale >= 0.0f) || (bits & 0x7f800000u) == 0x7f800000u) {
+            errno = EDOM;
+            return false;
+        }
+        const uint8_t *code = raw + 4;
+        if (m->ngram_encoding == DS4_NGRAM_I8_ROW) {
+            for (uint32_t i = 0; i < m->ngram_width; i++) out[i] = (float)(int8_t)code[i] * scale;
+            return true;
+        }
+        for (uint32_t i = 0; i < m->ngram_width; i++) {
+            if ((code[i] & 127u) == 127u) {
+                errno = EDOM;
+                return false;
+            }
+            out[i] = qwen4_e4m3(code[i]) * scale;
+        }
+        return true;
     }
     for (size_t i = 0; i < t->dim[0]; i++) {
         uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
@@ -58168,7 +58227,7 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
  * parallel; a cached row costs one cheap syscall. */
 static void qwen4_ngram_prefetch(const ds4_model *m, uint32_t row) {
 #if defined(POSIX_FADV_WILLNEED) && !defined(__APPLE__)
-    const uint64_t bytes = (uint64_t)m->ngram_tensor->dim[0] * 2u;
+    const uint64_t bytes = m->ngram_row_bytes;
     (void)posix_fadvise(m->ngram_fd, (off_t)(m->ngram_tensor->abs_offset + (uint64_t)row * bytes),
                         (off_t)bytes, POSIX_FADV_WILLNEED);
 #else
@@ -58194,7 +58253,7 @@ static int qwen4_ngram_order(const void *a, const void *b) {
 static void qwen4_ngram_part(void *context, size_t part) {
     qwen4_ngram_batch *b = context;
     const size_t begin = b->count * part / b->readers, end = b->count * (part+1) / b->readers;
-    const size_t width = b->model->ngram_tensor->dim[0];
+    const size_t width = b->model->ngram_width;
     for (size_t i = begin; i < end; i++) {
         if (i == begin || b->request[i].row != b->request[i-1].row)
             qwen4_ngram_prefetch(b->model, b->request[i].row);
@@ -58326,7 +58385,7 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
         if (count > 1)
             for (size_t i = 0; i < count; i++) qwen4_ngram_prefetch(m, rows[i]);
         for (size_t i = 0; i < count; i++)
-            if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_tensor->dim[0])) return false;
+            if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_width)) return false;
         return true;
     }
 #endif
@@ -58339,7 +58398,7 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
         for (size_t i = 0; i < n; i++) request[i] = (qwen4_ngram_request){rows[off+i], (uint32_t)i};
         qsort(request, n, sizeof(*request), qwen4_ngram_order);
         qwen4_ngram_batch batch = {.model = m, .request = request, .count = n,
-            .out = out + off * m->ngram_tensor->dim[0], .readers = 16};
+            .out = out + off * m->ngram_width, .readers = 16};
 #ifdef __APPLE__
         batch.readers = n < 16 ? n : 16;
         dispatch_apply_f(batch.readers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
@@ -58578,8 +58637,8 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
         return false;
     }
-    if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
-        fprintf(stderr, "ds4: Qwen3.8 requires original BF16 n-grams in the model GGUF\n");
+    if (!w->ple_embd || (w->ple_embd->type != DS4_TENSOR_BF16 && w->ple_embd->type != DS4_TENSOR_I8)) {
+        fprintf(stderr, "ds4: Qwen3.8 requires BF16 or 8-bit row n-grams in the model GGUF\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -72339,8 +72398,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_output,
                  load_output_optional);
     if (e->model.ngram_tensor) {
-        fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
-                (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
+        const uint8_t format = e->model.ngram_encoding;
+        fprintf(stderr, "ds4: Qwen %s n-grams: %.2f GiB, %s\n",
+                format == DS4_NGRAM_E4M3_ROW ? "E4M3" : format == DS4_NGRAM_I8_ROW ? "int8" : "BF16",
+                (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0),
+                format == DS4_NGRAM_BF16 ? "disk reads only" : "read through the page cache");
     }
     if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
