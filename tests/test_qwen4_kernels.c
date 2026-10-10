@@ -916,6 +916,59 @@ static void test_idx_select_exact(uint32_t T, uint32_t n, uint32_t k, uint32_t v
     printf("  %-44s ok\n", name);
     free(a); free(b); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gs); free(sc);
 }
+
+/* k - 1 keys above one 12-bit key bin that holds `in_bin` keys (distinct, or
+ * all equal), the rest below it: bins at the long-row selection's gather
+ * capacity resolve from shared memory or from the scores, with one result. */
+static void test_idx_select_bin(uint32_t n, uint32_t k, uint32_t in_bin, bool equal) {
+    float *sc = malloc((uint64_t)n * 4);
+    int32_t *a = malloc((uint64_t)k * 4), *b = malloc((uint64_t)k * 4);
+    require_ok(sc && a && b && k - 1 + in_bin <= n, "idx select bin alloc");
+    for (uint32_t i = 0; i < n; i++) sc[i] = 0.25f;
+    for (uint32_t j = 0; j < k - 1; j++) sc[(uint64_t)j * n / (k - 1 + in_bin)] = 4.0f;
+    for (uint32_t j = 0; j < in_bin; j++) {
+        uint32_t bits = 0x3f800000u + (equal ? 0u : (j * 7919u) % in_bin * 8u);   /* 1.0f + j * 2^-20 */
+        float v;
+        memcpy(&v, &bits, 4);
+        sc[(uint64_t)(k - 1 + j) * n / (k - 1 + in_bin)] = v;
+    }
+    ds4_gpu_tensor *gs = upload(sc, n);
+    ds4_gpu_tensor *ga = ds4_gpu_tensor_alloc((uint64_t)k * 4);
+    require_ok(gs && ga && ds4_gpu_qwen4_idx_select_tensor(ga, gs, NULL, n, 1, k), "idx select bin");
+    require_ok(ds4_gpu_tensor_read(ga, 0, a, (uint64_t)k * 4), "idx select bin read");
+    idx_select_cpu(b, sc, n, k);
+    char name[96];
+    snprintf(name, sizeof(name), "idx select bin n=%u k=%u in_bin=%u%s", n, k, in_bin, equal ? " equal" : "");
+    require_ok(memcmp(a, b, (uint64_t)k * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(a); free(b); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gs); free(sc);
+}
+
+/* Rows whose top keys crowd a few groups: ascending scores (all of the top
+ * k in the last k / 32 groups) and random scores with the latest blocks
+ * boosted, as recency would. */
+static void test_idx_select_shape(uint32_t T, uint32_t n, uint32_t k, bool ascending) {
+    float *sc = rand_vec((uint64_t)T * n, 4.0f);
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t b = 0; b < n; b++) {
+            float *v = &sc[(uint64_t)t * n + b];
+            if (ascending) *v = (float)b * 0.01f + (float)t;
+            else *v = fabsf(*v) + (b + 3000u >= n ? 8.0f : 0.0f);
+        }
+    }
+    ds4_gpu_tensor *gs = upload(sc, (uint64_t)T * n);
+    ds4_gpu_tensor *ga = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
+    int32_t *a = malloc((uint64_t)T * k * 4), *b = malloc((uint64_t)T * k * 4);
+    require_ok(gs && ga && a && b, "idx select shape alloc");
+    require_ok(ds4_gpu_qwen4_idx_select_tensor(ga, gs, NULL, n, T, k), "idx select shape");
+    require_ok(ds4_gpu_tensor_read(ga, 0, a, (uint64_t)T * k * 4), "idx select shape read");
+    for (uint32_t t = 0; t < T; t++) idx_select_cpu(b + (uint64_t)t * k, sc + (uint64_t)t * n, n, k);
+    char name[96];
+    snprintf(name, sizeof(name), "idx select %s T=%u n=%u k=%u", ascending ? "ascending" : "recent", T, n, k);
+    require_ok(memcmp(a, b, (uint64_t)T * k * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(a); free(b); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gs); free(sc);
+}
 #endif
 
 static void test_idx_select_exact_all(void) {
@@ -931,6 +984,23 @@ static void test_idx_select_exact_all(void) {
     test_idx_select_exact(2, 300, 1, 300, 0);
     test_idx_select_exact(2, 300, 300, 300, 2);
     test_idx_select_exact(2, 3000, 511, 1500, 17);
+    /* long-context rows, up to a million tokens of context */
+    const uint32_t long_ns[] = { 50001, 65536, 131071, 262144 };
+    for (unsigned i = 0; i < sizeof(long_ns) / sizeof(long_ns[0]); i++) {
+        test_idx_select_exact(3, long_ns[i], 512, long_ns[i], 0);
+        test_idx_select_exact(2, long_ns[i], 512, long_ns[i] - long_ns[i] / 5, 0);
+        test_idx_select_exact(1, long_ns[i], 512, long_ns[i], 3);
+        test_idx_select_exact(1, long_ns[i], 512, long_ns[i], 1);
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        test_idx_select_shape(2, 4097, 512, i == 0);
+        test_idx_select_shape(2, 50001, 512, i == 0);
+        test_idx_select_shape(1, 262144, 512, i == 0);
+    }
+    for (uint32_t in_bin = 2047; in_bin <= 2049; in_bin++) {
+        test_idx_select_bin(50000, 512, in_bin, false);
+        test_idx_select_bin(50000, 512, in_bin, true);
+    }
 #endif
 }
 
@@ -2044,15 +2114,27 @@ static void test_idx_prefilter(void) {
                     require_ok(ds4_gpu_tensor_write(gtm, 0, tm, (uint64_t)T * n_tiles * 4), "tie tiles upload");
                 }
                 ds4_gpu_tensor *gfull = ds4_gpu_tensor_alloc((uint64_t)T * k * 4), *gpre = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
+#ifdef __APPLE__
                 setenv("DS4_QWEN4_IDX_PREFILTER", "0", 1);
                 require_ok(gfull && gpre && ds4_gpu_qwen4_idx_select_tensor(gfull, gs1, gtm, n, T, k), "full select");
                 setenv("DS4_QWEN4_IDX_PREFILTER", "1", 1);
+#else
+                /* CUDA reads the tile maxima whenever it is given them */
+                require_ok(gfull && gpre && ds4_gpu_qwen4_idx_select_tensor(gfull, gs1, NULL, n, T, k), "full select");
+#endif
                 require_ok(ds4_gpu_qwen4_idx_select_tensor(gpre, gs1, gtm, n, T, k), "prefiltered select");
                 unsetenv("DS4_QWEN4_IDX_PREFILTER");
                 int32_t *full = malloc((uint64_t)T * k * 4), *pre = malloc((uint64_t)T * k * 4);
                 require_ok(ds4_gpu_tensor_read(gfull, 0, full, (uint64_t)T * k * 4) &&
                            ds4_gpu_tensor_read(gpre, 0, pre, (uint64_t)T * k * 4), "select read");
                 require_ok(memcmp(full, pre, (uint64_t)T * k * 4) == 0, "prefiltered select matches the full select");
+#ifndef __APPLE__
+                for (uint32_t t = 0; t < T; t++) {
+                    idx_select_cpu(full + (uint64_t)t * k, s1 + (uint64_t)t * n, n, k);
+                    require_ok(memcmp(full + (uint64_t)t * k, pre + (uint64_t)t * k, (uint64_t)k * 4) == 0,
+                               "prefiltered select matches the CPU layout");
+                }
+#else
                 /* A scalar-scorer override leaves tile maxima stale. Poison
                  * them and require the full selector fallback to remain exact. */
                 setenv("DS4_QWEN4_IDX_SCORE_VEC", "0", 1);
@@ -2066,6 +2148,7 @@ static void test_idx_prefilter(void) {
                 require_ok(memcmp(full, pre, (uint64_t)T * k * 4) == 0, "scalar override ignores stale tile maxima");
                 setenv("DS4_QWEN4_IDX_SCORE_VEC", "1", 1);
                 unsetenv("DS4_QWEN4_IDX_PREFILTER");
+#endif
                 free(full); free(pre);
                 ds4_gpu_tensor_free(gfull); ds4_gpu_tensor_free(gpre);
             }
@@ -4389,6 +4472,47 @@ static void test_presync_load(arena_t *a) {
 }
 #endif
 
+/* DS4_TEST_QWEN4_IDX_SELECT_BENCH=1: one selection launch per row length
+ * (DS4_QWEN4_SELECT_WIDE_MIN picks the kernel), on relu rows */
+typedef struct { ds4_gpu_tensor *score, *sel, *tiles; uint32_t n, T; } select_bench;
+static int bench_select_one(void *ud) {
+    select_bench *c = ud;
+    return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, NULL, c->n, c->T, 512);
+}
+static int bench_select_tiles(void *ud) {
+    select_bench *c = ud;
+    return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tiles, c->n, c->T, 512);
+}
+
+static void bench_idx_select(void) {
+    const uint32_t ns[] = { 1024, 2048, 4096, 8192, 16384, 32768, 50000, 65536, 131072, 262144 };
+    for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        for (uint32_t T = 1; T <= 3; T += 2) {
+            const uint32_t n = ns[i];
+            float *sc = rand_vec((uint64_t)T * n, 4.0f);
+            for (uint64_t j = 0; j < (uint64_t)T * n; j++) if (sc[j] < 0.0f) sc[j] = 0.0f;
+            const uint32_t nt = (n + 7) / 8;
+            uint32_t *tm = calloc((uint64_t)T * nt, 4);
+            require_ok(tm != NULL, "select bench tiles");
+            for (uint32_t t = 0; t < T; t++)
+                for (uint32_t b = 0; b < n; b++) {
+                    uint32_t key; memcpy(&key, &sc[(uint64_t)t * n + b], 4);
+                    if (key > tm[(uint64_t)t * nt + b / 8]) tm[(uint64_t)t * nt + b / 8] = key;
+                }
+            select_bench c = { upload(sc, (uint64_t)T * n), ds4_gpu_tensor_alloc((uint64_t)T * 512 * 4),
+                               ds4_gpu_tensor_alloc((uint64_t)T * nt * 4), n, T };
+            require_ok(c.score && c.sel && c.tiles && ds4_gpu_tensor_write(c.tiles, 0, tm, (uint64_t)T * nt * 4),
+                       "select bench alloc");
+            char name[64];
+            snprintf(name, sizeof(name), "idx select n=%u T=%u", n, T);
+            bench_run(name, bench_select_one, &c, n >= 65536 ? 50 : 200);
+            snprintf(name, sizeof(name), "idx select tiles n=%u T=%u", n, T);
+            bench_run(name, bench_select_tiles, &c, n >= 65536 ? 50 : 200);
+            ds4_gpu_tensor_free(c.score); ds4_gpu_tensor_free(c.sel); ds4_gpu_tensor_free(c.tiles); free(sc); free(tm);
+        }
+    }
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -4437,6 +4561,7 @@ int main(void) {
         return 0;
     }
     if (getenv("DS4_TEST_QWEN4_IDX_SELECT_ONLY")) { test_idx_select_exact_all(); printf("all qwen4 idx select tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_IDX_SELECT_BENCH")) { bench_idx_select(); return 0; }
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
