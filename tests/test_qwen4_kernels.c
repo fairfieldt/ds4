@@ -4232,12 +4232,14 @@ static void test_presync_load(arena_t *a) {
         {1u, 24320u, 9u}, {1u, 24448u, 9u},   /* the largest bulk row, then the fallback */
         {0u, 2560u, 512u}, {0u, 2560u, 48u}, {0u, 8192u, 40u}, {0u, 1152u, 9u},
         {30u, 2560u, 512u}, {30u, 2560u, 48u}, {30u, 1152u, 9u},
+        {8u, 6144u, 2560u}, {8u, 2560u, 12288u}, {8u, 2560u, 1537u}, {8u, 2560u, 2561u},  /* staged Q8 rows, odd M */
     };
     const uint32_t tokens[] = {1u, 2u, 3u, 5u, 8u};
     for (uint32_t s = 0; s < sizeof(mv) / sizeof(mv[0]); s++) {
         const uint32_t type = mv[s][0] == 30u ? 0u : mv[s][0], K = mv[s][1], M = mv[s][2];
         double *shadow = NULL;
-        const uint64_t off = type ? arena_f16(a, (uint64_t)M * K, &shadow, 0.05f)
+        const uint64_t off = type == 8u ? arena_q8_0(a, M, K, &shadow, 0.1f)
+                           : type ? arena_f16(a, (uint64_t)M * K, &shadow, 0.05f)
                                   : arena_f32(a, (uint64_t)M * K, &shadow, -0.05f, 0.05f);
         free(shadow);
         if (mv[s][0] == 30u) {
