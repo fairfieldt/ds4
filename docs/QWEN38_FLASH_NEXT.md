@@ -202,6 +202,10 @@ for collection settings, measurements and the hosted-checkpoint limitations.
 
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.
+The CUDA decode series on the RTX PRO 6000 are recorded in
+[fused decode](../speed-bench/qwen-cuda-6000/README.md),
+[roofline](../speed-bench/qwen-cuda-6000-roofline/README.md) and
+[staged projections](../speed-bench/qwen-cuda-6000-staging/README.md).
 
 Qwen prefill checkpoints include matching logits at each completed chunk,
 including cancellation frontiers. To test save/restore and continuation:
