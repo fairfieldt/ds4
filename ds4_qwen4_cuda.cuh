@@ -122,6 +122,8 @@ static bool presync_load(unsigned T) { return T <= 3; }
  * after the norm reduction (the MTP verify rows gained nothing from it). */
 static unsigned hc_norm_late(unsigned T) { return T == 1; }
 
+
+
 /* Reports the virtual architecture these kernels were compiled for. */
 __global__ void pdl_probe() {}
 
@@ -3335,37 +3337,18 @@ static int vis_mm_launch(void *out, const __half *x, const char *w, unsigned typ
     return launched();
 }
 
-/* PRE loads this thread's gamma and injection weights of the first chunk
- * iteration before the dependency wait, so they are not queued behind the
- * weight copies of the HC down projection that follows.  With late, PRE
- * lets that projection launch only after the norm reduction, so its weight
- * copies overlap the second pass instead of both. */
-template<unsigned TYPE, bool COMBINE = false, bool PRE = false>
+/* The decode kernels (T <= 8 rows): 8 chunk blocks per stream, each
+ * normalizing the whole stream row and then producing its chunk of xn and
+ * the chunk's ni injection partials.  This one is the reference (and the
+ * fallback for rows too wide for hc_norm_pre's shared memory). */
+template<unsigned TYPE, bool COMBINE = false>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned E, unsigned hc,
-                        unsigned ni, float eps, float *next, const float *blk, const float *oldinj,
-                        unsigned late) {
+                        unsigned ni, float eps, float *next, const float *blk, const float *oldinj) {
+    pdl_enter();
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per), first = chunk * per + tid;
-    float gp[4] = {}, wp[4][4] = {};
-    if (PRE) {
-        #pragma unroll
-        for (unsigned k = 0; k < 4; k++) {
-            const unsigned i = first + k * blockDim.x;
-            if (i < end) {
-                gp[k] = ldg_pre(gamma + stream * E + i);
-                #pragma unroll
-                for (unsigned j = 0; j < 4; j++) if (j < ni) {
-                    const uint64_t at = (uint64_t)j * dim + stream * E + i;
-                    wp[k][j] = TYPE == 1 ? ldg_pre_half(wi + at * 2) :
-                               TYPE == 0 ? ldg_pre((const float *)wi + at) : value<TYPE>(wi, at);
-                }
-            }
-        }
-        pdl_wait();
-        if (!late) pdl_trigger();
-    } else pdl_enter();
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
     __shared__ float red[32];
     __shared__ float add_weight;
@@ -3390,7 +3373,6 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
         for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(r[k], r[k], ss);
     }
     const float inv = rsqrtf(block_sum(ss, red) / E + eps);
-    if (PRE && late) pdl_trigger();
     float acc[4] = {};
     for (unsigned i0 = first; i0 < end; i0 += 4 * nt) {
         float r[4], g[4], w[4][4];
@@ -3403,15 +3385,9 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
                     r[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], r[k]);
                     next[base + i] = r[k];
                 }
-                if (PRE && i0 == first) {
-                    g[k] = gp[k];
-                    #pragma unroll
-                    for (unsigned j = 0; j < 4; j++) w[k][j] = wp[k][j];
-                } else {
-                    g[k] = gamma[stream * E + i];
-                    #pragma unroll
-                    for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
-                }
+                g[k] = gamma[stream * E + i];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
             }
         }
         #pragma unroll
@@ -3427,6 +3403,130 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     for (unsigned j = 0; j < ni; j++) {
         const float v = block_sum(acc[j], red);
         if (!tid) inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + j] = v;
+    }
+}
+
+/* hc_norm for decode rows (T <= 3), with the same arithmetic in the same
+ * order and less latency on the dependency chain.  Gamma and the injection
+ * weights of the first chunk iteration load before the wait, so they are not
+ * queued behind the weight copies of the HC down projection that follows;
+ * the first batches of R (and blk) are requested before the injection
+ * barrier instead of after it; and the ni injection partials take one block
+ * reduction instead of ni.  The chunk pass rereads its R and blk elements,
+ * which the first pass left in L1.  With late, the HC down projection
+ * launches only after the norm reduction, so its weight copies overlap the
+ * second pass instead of both. */
+template<unsigned TYPE, bool COMBINE>
+__global__ void __launch_bounds__(128) hc_norm_pre(float *xn, float *inj, const float *R, const float *gamma,
+        const char *wi, unsigned E, unsigned hc, unsigned ni, float eps,
+        float *next, const float *blk, const float *oldinj, unsigned late) {
+    const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
+    const unsigned tid = threadIdx.x, nt = blockDim.x, dim = E * hc;
+    const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per), first = chunk * per + tid;
+    float gp[4] = {}, wp[4][4] = {};
+    #pragma unroll
+    for (unsigned k = 0; k < 4; k++) {
+        const unsigned i = first + k * nt;
+        if (i < end) {
+            gp[k] = ldg_pre(gamma + stream * E + i);
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni) {
+                const uint64_t at = (uint64_t)j * dim + stream * E + i;
+                wp[k][j] = TYPE == 1 ? ldg_pre_half(wi + at * 2) :
+                           TYPE == 0 ? ldg_pre((const float *)wi + at) : value<TYPE>(wi, at);
+            }
+        }
+    }
+    pdl_wait();
+    if (!late) pdl_trigger();
+    const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    __shared__ float red[32], part[4][4];
+    __shared__ float add_weight;
+    /* the first three batches (all of a row up to 3072 wide) go out before
+     * the injection barrier; the same batches, element order and fused
+     * multiply-adds as hc_norm */
+    enum { B = 3 };
+    float r[B][8], bk[B][8];
+    #pragma unroll
+    for (unsigned b = 0; b < B; b++) {
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = tid + (b * 8 + k) * nt;
+            r[b][k] = i < E ? R[base + i] : 0;
+            if (COMBINE) bk[b][k] = i < E ? blk[(uint64_t)tok * E + i] : 0;
+        }
+    }
+    if (COMBINE) {
+        if (!tid) add_weight = injection(oldinj + (uint64_t)tok * hc * hc * 8, hc, stream);
+        __syncthreads();
+    }
+    float ss = 0;
+    #pragma unroll
+    for (unsigned b = 0; b < B; b++) {
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = tid + (b * 8 + k) * nt;
+            if (COMBINE && i < E) r[b][k] = __fmaf_rn(add_weight, bk[b][k], r[b][k]);
+            if (i < E) ss = __fmaf_rn(r[b][k], r[b][k], ss);
+        }
+    }
+    for (unsigned i0 = tid + B * 8 * nt; i0 < E; i0 += 8 * nt) {
+        float v[8];
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = i0 + k * nt;
+            v[k] = i < E ? R[base + i] : 0;
+            if (COMBINE && i < E) v[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], v[k]);
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(v[k], v[k], ss);
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    if (late) pdl_trigger();
+    float acc[4] = {};
+    for (unsigned i0 = first; i0 < end; i0 += 4 * nt) {
+        float rv[4], g[4], w[4][4];
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i < end) {
+                rv[k] = R[base + i];
+                if (COMBINE) {
+                    rv[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], rv[k]);
+                    next[base + i] = rv[k];
+                }
+                if (i0 == first) {
+                    g[k] = gp[k];
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) w[k][j] = wp[k][j];
+                } else {
+                    g[k] = gamma[stream * E + i];
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i >= end) break;
+            const float v = rv[k] * inv * g[k];
+            xn[base + i] = v;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni) acc[j] = __fmaf_rn(w[k][j], v, acc[j]);
+        }
+    }
+    /* block_sum of each partial: warp sums, then the warps in order */
+    #pragma unroll
+    for (unsigned j = 0; j < 4; j++) if (j < ni) {
+        const float v = sum(acc[j]);
+        if (!(tid & 31)) part[j][tid / 32] = v;
+    }
+    __syncthreads();
+    if (tid < ni) {
+        float v = 0;
+        for (unsigned w = 0; w < nt / 32; w++) v += part[tid][w];
+        inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + tid] = v;
     }
 }
 
@@ -3539,9 +3639,14 @@ __global__ void hc_mix_f16_bulk(float *out, const float *xn, const float *lo,
     if (!lane) out[(uint64_t)tok * E + d] = v / hc;
 }
 
+/* 2 * sigmoid of the mean of the hc * 8 injection partials of a stream.
+ * The loads go out together (hc <= 8) and the sum keeps its order. */
 __device__ float injection(const float *inj, unsigned hc, unsigned stream) {
-    float v = 0;
-    for (unsigned i = 0; i < hc * 8; i++) v += inj[i * hc + stream];
+    float p[64], v = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 64; i++) p[i] = i < hc * 8 ? inj[i * hc + stream] : 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 64; i++) if (i < hc * 8) v += p[i];
     return 2 * sigmoid(v / hc);
 }
 
@@ -4075,13 +4180,17 @@ static int qwen4_hc_norm(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
 #undef QWEN_HC_NORM
         return launched();
     }
-#define QWEN_HC_NORM(TYPE, PRE) launch(hc_norm<TYPE, false, PRE>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
+#define QWEN_HC_NORM(TYPE) launch(hc_norm<TYPE, false>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
+        ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
+        (float *)nullptr, (const float *)nullptr, (const float *)nullptr)
+#define QWEN_HC_NORM_PRE(TYPE) launch(hc_norm_pre<TYPE, false>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
         ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
         (float *)nullptr, (const float *)nullptr, (const float *)nullptr, hc_norm_late(T))
     const bool pre = !ref && presync_load(T);
-    if (type == 0) { if (pre) { QWEN_HC_NORM(0, true); } else { QWEN_HC_NORM(0, false); } }
-    else if (type == 1) { if (pre) { QWEN_HC_NORM(1, true); } else { QWEN_HC_NORM(1, false); } }
-    else { if (pre) { QWEN_HC_NORM(8, true); } else { QWEN_HC_NORM(8, false); } }
+    if (type == 0) { if (pre) { QWEN_HC_NORM_PRE(0); } else { QWEN_HC_NORM(0); } }
+    else if (type == 1) { if (pre) { QWEN_HC_NORM_PRE(1); } else { QWEN_HC_NORM(1); } }
+    else { if (pre) { QWEN_HC_NORM_PRE(8); } else { QWEN_HC_NORM(8); } }
+#undef QWEN_HC_NORM_PRE
 #undef QWEN_HC_NORM
     return launched();
 }
@@ -4654,9 +4763,14 @@ static int qwen4_hc_combine_norm(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk
         /* Every chunk reads the old residual, then writes its disjoint piece
          * of next. This folds the copy and combine into normalization without
          * a grid barrier or an in-place read/write race. */
-        launch(!ref && presync_load(T) ? hc_norm<1,true,true> : hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
-            (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
-            (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr,hc_norm_late(T));
+        if (!ref && presync_load(T))
+            launch(hc_norm_pre<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
+                (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
+                (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr,hc_norm_late(T));
+        else
+            launch(hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
+                (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
+                (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr);
         return launched();
     }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
