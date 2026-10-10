@@ -1,0 +1,3 @@
+mode,build,ctx,prefill_tps,decode_tps,step_ms_p50,step_ms_p95,tokens_per_cycle,tokens_match_main
+mtp,main,200000,2398.12,130.23,11.593,12.409,1.515625,yes
+mtp,tiles,200000,2763.87,172.42,8.752,9.407,1.515625,yes
