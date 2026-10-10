@@ -51,6 +51,99 @@ static void fixture(const char *path, bool bad_alignment, uint32_t type) {
     assert(!fclose(f));
 }
 
+static uint8_t code8(size_t row, size_t col) {
+    const uint8_t edge[] = {0, 0x80, 1, 0x81, 7, 8, 0x7e, 0xfe, 0x38, 0xb8};
+    return col < sizeof(edge) ? edge[col] : (uint8_t)((row * 31 + col * 7) % 251);
+}
+
+static float scale8(size_t row) { return row == 5 ? 0.0f : 0x1p-12f * (float)(1 + row % 37); }
+
+/* Independent of the runtime's bit construction. */
+static float e4m3_ref(uint8_t b) {
+    int e = (b >> 3) & 15, mant = b & 7;
+    float v = e ? ldexpf((float)(8 + mant), e - 10) : ldexpf((float)mant, -9);
+    return b & 128 ? -v : v;
+}
+
+static void fixture8(const char *path, const char *encoding, uint32_t type, uint64_t width) {
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fwrite("GGUF", 4, 1, f) == 1);
+    u32(f, 3); u64(f, 2); u64(f, 2);
+    str(f, "general.architecture"); u32(f, 8); str(f, "qwen4exp");
+    str(f, "qwen4exp.ple.ngram_encoding"); u32(f, 8); str(f, encoding);
+    str(f, "token_embd.weight"); u32(f, 2); u64(f, 1); u64(f, 1); u32(f, 0); u64(f, 0);
+    str(f, "per_layer_token_embd.weight"); u32(f, 2); u64(f, width); u64(f, 1000); u32(f, type);
+    uint64_t start = ((uint64_t)ftell(f) + 8 + 31) / 32 * 32;
+    u64(f, 65536 - start);
+    assert(!fseek(f, (long)start, SEEK_SET));
+    u32(f, 0x3f800000);
+    assert(!fseek(f, 65536, SEEK_SET));
+    for (size_t r = 0; r < 1000; r++) {
+        float scale = scale8(r);
+        assert(fwrite(&scale, 4, 1, f) == 1);
+        for (size_t c = 0; c < 160; c++) {
+            uint8_t v = code8(r, c);
+            if (!strcmp(encoding, "e4m3_f32row") && (v & 127) == 127) v ^= 1;
+            assert(fwrite(&v, 1, 1, f) == 1);
+        }
+    }
+    /* Room for the mismatched layouts, so they fail on layout rather than size. */
+    assert(!ftruncate(fileno(f), 65536 + 330000));
+    assert(!fclose(f));
+}
+
+static void test_8bit(const char *path, const uint32_t *rows, size_t n, float *out) {
+    const char *encodings[] = {"e4m3_f32row", "i8_f32row"};
+    for (int ei = 0; ei < 2; ei++) {
+        const bool e4m3 = ei == 0;
+        fixture8(path, encodings[ei], 24, 164);
+        ds4_model m;
+        model_open(&m, path, false, false);
+        assert(m.size == 65536 && m.ngram_tensor && m.ngram_width == 160 && m.ngram_row_bytes == 164);
+        const size_t sizes[] = {1, 16, 4097, n};
+        for (size_t ni = 0; ni < sizeof(sizes)/sizeof(*sizes); ni++) {
+            memset(out, 0xff, sizes[ni] * 160 * sizeof(*out));
+            assert(qwen4_ngram_read(&m, rows, sizes[ni], out));
+            for (size_t i = 0; i < sizes[ni]; i++) {
+                for (size_t c = 0; c < 160; c++) {
+                    uint8_t v = code8(rows[i], c);
+                    if (e4m3 && (v & 127) == 127) v ^= 1;
+                    float expected = (e4m3 ? e4m3_ref(v) : (float)(int8_t)v) * scale8(rows[i]);
+                    assert(out[i*160+c] == expected);
+                }
+            }
+        }
+        int fd = open(path, O_WRONLY);
+        assert(fd >= 0);
+        uint32_t first = 0;
+        if (e4m3) {
+            uint8_t nan = 0xff;
+            assert(pwrite(fd, &nan, 1, 65536 + 4 + 20) == 1);
+            assert(!qwen4_ngram_read(&m, &first, 1, out) && errno == EDOM);
+            nan = 0;
+            assert(pwrite(fd, &nan, 1, 65536 + 4 + 20) == 1);
+        }
+        const float bad[] = {-1.0f, NAN, INFINITY};
+        for (size_t bi = 0; bi < 3; bi++) {
+            assert(pwrite(fd, &bad[bi], 4, 65536) == 4);
+            assert(!qwen4_ngram_read(&m, &first, 1, out) && errno == EDOM);
+        }
+        close(fd);
+        model_close(&m);
+    }
+    /* Unknown encodings, BF16 tensors with an 8-bit encoding and oversized rows. */
+    for (int bad = 0; bad < 3; bad++) {
+        fixture8(path, bad == 0 ? "e5m2_f32row" : "i8_f32row", bad == 1 ? 30 : 24, bad == 2 ? 165 : 164);
+        pid_t pid = fork();
+        assert(pid >= 0);
+        ds4_model m;
+        if (!pid) { model_open(&m, path, false, false); _exit(0); }
+        int status;
+        assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    }
+}
+
 int main(void) {
     char path[] = "/tmp/ds4-qwen-ngrams-XXXXXX";
     int fd = mkstemp(path);
@@ -126,7 +219,8 @@ int main(void) {
         int status;
         assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     }
+    test_8bit(path, rows, N, out);
     free(rows); free(out); unlink(path);
-    puts("Qwen BF16 n-grams: disk-only mapping, exact reads, batches and errors OK");
+    puts("Qwen BF16 and 8-bit n-grams: disk-only mapping, exact reads, batches and errors OK");
     return 0;
 }
