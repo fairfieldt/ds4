@@ -31,6 +31,17 @@ __device__ __forceinline__ void pdl_trigger() {
 #endif
 }
 
+/* Small single-wave kernels on the critical path trigger their dependents
+ * before their own wait, so a bulk-staged projection a few launches behind
+ * them is resident, and streaming its weights, while they run.  Dependents
+ * still wait for this kernel's completion before reading what it wrote. */
+__device__ __forceinline__ void pdl_enter_early() {
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+#endif
+}
+
 /* Weight loads issued before pdl_wait().  The compiler sinks invariant
  * __ldg loads below griddepcontrol.wait; volatile PTX keeps their order.
  * ptxas also hoists the wait to the top of its basic block, so callers keep
@@ -193,10 +204,23 @@ __device__ void apply_rope(float *row, const uint32_t *pos, rope_args r) {
     __syncwarp();
 }
 
+/* The block's norm weights (gamma, D or Di values: lane + 32 m, m < 8). */
+__device__ __forceinline__ void attn_prep_gamma(float (&g)[8], const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di) {
+    const unsigned slot = blockIdx.x, lane = threadIdx.x;
+    if (slot >= H + Hkv + Hi) return;
+    const bool isq = slot < H, isk = !isq && slot < H + Hkv;
+    const unsigned dim = isq || isk ? D : Di;
+    const float *gamma = isq ? gq : isk ? gk : giq;
+    #pragma unroll
+    for (unsigned m = 0; m < 8; m++) if (lane + 32 * m < dim) g[m] = ldg_pre(gamma + lane + 32 * m);
+}
+
+/* g: the norm weights from attn_prep_gamma (lane + 32 m); NULL gq reads them here. */
 __device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half *kc, __half *vc,
         float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
         const float *iq, const float *ik, const uint32_t *pos3,
-        const float *gq, const float *gk, const float *giq,
+        const float *gq, const float *gk, const float *giq, const float (&g)[8],
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
         unsigned pos0, float eps, rope_args rp, unsigned t) {
     const unsigned slot = blockIdx.x, pos = pos0 + t, lane = threadIdx.x;
@@ -215,7 +239,11 @@ __device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half 
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) { const float v = src[lane * npt + i]; ss += v * v; }
     const float inv = rsqrtf(sum(ss) / dim + eps);
-    for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
+    #pragma unroll
+    for (unsigned m = 0; m < 8; m++) if (lane + 32 * m < dim) {
+        const unsigned i = lane + 32 * m;
+        row[i] = src[i] * inv * (gq ? gamma[i] : g[m]);
+    }
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)pos * 4, rp);
     for (unsigned i = lane; i < dim; i += 32) {
@@ -235,8 +263,13 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
         unsigned pos0, float eps, rope_args rp) {
-    pdl_enter();
-    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,gq,gk,giq,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
+    /* gamma before the wait: during this kernel the staged attention output
+     * projection streams its rows, and a dependent DRAM read would queue
+     * behind them */
+    float g[8] = {};
+    attn_prep_gamma(g,gq,gk,giq,H,Hkv,D,Hi,Di);
+    pdl_enter_early();
+    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,NULL,NULL,NULL,g,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
 }
 
 __device__ __forceinline__ void block_key_body(__half *out, const float *ik, const uint32_t *pos3,
@@ -259,7 +292,7 @@ __device__ __forceinline__ void block_key_body(__half *out, const float *ik, con
 
 __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
         const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
-    pdl_enter();
+    pdl_enter_early();
     block_key_body(out,ik,pos3,gamma,block0,ratio,D,eps,rp);
 }
 
@@ -280,7 +313,7 @@ __device__ __forceinline__ void idx_score_body(float *out, const float *q, const
 
 __global__ void idx_score(float *out, const float *q, const __half *key,
         unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
-    pdl_enter();
+    pdl_enter_early();
     idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
 }
 
@@ -363,7 +396,7 @@ __device__ __forceinline__ void idx_select_body(int *out, const float *score, un
 }
 
 __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
-    pdl_enter();
+    pdl_enter_early();
     idx_select_body(out,score,N,K,blockIdx.x);
 }
 
@@ -379,7 +412,7 @@ __device__ __forceinline__ void idx_expand_body(int *out, unsigned *count, const
 
 __global__ void idx_expand(int *out, unsigned *count, const int *blocks,
         unsigned K, unsigned ratio, unsigned pos0, unsigned stride) {
-    pdl_enter();
+    pdl_enter_early();
     idx_expand_body(out,count,blocks,K,ratio,pos0,stride,blockIdx.x);
 }
 
@@ -457,7 +490,7 @@ template<unsigned D>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, keys = attn_keys(sparse,stride,pos0+t), splits = partial ? attn_splits(keys) : 1;
     if (blockIdx.z >= splits) return;
     attention_body<D>(out+(uint64_t)t*H*D,partial ? partial+(uint64_t)t*H*64*(D+2) : nullptr,
@@ -465,17 +498,33 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
         sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,splits,(keys+splits-1)/splits,scale,0);
 }
 
+/* The split maxima, sums and this thread's partial values are requested
+ * sixteen splits at a time; the running sums keep their split order. */
 __device__ __forceinline__ void attn_merge_body(float *out, const float *partial, const float *gate,
         unsigned H, unsigned D, unsigned splits, unsigned t) {
     const unsigned h = blockIdx.x, d = threadIdx.x;
     if (d >= D) return;
     const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
     float m = -3e38f, denom = 0, acc = 0;
-    for (unsigned s = 0; s < splits; s++) m = fmaxf(m, p[s * (D + 2)]);
-    for (unsigned s = 0; s < splits; s++) {
-        const float *row = p + s * (D + 2);
-        const float w = row[1] > 0 ? expf(row[0] - m) : 0;
-        denom += row[1] * w; acc += row[2 + d] * w;
+    for (unsigned s0 = 0; s0 < splits; s0 += 16) {
+        float mv[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) mv[j] = s0 + j < splits ? p[(s0 + j) * (D + 2)] : -3e38f;
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) m = fmaxf(m, mv[j]);
+    }
+    for (unsigned s0 = 0; s0 < splits; s0 += 16) {
+        float r0[16], r1[16], rd[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) {
+            const float *row = p + (s0 + j) * (D + 2);
+            r0[j] = row[0]; r1[j] = row[1]; rd[j] = row[2 + d];
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) {
+            const float w = r1[j] > 0 ? expf(r0[j] - m) : 0;
+            denom += r1[j] * w; acc += rd[j] * w;
+        }
     }
     const uint64_t i = ((uint64_t)t * H + h) * D + d;
     out[i] = (denom > 0 ? acc / denom : 0) * sigmoid(gate[i]);
@@ -483,7 +532,7 @@ __device__ __forceinline__ void attn_merge_body(float *out, const float *partial
 
 __global__ void attn_merge(float *out, const float *partial, const float *gate,
         unsigned H, unsigned D, unsigned pos0, unsigned stride, bool sparse) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, splits = attn_splits(attn_keys(sparse,stride,pos0+t));
     if (splits > 1) attn_merge_body(out+(uint64_t)t*H*D,partial+(uint64_t)t*H*64*(D+2),
         gate+(uint64_t)t*H*D,H,D,splits,0);
@@ -626,7 +675,7 @@ __device__ __forceinline__ void attention_group_body(float *out, float *partial,
 __global__ void attention_group(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, D = 256, keys = attn_keys(sparse,stride,pos0+t),
         splits = partial ? attn_splits(keys) : 1;
     if (blockIdx.z >= splits) return;
@@ -1968,6 +2017,37 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     matvec_q8_body<ROWS>(out,w,x,T,K,M,stride,blockIdx.x*4+threadIdx.x/32);
 }
 
+/* matvec_q8 with the block's two weight rows bulk-copied to shared memory
+ * before the dependency wait.  Launched behind kernels that trigger their
+ * dependents early (the GDN scan chain before the GDN output projection,
+ * the attention core before the attention output projection), its blocks
+ * are resident, and its rows stream, while those latency-bound kernels run.
+ * Two rows per block keep every block of a 2560-row projection resident
+ * at once.  Same per-lane order and fused multiply-adds as matvec_q8.
+ * 2 * stride bytes of dynamic shared memory; rows are 16-byte multiples. */
+template<unsigned ROWS>
+__global__ void __launch_bounds__(64) matvec_q8_bulk(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    __shared__ __align__(8) uint64_t bar;
+    const unsigned row0 = blockIdx.x * 2, nr = min(2u, M - row0), lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    if (!threadIdx.x) {
+        bulk_start(&bar, (unsigned)(nr * stride));
+        bulk_copy(wsm, w + (uint64_t)row0 * stride, (unsigned)(nr * stride), &bar);
+    }
+    pdl_enter();
+    __syncthreads();
+    bulk_wait(&bar);
+    if (warp >= nr) return;
+    float acc[ROWS] = {};
+    q8_row_acc<ROWS>(acc, (const char *)wsm + warp * stride, x, T, K);
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t * M + row0 + warp] = v;
+    }
+}
+
 /* Decode projections with few output rows (the HC down projections, the
  * router, the linear-attention gates) cannot fill the GPU at one warp per
  * row. Split each row's K across the eight warps of a block instead. The
@@ -2381,6 +2461,17 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         return launched();
     }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
+        /* decode rows of the layer projections stage their rows; the output
+         * head (330 waves of blocks) keeps the plain kernel */
+        if (!ref && presync_load(T) && M < 65536 && bulk_supported() && !(stride & 15) && !((uintptr_t)w & 15) &&
+            2 * stride + 64 <= BULK_DYN_SMEM_LIMIT) {
+#define QWEN_Q8_BULK(N) launch(matvec_q8_bulk<N>, (M+1)/2, 64, (size_t)stride * 2, out,w,x,T,K,M,stride)
+            if (T == 1) { QWEN_Q8_BULK(1); }
+            else if (T == 2) { QWEN_Q8_BULK(2); }
+            else { QWEN_Q8_BULK(4); }
+#undef QWEN_Q8_BULK
+            return launched();
+        }
 #define QWEN_Q8_ROWS(N) launch(matvec_q8<N>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
         else if (T == 2) { QWEN_Q8_ROWS(2); }
@@ -3702,9 +3793,10 @@ __global__ void attn_prep_rows(float *q, float *gate, float *iqn, const float *q
     pdl_enter();
     const unsigned r = blockIdx.y;
     const attn_row row = rows[r];
+    const float g[8] = {};
     attn_prep_body(q+(uint64_t)r*H*D,gate+(uint64_t)r*H*D,row.k,row.v,iqn+(uint64_t)r*Hi*Di,row.ik,
         qg+(uint64_t)r*H*D*2,kp+(uint64_t)r*Hkv*D,vp+(uint64_t)r*Hkv*D,
-        iq+(uint64_t)r*Hi*Di,ik+(uint64_t)r*Di,row.pos3,gq,gk,giq,H,Hkv,D,Hi,Di,row.pos,eps,rp,0);
+        iq+(uint64_t)r*Hi*Di,ik+(uint64_t)r*Di,row.pos3,gq,gk,giq,g,H,Hkv,D,Hi,Di,row.pos,eps,rp,0);
 }
 
 __global__ void block_key_rows(const attn_row *rows, const float *gamma, unsigned ratio,
@@ -3830,7 +3922,7 @@ __device__ __forceinline__ float gdn_decay(float a, float A, float bias) { retur
 template<bool ACT>
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
                          unsigned Hk, unsigned Hv, unsigned D) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
     const unsigned C = (2 * Hk + Hv) * D, npt = D / 32;
     float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
@@ -3891,7 +3983,7 @@ __device__ __forceinline__ void gdn_scan_body(float *out, float *state, const fl
 template<unsigned ROWS, unsigned D>
 __global__ void gdn_scan(float *out, float *state, const float *qkv, const float *a, const float *b,
         unsigned T, unsigned Hk, unsigned Hv, float *snap, unsigned st, float *snap2, unsigned st2) {
-    pdl_enter();
+    pdl_enter_early();
     gdn_scan_body<ROWS,D>(out,state,qkv,a,b,T,Hk,Hv,snap,st,snap2,st2);
 }
 
@@ -3913,14 +4005,21 @@ __global__ void gdn_scan_slots(float *out, float *state, const float *qkv, const
         qkv+(uint64_t)r*(2*Hk+Hv)*D,a+(uint64_t)r*Hv,b+(uint64_t)r*Hv,1,Hk,Hv,NULL,0,NULL,0);
 }
 
+/* The norm weights load before the wait (D <= 128): the staged GDN output
+ * projection streams its rows meanwhile, and a dependent DRAM read would
+ * queue behind them. */
 __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
-    pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, npt = D / 32, k0 = threadIdx.x * npt;
+    float wp[4] = {};
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) if (i < npt) wp[i] = ldg_pre(w + k0 + i);
+    pdl_enter_early();
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) ss += o[idx + i] * o[idx + i];
     const float r = rsqrtf(sum(ss) / D + eps);
-    for (unsigned i = 0; i < npt; i++) o[idx + i] = o[idx + i] * r * w[k0 + i] * sigmoid(z[idx + i]);
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) if (i < npt) o[idx + i] = o[idx + i] * r * wp[i] * sigmoid(z[idx + i]);
 }
 
 /* The decode (T <= 3: a token, or the MTP verify rows) GDN projections in
