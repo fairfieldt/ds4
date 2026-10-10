@@ -1,0 +1,63 @@
+kernel,scores,rows,tile_maxima,us_per_launch,note
+idx_select (main),1024,1,no,5.4,random relu rows
+idx_select (main),2048,1,no,8.0,random relu rows
+idx_select (main),4096,1,no,12.8,random relu rows
+idx_select (main),8192,1,no,24.6,random relu rows
+idx_select (main),16384,1,no,46.0,random relu rows
+idx_select (main),32768,1,no,133.3,random relu rows
+idx_select (main),50000,1,no,196.2,random relu rows
+idx_select (main),65536,1,no,262.1,random relu rows
+idx_select (main),131072,1,no,519.5,random relu rows
+idx_select (main),262144,1,no,1033.9,random relu rows
+idx_score,1024,1,no,2.3,twelve layers of keys in turn (DRAM)
+idx_score_tiles,1024,1,written,3.6,twelve layers of keys in turn (DRAM)
+idx_score,8192,1,no,3.9,twelve layers of keys in turn (DRAM)
+idx_score_tiles,8192,1,written,5.3,twelve layers of keys in turn (DRAM)
+idx_score,16384,1,no,5.7,twelve layers of keys in turn (DRAM)
+idx_score_tiles,16384,1,written,5.9,twelve layers of keys in turn (DRAM)
+idx_score,50000,1,no,14.3,twelve layers of keys in turn (DRAM)
+idx_score_tiles,50000,1,written,12.5,twelve layers of keys in turn (DRAM)
+idx_score,65536,1,no,18.0,twelve layers of keys in turn (DRAM)
+idx_score_tiles,65536,1,written,14.4,twelve layers of keys in turn (DRAM)
+idx_score,262144,1,no,66.2,twelve layers of keys in turn (DRAM)
+idx_score_tiles,262144,1,written,45.1,twelve layers of keys in turn (DRAM)
+idx_select,1024,1,no,5.2,random relu rows
+idx_select,1024,1,"given, unused",5.2,random relu rows
+idx_select,1024,3,no,5.4,random relu rows
+idx_select,1024,3,"given, unused",5.4,random relu rows
+idx_select_wide,2048,1,no,7.3,random relu rows
+idx_select_wide,2048,1,"given, unused",7.3,random relu rows
+idx_select_wide,2048,3,no,7.4,random relu rows
+idx_select_wide,2048,3,"given, unused",7.4,random relu rows
+idx_select_wide,4096,1,no,8.4,random relu rows
+idx_select_wide,4096,1,"given, unused",8.4,random relu rows
+idx_select_wide,4096,3,no,8.5,random relu rows
+idx_select_wide,4096,3,"given, unused",8.5,random relu rows
+idx_select_wide,8192,1,no,10.5,random relu rows
+idx_select_wide,8192,1,"given, unused",10.5,random relu rows
+idx_select_wide,8192,3,no,10.6,random relu rows
+idx_select_wide,8192,3,"given, unused",10.6,random relu rows
+idx_select_wide,16384,1,no,12.9,random relu rows
+idx_select_wide,16384,1,read,7.6,random relu rows
+idx_select_wide,16384,3,no,13.2,random relu rows
+idx_select_wide,16384,3,read,7.9,random relu rows
+idx_select_wide,32768,1,no,16.0,random relu rows
+idx_select_wide,32768,1,read,9.2,random relu rows
+idx_select_wide,32768,3,no,16.0,random relu rows
+idx_select_wide,32768,3,read,9.3,random relu rows
+idx_select_wide,50000,1,no,20.2,random relu rows
+idx_select_wide,50000,1,read,11.5,random relu rows
+idx_select_wide,50000,3,no,20.3,random relu rows
+idx_select_wide,50000,3,read,11.5,random relu rows
+idx_select_wide,65536,1,no,22.4,random relu rows
+idx_select_wide,65536,1,read,12.2,random relu rows
+idx_select_wide,65536,3,no,22.4,random relu rows
+idx_select_wide,65536,3,read,12.3,random relu rows
+idx_select_wide,131072,1,no,37.6,random relu rows
+idx_select_wide,131072,1,read,14.9,random relu rows
+idx_select_wide,131072,3,no,37.7,random relu rows
+idx_select_wide,131072,3,read,14.9,random relu rows
+idx_select_wide,262144,1,no,40.8,random relu rows
+idx_select_wide,262144,1,read,21.0,random relu rows
+idx_select_wide,262144,3,no,41.0,random relu rows
+idx_select_wide,262144,3,read,21.0,random relu rows
