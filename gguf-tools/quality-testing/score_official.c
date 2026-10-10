@@ -28,7 +28,7 @@ static void usage(const char *prog) {
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N] "
-            "[--dump-first-logits PATH] "
+            "[--dump-first-logits PATH] [--dump-token-logprobs PATH] "
             "[--max-cases N] "
             "[--continued-prefill N] "
             "[--session-batch N] "
@@ -688,6 +688,7 @@ int main(int argc, char **argv) {
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
     const char *first_logits_path = NULL;
+    const char *token_logprobs_path = NULL;
     int max_cases = 0;
     int continued_prefill = 0;
     int session_count = 1;
@@ -744,6 +745,8 @@ int main(int argc, char **argv) {
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dump-first-logits")) {
             first_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-token-logprobs")) {
+            token_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--max-cases")) {
             max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--continued-prefill")) {
@@ -897,6 +900,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "open %s: %s\n", out_path, strerror(errno));
         return 1;
     }
+    /* One line per target position: id, position, target, target logprob,
+     * greedy token, then the local top 20 as token:logprob, for paired
+     * comparisons between two GGUFs on the same fixtures. */
+    FILE *token_out = NULL;
+    if (token_logprobs_path && !(token_out = fopen(token_logprobs_path, "wb"))) {
+        fprintf(stderr, "open %s: %s\n", token_logprobs_path, strerror(errno));
+        return 1;
+    }
     fprintf(out,
             "id\tprompt_tokens\ttarget_tokens\tnll\tavg_nll\tfirst_match\tgreedy_lcp"
             "\tapi_ref_tokens\tapi_target_tokens\tapi_target_mae\tapi_target_mean_delta"
@@ -1017,6 +1028,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             nll += -target_lp;
+            if (token_out) {
+                int top[20];
+                const int n_top = local_top_ids(logits, n_vocab, top, 20);
+                fprintf(token_out, "%s\t%d\t%d\t%.6f\t%d", id, i, target.v[i], target_lp, greedy);
+                for (int j = 0; j < n_top; j++)
+                    fprintf(token_out, "\t%d:%.6f", top[j], local_logprob(logits, n_vocab, top[j], logsum));
+                fputc('\n', token_out);
+            }
 
             if (api_aligned) {
                 const api_pos *ap = &ref.pos[i];
@@ -1175,6 +1194,10 @@ int main(int argc, char **argv) {
             safe_ratio(total_api.pair_agree, total_api.pair_total));
 
     fclose(out);
+    if (token_out && fclose(token_out)) {
+        fprintf(stderr, "write %s: %s\n", token_logprobs_path, strerror(errno));
+        return 1;
+    }
     fclose(mf);
     free(logits);
     for (int i = 0; i < session_count; i++) {
