@@ -4484,6 +4484,40 @@ static int bench_select_tiles(void *ud) {
     return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tiles, c->n, c->T, 512);
 }
 
+/* twelve layers' block keys, used in turn, so long rows come from DRAM as in decode */
+typedef struct { ds4_gpu_tensor *score, *tiles, *q, *key, *layer[12]; uint32_t n, T, next; } score_bench;
+static int bench_score_tiles(void *ud) {
+    score_bench *c = ud;
+    ds4_gpu_tensor *key = c->layer[c->next++ % 12];
+    return ds4_gpu_qwen4_idx_score_tensor(c->score, c->tiles, c->q, key, c->T, c->n, 4, 128, c->n * 4 - 1, 4);
+}
+static int bench_score_plain(void *ud) {
+    score_bench *c = ud;
+    ds4_gpu_tensor *key = c->layer[c->next++ % 12];
+    return ds4_gpu_qwen4_idx_score_tensor(c->score, NULL, c->q, key, c->T, c->n, 4, 128, c->n * 4 - 1, 4);
+}
+
+static void bench_idx_score(void) {
+    const uint32_t ns[] = { 1024, 8192, 16384, 50000, 65536, 262144 };
+    for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        const uint32_t n = ns[i], T = 1;
+        const uint64_t bytes = (uint64_t)n * 128 * 2;
+        float *q = rand_vec(4 * 128, 1.0f);
+        score_bench c = { upload(NULL, n), ds4_gpu_tensor_alloc((uint64_t)(n + 7) / 8 * 4), upload(q, 4 * 128),
+                          ds4_gpu_tensor_alloc(12 * bytes), {0}, n, T, 0 };
+        require_ok(c.score && c.tiles && c.q && c.key && ds4_gpu_tensor_fill_f32(c.key, 0.01f, 12 * bytes / 4),
+                   "score bench alloc");
+        for (unsigned l = 0; l < 12; l++) require_ok((c.layer[l] = ds4_gpu_tensor_view(c.key, l * bytes, bytes)) != NULL, "view");
+        char name[64];
+        snprintf(name, sizeof(name), "idx score n=%u", n);
+        bench_run(name, bench_score_plain, &c, 96);
+        snprintf(name, sizeof(name), "idx score tiles n=%u", n);
+        bench_run(name, bench_score_tiles, &c, 96);
+        for (unsigned l = 0; l < 12; l++) ds4_gpu_tensor_free(c.layer[l]);
+        ds4_gpu_tensor_free(c.score); ds4_gpu_tensor_free(c.tiles); ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.key); free(q);
+    }
+}
+
 static void bench_idx_select(void) {
     const uint32_t ns[] = { 1024, 2048, 4096, 8192, 16384, 32768, 50000, 65536, 131072, 262144 };
     for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
@@ -4561,7 +4595,7 @@ int main(void) {
         return 0;
     }
     if (getenv("DS4_TEST_QWEN4_IDX_SELECT_ONLY")) { test_idx_select_exact_all(); printf("all qwen4 idx select tests passed\n"); return 0; }
-    if (getenv("DS4_TEST_QWEN4_IDX_SELECT_BENCH")) { bench_idx_select(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_IDX_SELECT_BENCH")) { bench_idx_score(); bench_idx_select(); return 0; }
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {

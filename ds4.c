@@ -59372,11 +59372,14 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *iqn = ds4_gpu_tensor_view(iqn_rows,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-    /* Only Metal's selection reads the per-tile score maxima; the CUDA
-     * selection scans the scores themselves. */
-    ds4_gpu_tensor *tiles = NULL;
+    /* The scorer's 8-block tile maxima bound the selection threshold from
+     * below: on Metal for decode rows, on CUDA for rows of more than 8192
+     * blocks (32K tokens), where its selection keeps one maximum per tile
+     * or per larger group. */
 #ifdef DS4_HAS_QWEN4_METAL
-    tiles = n_sparse <= 2u ? g->tile_max : NULL;
+    ds4_gpu_tensor *tiles = n_sparse <= 2u ? g->tile_max : NULL;
+#else
+    ds4_gpu_tensor *tiles = n_blocks_after > 8192u ? g->tile_max : NULL;
 #endif
     const bool ok = q && gate && o && iqn &&
         ds4_gpu_qwen4_idx_score_tensor(g->score, tiles, iqn,
