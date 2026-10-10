@@ -349,6 +349,52 @@ __global__ void idx_score(float *out, const float *q, const __half *key,
     idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
 }
 
+/* Scores of eight consecutive blocks per warp, plus the largest key of
+ * those eight (max(score, 0) as bits) for the long-row selection.  Each
+ * score is computed as in idx_score_body, from queries held in registers
+ * and with all of the warp's key loads issued first.  At most four heads. */
+template<unsigned DPL>
+__global__ void __launch_bounds__(256) idx_score_tiles(float *out, unsigned *tiles, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned pos0, unsigned ratio, unsigned nt) {
+    pdl_enter_early();
+    constexpr unsigned D = DPL * 32;
+    const unsigned t = blockIdx.y, lane = threadIdx.x & 31, tile = blockIdx.x * 8 + threadIdx.x / 32, b0 = tile * 8;
+    if (b0 >= N) return;
+    float qv[4][DPL];
+    #pragma unroll
+    for (unsigned h = 0; h < 4; h++)
+        #pragma unroll
+        for (unsigned i = 0; i < DPL; i++) qv[h][i] = h < H ? q[((uint64_t)t * H + h) * D + lane + 32 * i] : 0;
+    __half kr[8][DPL];
+    #pragma unroll
+    for (unsigned j = 0; j < 8; j++)
+        #pragma unroll
+        for (unsigned i = 0; i < DPL; i++)
+            kr[j][i] = b0 + j < N ? key[(uint64_t)(b0 + j) * D + lane + 32 * i] : __float2half_rn(0);
+    const unsigned visible = (pos0 + t + 1) / ratio;
+    float mine = 0;
+    unsigned top = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < 8; j++) {
+        float score = 0;
+        if (b0 + j >= visible) score = -3e38f;
+        else {
+            #pragma unroll
+            for (unsigned h = 0; h < 4; h++) {
+                if (h >= H) break;
+                float a = 0;
+                #pragma unroll
+                for (unsigned i = 0; i < DPL; i++) a += qv[h][i] * __half2float(kr[j][i]);
+                score += fmaxf(sum(a), 0);
+            }
+        }
+        if (lane == j) mine = score;
+        if (b0 + j < N) top = max(top, __float_as_uint(fmaxf(score, 0)));
+    }
+    if (lane < 8 && b0 + lane < N) out[(uint64_t)t * N + b0 + lane] = mine;
+    if (!lane) tiles[(uint64_t)t * nt + tile] = top;
+}
+
 __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigned tiles) {
     pdl_enter();
     const unsigned tile = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -4825,6 +4871,13 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    if (tiles && H <= 4 && D % 32 == 0 && D <= 128) {
+#define QWEN_SCORE_TILES(DPL) case DPL: launch(idx_score_tiles<DPL>, dim3((nt + 7) / 8, T), 256, 0, (float *)out->ptr, \
+        (unsigned *)tiles->ptr, (const float *)q->ptr, (const __half *)key->ptr, N, H, pos0, ratio, nt); break
+        switch (D / 32) { QWEN_SCORE_TILES(1); QWEN_SCORE_TILES(2); QWEN_SCORE_TILES(3); QWEN_SCORE_TILES(4); }
+#undef QWEN_SCORE_TILES
+        return launched();
+    }
     launch(idx_score, dim3((N + 3) / 4, T), 128, 0, (float *)out->ptr,
         (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
     if (!launched()) return 0;
