@@ -1536,6 +1536,112 @@ static void test_attn_pipe_exact_all(void) {
     test_attn_pipe_exact(33, 500, true, 16);
 }
 
+/* Prefill chunks (T > 8) take conv_seg and gdn_scan_pipe: outputs, states,
+ * histories and snapshots equal conv's and gdn_scan's bit for bit
+ * (DS4_QWEN4_CONV_SEG=0, DS4_QWEN4_GDN_PIPE=0), with ragged lengths,
+ * segments shorter than the window and snapshots inside the chunk. */
+static void test_conv_seg_exact(arena_t *a, uint32_t T, uint32_t C, uint32_t K, bool activate) {
+    double *sh;
+    const uint64_t w = arena_f32(a, (uint64_t)C * K, &sh, -0.5f, 0.5f);
+    free(sh);
+    const uint64_t nx = (uint64_t)T * C, nh = (uint64_t)(K - 1) * C;
+    float *x = rand_vec(nx, 1.0f), *hist = rand_vec(nh, 1.0f), *got[2][2];
+    for (int seg = 0; seg < 2; seg++) {
+        setenv("DS4_QWEN4_CONV_SEG", seg ? "1" : "0", 1);
+        ds4_gpu_tensor *gx = upload(x, nx), *gh = upload(hist, nh);
+        require_ok(ds4_gpu_qwen4_conv_stream_tensor(gx, gh, a->base, a->size, w, T, C, K, activate), "conv seg");
+        got[seg][0] = download(gx, nx);
+        got[seg][1] = download(gh, nh);
+        ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gh);
+    }
+    unsetenv("DS4_QWEN4_CONV_SEG");
+    char name[96];
+    snprintf(name, sizeof(name), "conv seg exact T=%u C=%u K=%u%s", T, C, K, activate ? "" : " linear");
+    require_ok(memcmp(got[0][0], got[1][0], nx * 4) == 0 && memcmp(got[0][1], got[1][1], nh * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    for (int i = 0; i < 2; i++) { free(got[i][0]); free(got[i][1]); }
+    free(x); free(hist);
+}
+
+static void test_ngram_conv_seg_exact(arena_t *a, uint32_t T, uint32_t C, uint32_t K, uint32_t dil, uint32_t type,
+                                      uint32_t st, uint32_t st2) {
+    double *sh;
+    const uint64_t w = type ? arena_f16(a, (uint64_t)C * K, &sh, 0.5f) : arena_f32(a, (uint64_t)C * K, &sh, -0.5f, 0.5f);
+    free(sh);
+    const uint64_t n = (uint64_t)T * C, nh = (uint64_t)(K - 1) * dil * C;
+    float *R = rand_vec(n, 1.0f), *gt = rand_vec(n, 1.0f), *nm = rand_vec(n, 1.0f), *hist = rand_vec(nh, 1.0f), *got[2][4] = {{0}};
+    for (int seg = 0; seg < 2; seg++) {
+        setenv("DS4_QWEN4_CONV_SEG", seg ? "1" : "0", 1);
+        ds4_gpu_tensor *gR = upload(R, n), *gg = upload(gt, n), *gn = upload(nm, n), *gh = upload(hist, nh);
+        ds4_gpu_tensor *s1 = st < T ? upload(NULL, nh) : NULL, *s2 = st2 < T ? upload(NULL, nh) : NULL;
+        require_ok(ds4_gpu_qwen4_ple_conv_tensor(gR, gg, gn, gh, a->base, a->size, w, type, T, C, K, dil, s1, st, s2, st2),
+                   "ngram conv seg");
+        got[seg][0] = download(gR, n);
+        got[seg][1] = download(gh, nh);
+        if (s1) got[seg][2] = download(s1, nh);
+        if (s2) got[seg][3] = download(s2, nh);
+        ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gn); ds4_gpu_tensor_free(gh);
+        ds4_gpu_tensor_free(s1); ds4_gpu_tensor_free(s2);
+    }
+    unsetenv("DS4_QWEN4_CONV_SEG");
+    char name[96];
+    snprintf(name, sizeof(name), "ngram conv seg exact T=%u C=%u K=%u/%u snap %u/%u", T, C, K, dil, st, st2);
+    require_ok(memcmp(got[0][0], got[1][0], n * 4) == 0 && memcmp(got[0][1], got[1][1], nh * 4) == 0 &&
+               (!got[0][2] || memcmp(got[0][2], got[1][2], nh * 4) == 0) &&
+               (!got[0][3] || memcmp(got[0][3], got[1][3], nh * 4) == 0), name);
+    printf("  %-44s ok\n", name);
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) free(got[i][j]);
+    free(R); free(gt); free(nm); free(hist);
+}
+
+static void test_gdn_pipe_exact(uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t st, uint32_t st2) {
+    const uint32_t D = 128, C = (2 * Hk + Hv) * D;
+    const uint64_t ns = (uint64_t)Hv * D * D, no = (uint64_t)T * Hv * D, nq = (uint64_t)T * C;
+    float *qkv = rand_vec(nq, 0.2f), *state = rand_vec(ns, 0.1f);
+    float *av = malloc((uint64_t)T * Hv * 4), *bv = malloc((uint64_t)T * Hv * 4), *got[2][4] = {{0}};
+    require_ok(av && bv, "gdn pipe alloc");
+    for (uint64_t i = 0; i < (uint64_t)T * Hv; i++) { av[i] = 0.75f + 0.25f * frand(); bv[i] = 0.5f + 0.5f * frand(); }
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_GDN_PIPE", pipe ? "1" : "0", 1);
+        ds4_gpu_tensor *gq = upload(qkv, nq), *ga = upload(av, (uint64_t)T * Hv), *gb = upload(bv, (uint64_t)T * Hv);
+        ds4_gpu_tensor *gs = upload(state, ns), *go = upload(NULL, no);
+        ds4_gpu_tensor *s1 = st < T ? upload(NULL, ns) : NULL, *s2 = st2 < T ? upload(NULL, ns) : NULL;
+        require_ok(ds4_gpu_qwen4_gdn_scan_tensor(go, gs, gq, ga, gb, T, Hk, Hv, D, s1, st, s2, st2), "gdn pipe");
+        got[pipe][0] = download(go, no);
+        got[pipe][1] = download(gs, ns);
+        if (s1) got[pipe][2] = download(s1, ns);
+        if (s2) got[pipe][3] = download(s2, ns);
+        ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(gs);
+        ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(s1); ds4_gpu_tensor_free(s2);
+    }
+    unsetenv("DS4_QWEN4_GDN_PIPE");
+    char name[96];
+    snprintf(name, sizeof(name), "gdn pipe exact T=%u heads %u/%u snap %u/%u", T, Hk, Hv, st, st2);
+    require_ok(memcmp(got[0][0], got[1][0], no * 4) == 0 && memcmp(got[0][1], got[1][1], ns * 4) == 0 &&
+               (!got[0][2] || memcmp(got[0][2], got[1][2], ns * 4) == 0) &&
+               (!got[0][3] || memcmp(got[0][3], got[1][3], ns * 4) == 0), name);
+    printf("  %-44s ok\n", name);
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) free(got[i][j]);
+    free(qkv); free(state); free(av); free(bv);
+}
+
+static void test_prefill_pipes_exact_all(arena_t *a) {
+    test_conv_seg_exact(a, 9, 10240, 4, true);
+    test_conv_seg_exact(a, 47, 10240, 4, true);
+    test_conv_seg_exact(a, 8192, 10240, 4, true);
+    test_conv_seg_exact(a, 8193, 100, 4, false);
+    test_conv_seg_exact(a, 33, 77, 3, true);
+    test_conv_seg_exact(a, 20, 64, 2, true);
+    test_ngram_conv_seg_exact(a, 8192, 10240, 4, 3, 0, 4000, 8191);
+    test_ngram_conv_seg_exact(a, 9, 10240, 4, 3, 1, 0, 1);
+    test_ngram_conv_seg_exact(a, 77, 100, 3, 2, 0, 76, 1000);
+    test_gdn_pipe_exact(9, 16, 48, 0, 1);
+    test_gdn_pipe_exact(37, 16, 48, 13, 36);
+    test_gdn_pipe_exact(200, 16, 48, 0, 1000);
+    test_gdn_pipe_exact(1001, 2, 6, 600, 999);
+    test_gdn_pipe_exact(8192, 16, 48, 8191, 8191);
+}
+
 #endif
 
 static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
@@ -5092,6 +5198,42 @@ static void bench_attn_prefill(void) {
 }
 #endif
 
+#ifndef __APPLE__
+/* DS4_TEST_QWEN4_GDN_BENCH=1: one prefill chunk's conv and scan (8192 rows
+ * of a GDN layer), per kernel (DS4_QWEN4_CONV_SEG=0 / DS4_QWEN4_GDN_PIPE=0
+ * for the originals) */
+typedef struct { ds4_gpu_tensor *qkv, *hist, *state, *a, *b, *out; arena_t *ar; uint64_t w; uint32_t T; } gdn_bench;
+static int bench_gdn_conv(void *ud) {
+    gdn_bench *c = ud;
+    return ds4_gpu_qwen4_conv_stream_tensor(c->qkv, c->hist, c->ar->base, c->ar->size, c->w, c->T, 10240, 4, true);
+}
+static int bench_gdn_scan_chunk(void *ud) {
+    gdn_bench *c = ud;
+    return ds4_gpu_qwen4_gdn_scan_tensor(c->out, c->state, c->qkv, c->a, c->b, c->T, 16, 48, 128, NULL, 0u, NULL, 0u);
+}
+
+static void bench_gdn_prefill(arena_t *ar) {
+    const uint32_t T = 8192, C = 10240, Hv = 48, D = 128;
+    double *sh;
+    gdn_bench c = { upload(NULL, (uint64_t)T * C), upload(NULL, 3 * C), upload(NULL, Hv * D * D), upload(NULL, T * Hv),
+                    upload(NULL, T * Hv), upload(NULL, (uint64_t)T * Hv * D), ar, arena_f32(ar, C * 4, &sh, -0.5f, 0.5f), T };
+    free(sh);
+    require_ok(ds4_gpu_tensor_fill_f32(c.qkv, 0.01f, (uint64_t)T * C) && ds4_gpu_tensor_fill_f32(c.a, 0.9f, T * Hv) &&
+               ds4_gpu_tensor_fill_f32(c.b, 0.3f, T * Hv), "gdn bench setup");
+    for (int v = 0; v < 2; v++) {
+        setenv("DS4_QWEN4_CONV_SEG", v ? "1" : "0", 1);
+        setenv("DS4_QWEN4_GDN_PIPE", v ? "1" : "0", 1);
+        bench_run(v ? "conv seg T=8192" : "conv T=8192", bench_gdn_conv, &c, 10);
+        bench_run(v ? "gdn scan pipe T=8192" : "gdn scan T=8192", bench_gdn_scan_chunk, &c, v ? 10 : 3);
+    }
+    unsetenv("DS4_QWEN4_CONV_SEG");
+    unsetenv("DS4_QWEN4_GDN_PIPE");
+    ds4_gpu_tensor_free(c.qkv); ds4_gpu_tensor_free(c.hist); ds4_gpu_tensor_free(c.state);
+    ds4_gpu_tensor_free(c.a); ds4_gpu_tensor_free(c.b); ds4_gpu_tensor_free(c.out);
+}
+
+#endif
+
 static void bench_idx_select(void) {
     const uint32_t ns[] = { 1024, 2048, 4096, 8192, 16384, 32768, 50000, 65536, 131072, 262144 };
     for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
@@ -5289,6 +5431,8 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_IDX_TOPK_BENCH")) { bench_idx_topk(); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_PIPE_ONLY")) { test_attn_pipe_exact_all(); printf("all qwen4 attention pipe tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_BENCH")) { bench_attn_prefill(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_PREFILL_PIPES_ONLY")) { test_prefill_pipes_exact_all(&arena); printf("all qwen4 prefill pipe tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_GDN_BENCH")) { bench_gdn_prefill(&arena); return 0; }
 #endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
@@ -5346,6 +5490,9 @@ int main(void) {
     test_gdn(&arena, 16, 48, 128, 5);
     test_gdn(&arena, 16, 48, 128, 40);
     test_gdn(&arena, 16, 48, 128, 200);
+#ifndef __APPLE__
+    test_prefill_pipes_exact_all(&arena);
+#endif
     test_idx_score_mm(37, 3001, 11000);
     test_idx_score_mm(3, 70, 100);
 #ifndef __APPLE__
