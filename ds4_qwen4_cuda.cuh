@@ -3142,6 +3142,9 @@ __device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_mxfp4 &r, u
  * ldmatrix rows and the dequant stores hit distinct banks */
 __device__ __forceinline__ unsigned xw_chunk(unsigned r, unsigned c) { return r*128+((c^(r%8))*16); }
 
+/* the same for 64-byte rows: the tensor memory accelerator's 64-byte swizzle */
+__device__ __forceinline__ unsigned sp_chunk(unsigned r, unsigned c) { return r*64+((c^(r/2%4))*16); }
+
 __device__ __forceinline__ void bar_sync(unsigned id, unsigned n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ void bar_arrive(unsigned id, unsigned n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 
@@ -4311,6 +4314,122 @@ __global__ void __launch_bounds__(256, 1) dense_f16_pipe(float *out, const __hal
 #endif
 }
 
+/* The HC up projection of a prefill chunk (dense_f16_pipe's products and
+ * rounding) and hc_rows on its outputs in one kernel: a block takes 32
+ * columns d of every stream (weight rows s * E + d) by 64 tokens, and a
+ * warp's four m16 tiles are the four streams of the same 16 columns, so
+ * each thread holds the hc values hc_rows sums for its outputs and sums
+ * them in hc_rows' order.  The T x hc x E up projection is never written or
+ * read back.  32 k a stage, two stages (32 KB): two blocks an SM, one
+ * block's epilogue beside the other's products. */
+constexpr unsigned HU_BN = 64, HU_SMEM = 2*(128+2*HU_BN)*64;
+
+__global__ void __launch_bounds__(256, 2) hc_up_rows(float *dst, const __half *xh, const __half *xl,
+        const __half *w, const float *scales, const float *xn, unsigned T, unsigned K, unsigned E, unsigned hc,
+        const float *R, const float *invs, const float *gamma) {
+    extern __shared__ __align__(128) unsigned char hu_smem[];
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, lane = tid%32, warp = tid/32;
+    const unsigned d0 = blockIdx.x*32, t0 = blockIdx.y*HU_BN, KS = K/32;
+    /* stage rows: weight rows (stream r / 32, column d0 + r % 32), then hi and lo of tokens t0.. */
+    constexpr unsigned ROWS = 128+2*HU_BN;
+    auto load = [&](unsigned ks) {
+        if (ks < KS) {
+            unsigned char *st = hu_smem+ks%2*ROWS*64;
+            for (unsigned i = tid; i < ROWS*4; i += 256) {
+                const unsigned r = i/4, c = i%4, k = ks*32+c*8;
+                const __half *src;
+                bool v;
+                if (r < 128) {
+                    const unsigned s = r/32, d = d0+r%32;
+                    v = s < hc && d < E;
+                    src = w+(uint64_t)(v ? s*E+d : 0)*K;
+                } else {
+                    const unsigned t = t0+(r-128)%HU_BN;
+                    v = t < T;
+                    src = (r < 128+HU_BN ? xh : xl)+(uint64_t)(v ? t : 0)*K;
+                }
+                tt_cp_async_16B(st+sp_chunk(r,c),src+k,v);
+            }
+        }
+        tt_cp_async_commit();
+    };
+    load(0);
+    load(1);
+    /* the epilogue's xn (or R) rows (128 bytes of each token's stream) start for L2 during the products */
+    const float *xr = R ? R : xn;
+    for (unsigned q = tid; q < HU_BN*hc; q += 256) {
+        const unsigned t = t0+q/hc;
+        if (t < T) asm volatile("prefetch.global.L2 [%0];" :: "l"(xr+((uint64_t)t*hc+q%hc)*E+d0));
+    }
+    /* warp: columns wm*16.. of the four streams by tokens wt*16.. */
+    const unsigned wm = warp%2, wt = warp/2;
+    float hi[4][2][4] = {}, lo[4][2][4] = {};
+    for (unsigned ks = 0; ks < KS; ks++) {
+        tt_cp_async_wait_group<1>();
+        __syncthreads();
+        const unsigned char *st = hu_smem+ks%2*ROWS*64;
+        #pragma unroll
+        for (unsigned k16 = 0; k16 < 2; k16++) {
+            uint32_t a[4][4], bh[4], bl[4];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) tt_ldmatrix_x4(a[i],st+sp_chunk(i*32+wm*16+lane%16,k16*2+lane/16));
+            const unsigned rb = 128+wt*16+lane%8+lane/16*8, c = k16*2+lane/8%2;
+            tt_ldmatrix_x4(bh,st+sp_chunk(rb,c));
+            tt_ldmatrix_x4(bl,st+sp_chunk(HU_BN+rb,c));
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++)
+                #pragma unroll
+                for (unsigned j = 0; j < 2; j++) {
+                    const uint32_t b0[2] = {bh[j*2],bh[j*2+1]}, b1[2] = {bl[j*2],bl[j*2+1]};
+                    tt_mma_m16n8k16_f16_f32(hi[i][j],a[i],b0);
+                    tt_mma_m16n8k16_f16_f32(lo[i][j],a[i],b1);
+                }
+        }
+        __syncthreads();
+        load(ks+2);
+    }
+    tt_cp_async_wait_group<0>();
+    /* c0,c1: column lane/4, tokens lane%4*2 and +1; c2,c3: column lane/4+8; tile i is stream i */
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        #pragma unroll
+        for (unsigned v2 = 0; v2 < 2; v2++)
+            #pragma unroll
+            for (unsigned h = 0; h < 2; h++) {
+                const unsigned d = d0+wm*16+lane/4+v2*8, t = t0+wt*16+j*8+lane%4*2+h, e = v2*2+h;
+                if (d >= E || t >= T) continue;
+                float v = 0;
+                #pragma unroll
+                for (unsigned s = 0; s < 4; s++) {
+                    if (s >= hc) break;
+                    float u = hi[s][j][e];
+                    u += lo[s][j][e]*0x1p-12f;
+                    const uint64_t i = ((uint64_t)t*hc+s)*E+d;
+                    /* hc_norm_split leaves xn to be recomputed as hc_norm_prefill does */
+                    const float x = R ? R[i]*invs[(uint64_t)t*hc+s]*gamma[s*E+d] : xn[i];
+                    v += sigmoid(u*scales[t])*x;
+                }
+                dst[(uint64_t)t*E+d] = v/hc;
+            }
+#endif
+}
+
+/* dense_f16_blas past K = 512 on packed components: two cuBLAS GEMMs and the rescale */
+static int dense_f16_packed(float *out, const __half *hi, const __half *lo, const float *scales, const __half *w,
+        unsigned T, unsigned K, unsigned M) {
+    const float zero = 0, one = 1, low = 0x1p-12f;
+    if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                M,T,K,&low,w,CUDA_R_16F,K,lo,CUDA_R_16F,K,&zero,out,CUDA_R_32F,M,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 residual projection") ||
+        !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                M,T,K,&one,w,CUDA_R_16F,K,hi,CUDA_R_16F,K,&one,out,CUDA_R_32F,M,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 leading projection")) return 0;
+    launch(dense_rescale, ((uint64_t)M*T+255)/256, 256, 0, out,scales,M,T);
+    return launched();
+}
+
 static int dense_f16_blas(float *out, const float *x, const __half *w,
         unsigned T, unsigned K, unsigned M) {
     const uint64_t xn = (uint64_t)T*K;
@@ -4331,15 +4450,7 @@ static int dense_f16_blas(float *out, const float *x, const __half *w,
         else launch(dense_f16_components, dim3((M+63)/64,(T+63)/64), 256, 0, out,hi,lo,w,scales,T,K,M);
         return launched();
     }
-    const float zero = 0, one = 1, low = 0x1p-12f;
-    if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                M,T,K,&low,w,CUDA_R_16F,K,lo,CUDA_R_16F,K,&zero,out,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 residual projection") ||
-        !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                M,T,K,&one,w,CUDA_R_16F,K,hi,CUDA_R_16F,K,&one,out,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 leading projection")) return 0;
-    launch(dense_rescale, ((uint64_t)M*T+255)/256, 256, 0, out,scales,M,T);
-    return launched();
+    return dense_f16_packed(out,hi,lo,scales,w,T,K,M);
 }
 
 __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
@@ -4372,9 +4483,6 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
 constexpr unsigned SP_BM = 128, SP_BN = 96, SP_STAGES = 3, SP_ROWS = 2*SP_BM+2*SP_BN;
 constexpr unsigned SP_STAGE = SP_ROWS*64, SP_SMEM = SP_STAGES*SP_STAGE+1024+64;
 
-/* 16-byte chunk c of row r in a stage: the copies' 64-byte swizzle, so the
- * ldmatrix rows hit distinct banks */
-__device__ __forceinline__ unsigned sp_chunk(unsigned r, unsigned c) { return r*64+((c^(r/2%4))*16); }
 
 __device__ __forceinline__ void tma_2d(void *dst, const CUtensorMap *map, int x, int y, uint64_t *bar) {
 #if __CUDA_ARCH__ >= 900
@@ -5560,6 +5668,79 @@ __global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
     }
 }
 
+/* hc_norm_prefill for all hc streams of a token in one block (256 threads
+ * a stream, each group doing what a hc_norm_prefill block does, the same
+ * partial sums in the same order), then pack_half_rows of the token's hc *
+ * E values for the HC down projection, without writing them: hc_up_rows
+ * recomputes them from R and inv[t * hc + stream].  Needs E <= 3072. */
+template<unsigned TYPE>
+__global__ void __launch_bounds__(1024) hc_norm_split(__half *hi, __half *lo, float *xs, float *invs, float *inj,
+        const float *R, const float *gamma, const char *wi, unsigned E, unsigned hc, unsigned ni, float eps) {
+    pdl_enter();
+    const unsigned tok = blockIdx.x, stream = threadIdx.x/256, tid = threadIdx.x%256, lane = tid&31, chunk = tid/32;
+    const unsigned dim = E*hc, per = (E+7)/8;
+    const uint64_t base = ((uint64_t)tok*hc+stream)*E;
+    __shared__ float red[4][8], mxs[32], sinv;
+    float ss = 0;
+    if (tid < 128) for (unsigned i = tid; i < E; i += 128)
+        ss += R[base+i]*R[base+i];
+    /* block_sum over the stream's eight warps */
+    ss = sum(ss);
+    if (!lane) red[stream][chunk] = ss;
+    __syncthreads();
+    float tot = 0;
+    for (unsigned i = 0; i < 8; i++) tot += red[stream][i];
+    const float inv = rsqrtf(tot/E+eps);
+    float acc[4][4] = {}, v[4][3], mx = 0;
+    const unsigned end = min(E,(chunk+1)*per);
+    #pragma unroll
+    for (unsigned part = 0; part < 4; part++)
+        #pragma unroll
+        for (unsigned k = 0; k < 3; k++) {
+            const unsigned i = chunk*per+lane+part*32+k*128;
+            if (i < end) {
+                const float x = R[base+i]*inv*gamma[stream*E+i];
+                v[part][k] = x;
+                mx = fmaxf(mx,fabsf(x));
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) if (j < ni)
+                    acc[j][part] += value<TYPE>(wi,j*dim+stream*E+i)*x;
+            }
+        }
+    #pragma unroll
+    for (unsigned j = 0; j < 4; j++) if (j < ni) {
+        float a = 0;
+        #pragma unroll
+        for (unsigned part = 0; part < 4; part++) a += sum(acc[j][part]);
+        if (!lane) inj[((uint64_t)tok*hc*8+stream*8+chunk)*ni+j] = a;
+    }
+    if (!tid) invs[(uint64_t)tok*hc+stream] = inv;
+    /* pack_half_rows of the token's row */
+    for (int d = 16; d; d >>= 1) mx = fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));
+    if (!lane) mxs[threadIdx.x/32] = mx;
+    __syncthreads();
+    if (!threadIdx.x) {
+        for (unsigned w = 1; w < blockDim.x/32; w++) mx = fmaxf(mx,mxs[w]);
+        const int e = mx > 0 ? max(-120,min(120,(int)((__float_as_uint(mx)>>23)&255)-127)) : 0;
+        sinv = ldexpf(1,-e); xs[tok] = ldexpf(1,e);
+    }
+    __syncthreads();
+    const float sc = sinv;
+    #pragma unroll
+    for (unsigned part = 0; part < 4; part++)
+        #pragma unroll
+        for (unsigned k = 0; k < 3; k++) {
+            const unsigned i = chunk*per+lane+part*32+k*128;
+            if (i < end) {
+                const float f = v[part][k]*sc;
+                const __half h = __float2half_rn(f);
+                const uint64_t o = (uint64_t)tok*dim+stream*E+i;
+                hi[o] = h;
+                lo[o] = __float2half_rn((f-__half2float(h))*4096);
+            }
+        }
+}
+
 template<unsigned TYPE>
 __global__ void hc_mix(float *out, const float *xn, const float *lo,
                        const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
@@ -6499,6 +6680,87 @@ extern "C" int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *dst,
         !tensor(up, (uint64_t)T * hc * E * 4) || !tensor(xn, (uint64_t)T * hc * E * 4)) return 0;
     launch(hc_rows, dim3((E + 255) / 256, T), 256, 0,
         (float *)dst->ptr, (const float *)up->ptr, (const float *)xn->ptr, E, hc);
+    return launched();
+}
+
+/* The prefill HC up projection (F16, rank <= 512 inputs) and hc_mix_rows
+ * in one kernel where dense_mm_tensor would take dense_f16_pipe; returns 0
+ * otherwise (DS4_QWEN4_HC_UP_ROWS=0 too), and the caller runs the two. */
+extern "C" int ds4_gpu_qwen4_hc_up_rows_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *act,
+        const ds4_gpu_tensor *xn, const void *map, uint64_t size, uint64_t up, uint32_t type,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t rank) {
+    using namespace qwen4_cuda;
+    if (type != 1 || T <= 32 || select_rows(T) < 32 || !hc || hc > 4 || E%32 || rank > 512 || rank%64 ||
+        !g_cublas_ready || g_quality_mode || getenv("DS4_CUDA_NO_TF32") || !ds4_cuda_attn_tokentile_arch_ok() ||
+        !env_on("DS4_QWEN4_HC_UP_ROWS") || !env_on("DS4_QWEN4_F16_PIPE") ||
+        !tensor(dst,(uint64_t)T*E*4) || !tensor(act,(uint64_t)T*rank*4) || !tensor(xn,(uint64_t)T*hc*E*4)) return 0;
+    const __half *w = (const __half *)weight(map,size,up,(uint64_t)rank*2*E*hc);
+    static int opted = -1;
+    if (opted < 0) {
+        opted = cudaFuncSetAttribute(hc_up_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, HU_SMEM) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    if (!w || ((uintptr_t)w&15) || !opted) return 0;
+    const uint64_t xn_ = (uint64_t)T*rank;
+    __half *hi = (__half *)cuda_tmp_alloc((xn_+T)*4,"Qwen HC up scratch");
+    if (!hi) return 0;
+    __half *lo = hi+xn_;
+    float *scales = (float *)(lo+xn_);
+    pack_rows(scales,hi,lo,(const float *)act->ptr,T,rank);
+    launch(hc_up_rows, dim3(E/32,(T+HU_BN-1)/HU_BN), 256, HU_SMEM, (float *)dst->ptr,hi,lo,w,scales,
+           (const float *)xn->ptr,T,rank,E,hc,(const float *)nullptr,(const float *)nullptr,(const float *)nullptr);
+    return launched();
+}
+
+/* A prefill HC mix of F16 down and up weights in four launches: hc_norm_split
+ * (hc_norm_tensor and the HC down projection's pack_half_rows in one pass,
+ * xn never written), the HC down GEMMs on its components, hc_lo, and
+ * hc_up_rows recomputing xn; the outputs (mixed, inj, lo, act) equal those
+ * of hc_norm_tensor, dense_mm_tensor (down), hc_lo_act_tensor, dense_mm_tensor
+ * (up) and hc_mix_rows_tensor.  hilo (T * hc * E floats) and scales (T * (1 +
+ * hc) floats) are scratch.  Returns 0 before any launch where it does not
+ * apply (DS4_QWEN4_HC_FUSE=0 too). */
+extern "C" int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *lo,
+        ds4_gpu_tensor *act, ds4_gpu_tensor *hilo, ds4_gpu_tensor *scales, const ds4_gpu_tensor *R,
+        const void *map, uint64_t size, uint64_t norm, uint64_t io, uint32_t itype, uint64_t down, uint64_t up,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, uint32_t rank, float eps) {
+    using namespace qwen4_cuda;
+    const uint64_t n = (uint64_t)T*E*hc, K = (uint64_t)E*hc;
+    /* past K = 512 the reference's down projection is dense_f16_blas's cuBLAS path */
+    if (T <= 32 || select_rows(T) < 32 || !hc || hc > 4 || ni > 4 || E%32 || E > 3072 || rank > 512 || rank%64 ||
+        K <= 512 || K > INT_MAX || (ni && itype != 0 && itype != 1 && itype != 8) ||
+        !g_cublas_ready || g_quality_mode || getenv("DS4_CUDA_NO_TF32") || !ds4_cuda_attn_tokentile_arch_ok() ||
+        !env_on("DS4_QWEN4_HC_FUSE") || !env_on("DS4_QWEN4_HC_UP_ROWS") || !env_on("DS4_QWEN4_F16_PIPE") ||
+        !env_on("DS4_QWEN4_PACK_ROWS") || !tensor(mixed,(uint64_t)T*E*4) || !tensor(R,n*4) || !tensor(hilo,n*4) ||
+        !tensor(scales,(uint64_t)T*(1+hc)*4) || !tensor(lo,(uint64_t)T*rank*4) || !tensor(act,(uint64_t)T*rank*4) ||
+        (ni && !tensor(inj,(uint64_t)T*hc*8*ni*4))) return 0;
+    const float *gamma = (const float *)weight(map,size,norm,n/T*4);
+    const char *wi = ni ? weight(map,size,io,row_bytes(itype,K)*ni) : (const char *)gamma;
+    const __half *wd = (const __half *)weight(map,size,down,K*rank*2), *wu = (const __half *)weight(map,size,up,K*rank*2);
+    static int opted = -1;
+    if (opted < 0) {
+        opted = cudaFuncSetAttribute(hc_up_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, HU_SMEM) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    if (!gamma || !wi || !wd || !wu || ((uintptr_t)wu&15) || !opted) return 0;
+    __half *hi = (__half *)hilo->ptr, *lw = hi+n;
+    float *xs = (float *)scales->ptr, *invs = xs+T;
+#define QWEN_HC_SPLIT(TYPE) launch(hc_norm_split<TYPE>, T, 256*hc, 0, hi,lw,xs,invs,ni ? (float *)inj->ptr : nullptr, \
+        (const float *)R->ptr,gamma,wi,E,hc,ni,eps)
+    if (!ni || itype == 0) { QWEN_HC_SPLIT(0); }
+    else if (itype == 1) { QWEN_HC_SPLIT(1); }
+    else { QWEN_HC_SPLIT(8); }
+#undef QWEN_HC_SPLIT
+    if (!launched() || !dense_f16_packed((float *)lo->ptr,hi,lw,xs,wd,T,(unsigned)K,rank)) return 0;
+    launch(hc_lo, ((uint64_t)T*rank+255)/256, 256, 0, (float *)act->ptr,(const float *)lo->ptr,(uint64_t)T*rank,hc);
+    const uint64_t an = (uint64_t)T*rank;
+    __half *ah = (__half *)cuda_tmp_alloc((an+T)*4,"Qwen HC up scratch");
+    if (!launched() || !ah) return 0;
+    __half *al = ah+an;
+    float *as = (float *)(al+an);
+    pack_rows(as,ah,al,(const float *)act->ptr,T,rank);
+    launch(hc_up_rows, dim3(E/32,(T+HU_BN-1)/HU_BN), 256, HU_SMEM, (float *)mixed->ptr,ah,al,wu,as,
+           (const float *)nullptr,T,rank,E,hc,(const float *)R->ptr,(const float *)invs,gamma);
     return launched();
 }
 
