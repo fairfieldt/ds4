@@ -1,0 +1,5 @@
+kernel,replaces,power_limit_w,rows,us_per_launch,note
+dense_mm (HC up) + hc_mix_rows,,600,8192,868.3,"HC up projection (rank 320 to 4 x 2560, F16) and the mix of one chunk, DS4_TEST_QWEN4_HC_BENCH=1"
+hc_up_rows,dense_mm (HC up) + hc_mix_rows,600,8192,482.3,"one 256-thread block per 32 columns x 64 tokens, two blocks an SM"
+hc_up_rows (first version),dense_mm (HC up) + hc_mix_rows,600,8192,639.3,"dropped: 128 tokens a block, sigmoid(up) through shared memory, one block an SM"
+hc_up_rows (first version) with L2 prefetch,dense_mm (HC up) + hc_mix_rows,600,8192,529.0,dropped
