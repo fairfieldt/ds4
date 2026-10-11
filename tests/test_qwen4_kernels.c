@@ -1946,7 +1946,44 @@ static void test_split_exact_all(arena_t *a) {
     test_split_multi_exact(a, 5000, 2560, 2, m2);
 }
 
+/* Prefill embedding rows (embed_rows): every BF16 bit pattern, NaN payloads
+ * included, widens as the host widens it (the bits shifted up) into each
+ * stream; other table types are declined. */
+static void test_embed_rows_exact(arena_t *a, uint32_t T, uint32_t E, uint32_t hc, uint32_t vocab) {
+    const uint64_t off = arena_alloc(a, (uint64_t)vocab * E * 2);
+    uint16_t *w = (uint16_t *)(a->base + off);
+    uint32_t h = 12345u + T;
+    for (uint64_t i = 0; i < (uint64_t)vocab * E; i++) { h = h * 1664525u + 1013904223u; w[i] = (uint16_t)(h >> 16); }
+    int32_t *ids = malloc((uint64_t)T * 4);
+    for (uint32_t t = 0; t < T; t++) { h = h * 1664525u + 1013904223u; ids[t] = (int32_t)((h >> 8) % vocab); }
+    ids[0] = 0;
+    ids[T - 1] = (int32_t)vocab - 1;
+    ds4_gpu_tensor *gi = ds4_gpu_tensor_alloc((uint64_t)T * 4), *R = upload(NULL, (uint64_t)T * E * hc);
+    require_ok(gi && ds4_gpu_tensor_write(gi, 0, ids, (uint64_t)T * 4), "embed rows ids");
+    require_ok(ds4_gpu_qwen4_embed_rows_tensor(R, gi, a->base, a->size, off, 1u, vocab, T, E, hc) == 0,
+               "embed rows declines F16");
+    require_ok(ds4_gpu_qwen4_embed_rows_tensor(R, gi, a->base, a->size, off, 30u, vocab, T, E, hc) == 1, "embed rows");
+    float *got = download(R, (uint64_t)T * E * hc);
+    uint64_t bad = 0;
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < hc; s++)
+            for (uint32_t e = 0; e < E; e++) {
+                const uint32_t want = (uint32_t)w[(uint64_t)ids[t] * E + e] << 16;
+                uint32_t bits;
+                memcpy(&bits, got + ((uint64_t)t * hc + s) * E + e, 4);
+                bad += bits != want;
+            }
+    char name[96];
+    snprintf(name, sizeof(name), "embed rows exact T=%u E=%u hc=%u", T, E, hc);
+    require_ok(bad == 0, name);
+    printf("  %-44s ok\n", name);
+    free(got); free(ids);
+    ds4_gpu_tensor_free(gi); ds4_gpu_tensor_free(R);
+}
+
 static void test_prefill_pipes_exact_all(arena_t *a) {
+    test_embed_rows_exact(a, 8192, 2560, 4, 4096);
+    test_embed_rows_exact(a, 37, 64, 3, 100);
     test_hc_up_rows_exact(a, 8192, 2560, 4, 320);
     test_hc_up_rows_exact(a, 33, 2560, 4, 320);
     test_hc_up_rows_exact(a, 4099, 2560, 4, 320);
