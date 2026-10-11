@@ -3151,14 +3151,14 @@ __device__ __forceinline__ void bar_arrive(unsigned id, unsigned n) { asm volati
 /* tile q of the schedule: the expert, its token count, first token and first A row */
 struct xw_tile { unsigned e, count, t0, r0; };
 __device__ __forceinline__ xw_tile xw_decode(unsigned q, unsigned nr, unsigned rows, const unsigned *tiles,
-        const int *counts, unsigned NE) {
+        const int *counts, unsigned NE, unsigned nt = XW_NT) {
     const unsigned job = q/nr;
     unsigned e = 0, end = NE;
     while (e < end) {
         const unsigned mid = (e+end)/2;
         if (tiles[mid+1] <= job) e = mid+1; else end = mid;
     }
-    return {e,(unsigned)counts[e],(job-tiles[e])*XW_NT,q%nr*rows};
+    return {e,(unsigned)counts[e],(job-tiles[e])*nt,q%nr*rows};
 }
 
 template<unsigned TYPE, bool DOWN>
@@ -3323,6 +3323,167 @@ __global__ void __launch_bounds__(512, 1) matrix_half_ws(float *out, const __hal
 #endif
 }
 
+/* matrix_half_ws on wider tiles: 128 A rows (64 gate rows and the same up
+ * rows, or 128 down rows) by 192 tokens, so a weight is dequantized once
+ * per 192 of an expert's tokens instead of 64 (once per expert at 8192
+ * rows) and the products per dequantized value triple.  Four producer warps
+ * (a thread per A row) dequantize a step while the consumers multiply the
+ * one before; the activations of a step go into its stage when the
+ * producers start it, behind the same empty barrier as the weights.  Eight
+ * consumer warps take 32 A rows (gate/up: 16 of each) by 96 tokens. */
+constexpr unsigned WB_NT = 192, WB_AR = 128, WB_SMEM = 2*WB_AR*128+2*WB_NT*128+2*WB_NT*4+16*4;
+
+/* a 16-byte copy that zero-fills where !valid (source size 0), without a branch */
+__device__ __forceinline__ void wb_cp16(void *dst, const void *src, bool valid) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(smem_addr(dst)), "l"(src), "r"(valid ? 16u : 0u));
+#endif
+}
+
+template<unsigned TYPE, bool DOWN>
+__global__ void __launch_bounds__(384, 1) matrix_half_wb(float *out, const __half *xh,
+        const char *w0, const char *w1, const int *lists, const int *counts, const unsigned *tiles,
+        unsigned NE, unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    extern __shared__ __align__(128) unsigned char wb_smem[];
+    unsigned char *As = wb_smem, *Bs = wb_smem+2*WB_AR*128;
+    int *pairs = (int *)(Bs+2*WB_NT*128);
+    float *lut = (float *)(pairs+2*WB_NT);
+    enum { FULL = 1, EMPTY = 3, PROD = 5 };
+    constexpr unsigned G = DOWN ? WB_AR : WB_AR/2, NB = 8*WB_NT/WB_AR;
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, rows = G, nr = (M+rows-1)/rows, KS = K/64;
+    const unsigned ntiles = tiles[NE]*nr, mine = blockIdx.x < ntiles ? (ntiles-blockIdx.x+gridDim.x-1)/gridDim.x : 0;
+    const unsigned steps = mine*KS;
+    if (tid >= 256) {
+        /* producers: thread p dequantizes A row p (gate rows, then the same up rows) */
+        const unsigned p = tid-256;
+        if (TYPE == 39 && p < 16) {
+            const unsigned mag = p&7;
+            const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+            lut[p] = p&8 ? -level : level;
+        }
+        bar_sync(PROD,WB_AR);
+        typedef typename xw_raw<TYPE>::type raw_t;
+        /* a tile's expert, weight row and activation rows (tokens p / 8 + 16c, chunk p % 8) */
+        struct state { unsigned it; xw_tile t; const char *wrow; const __half *b[NB]; };
+        auto enter = [&](state &st, unsigned it) {
+            st.it = it;
+            st.t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE,WB_NT);
+            const unsigned arow = st.t.r0+p%G;
+            st.wrow = (DOWN || p < G ? w0 : w1)+((uint64_t)st.t.e*M+(arow < M ? arow : 0))*rb;
+            #pragma unroll
+            for (unsigned c = 0; c < NB; c++) {
+                const unsigned item = st.t.t0+p/8+c*(WB_AR/8);
+                const int pr = item < st.t.count ? lists[(uint64_t)st.t.e*cap+item] : -1;
+                st.b[c] = pr < 0 ? nullptr : xh+(DOWN ? (uint64_t)(pr/NS)*NO+pr%NS : (uint64_t)pr/NS)*K+p%8*8;
+            }
+        };
+        struct cursor { state st; unsigned ks; };
+        auto advance = [&](cursor &c) {
+            if (++c.ks == KS) { c.ks = 0; if (c.st.it+1 < mine) enter(c.st,c.st.it+1); else c.st.it++; }
+        };
+        cursor cur = {}, braw;
+        if (steps) enter(cur.st,0);
+        braw = cur;
+        auto load_raw = [&](raw_t &raw, unsigned g) {
+            if (g < steps) xw_load(raw,braw.st.wrow,braw.ks*64);
+            advance(braw);
+        };
+        auto produce = [&](unsigned g, const raw_t &raw) {
+            if (g >= 2) bar_sync(EMPTY+g%2,WB_AR+256);
+            /* the step's activations into its stage, landing during the dequant */
+            unsigned char *B = Bs+g%2*WB_NT*128;
+            #pragma unroll
+            for (unsigned c = 0; c < NB; c++)
+                wb_cp16(B+xw_chunk(p/8+c*(WB_AR/8),p%8),cur.st.b[c] ? cur.st.b[c]+cur.ks*64 : xh,cur.st.b[c] != nullptr);
+            tt_cp_async_commit();
+            const unsigned ks = cur.ks, arow = cur.st.t.r0+p%G;
+            if (ks == 0)
+                for (unsigned q = p; q < WB_NT; q += WB_AR)
+                    pairs[cur.st.it%2*WB_NT+q] = cur.st.t.t0+q < cur.st.t.count ? lists[(uint64_t)cur.st.t.e*cap+cur.st.t.t0+q] : -1;
+            uint4 h[8];
+            if (arow < M) xw_dequant(h,raw,ks*64,lut);
+            else for (unsigned c = 0; c < 8; c++) h[c] = make_uint4(0,0,0,0);
+            unsigned char *A = As+g%2*WB_AR*128;
+            #pragma unroll
+            for (unsigned c = 0; c < 8; c++) *(uint4 *)(A+xw_chunk(p,c)) = h[c];
+            tt_cp_async_wait_group<0>();
+            __threadfence_block();
+            bar_arrive(FULL+g%2,WB_AR+256);
+            advance(cur);
+        };
+        raw_t ra, rbuf;
+        load_raw(ra,0);
+        load_raw(rbuf,1);
+        for (unsigned g = 0; g < steps; g += 2) {
+            produce(g,ra);
+            load_raw(ra,g+2);
+            if (g+1 < steps) {
+                produce(g+1,rbuf);
+                load_raw(rbuf,g+3);
+            }
+        }
+    } else {
+        /* consumers: warp tile of 32 A rows (gate/up: 16 of each) by 96 tokens */
+        const unsigned lane = tid%32, warp = tid/32, rg = warp%4, th = warp/4;
+        const unsigned mrow[2] = {DOWN ? rg*32 : rg*16, DOWN ? rg*32+16 : G+rg*16};
+        unsigned g = 0;
+        for (unsigned it = 0; it < mine; it++) {
+            const xw_tile t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE,WB_NT);
+            /* the 8-token columns holding the tile's tokens; the rest are never stored */
+            const int left = (int)(t.count-t.t0)-(int)(th*96);
+            const unsigned nj = left <= 0 ? 0 : left >= 96 ? 12 : (unsigned)(left+7)/8;
+            float acc[2][12][4] = {};
+            for (unsigned ks = 0; ks < KS; ks++, g++) {
+                bar_sync(FULL+g%2,WB_AR+256);
+                const unsigned char *A = As+g%2*WB_AR*128, *B = Bs+g%2*WB_NT*128;
+                if (nj) {
+                    #pragma unroll
+                    for (unsigned k16 = 0; k16 < 4; k16++) {
+                        uint32_t a[2][4], b[6][4];
+                        #pragma unroll
+                        for (unsigned i = 0; i < 2; i++)
+                            tt_ldmatrix_x4(a[i],A+xw_chunk(mrow[i]+lane%16,k16*2+lane/16));
+                        #pragma unroll
+                        for (unsigned j = 0; j < 6; j++)
+                            if (j*2 < nj) tt_ldmatrix_x4(b[j],B+xw_chunk(th*96+j*16+lane%8+lane/16*8,k16*2+lane/8%2));
+                        #pragma unroll
+                        for (unsigned j = 0; j < 12; j++) {
+                            if (j >= nj) break;
+                            const uint32_t bb[2] = {b[j/2][j%2*2],b[j/2][j%2*2+1]};
+                            #pragma unroll
+                            for (unsigned i = 0; i < 2; i++) tt_mma_m16n8k16_f16_f32(acc[i][j],a[i],bb);
+                        }
+                    }
+                }
+                if (g+2 < steps) bar_arrive(EMPTY+g%2,WB_AR+256);
+            }
+            const int *pp = pairs+it%2*WB_NT;
+            /* c0,c1: row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+            #pragma unroll
+            for (unsigned j = 0; j < 12; j++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const int pr = pp[th*96+j*8+lane%4*2+h];
+                    if (pr < 0) continue;
+                    float *o = out+((uint64_t)(pr/NS)*NO+pr%NS)*M;
+                    #pragma unroll
+                    for (unsigned i = 0; i < (DOWN ? 2 : 1); i++)
+                        #pragma unroll
+                        for (unsigned v = 0; v < 2; v++) {
+                            const unsigned row = t.r0+(DOWN ? mrow[i] : rg*16)+lane/4+v*8;
+                            if (row >= M) continue;
+                            if (DOWN) o[row] = acc[i][j][v*2+h];
+                            else o[row] = silu(acc[0][j][v*2+h])*acc[1][j][v*2+h];
+                        }
+                }
+        }
+    }
+#endif
+}
+
 /* The activations rounded to half once per call, as matrix_half_tile
  * rounds each one it loads. */
 __global__ void half_rows(__half *out, const float *x, uint64_t n) {
@@ -3347,9 +3508,31 @@ static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
     if (!scratch) return 0;
     unsigned *tiles = (unsigned *)scratch;
     __half *xh = (__half *)(scratch+tb);
-    launch(expert_tiles, 1, 1, 0, tiles,counts,NE,XW_NT);
+    /* the wide tiles for gate/up, and for down where an expert averages 64 tokens or more
+     * (fewer leave half a wide tile's consumer warps without columns) */
+    const bool wb = env_on("DS4_QWEN4_EXPERT_WB") && (!down || (uint64_t)T*NS >= (uint64_t)64*NE);
+    launch(expert_tiles, 1, 1, 0, tiles,counts,NE,wb ? WB_NT : XW_NT);
     launch(half_rows, (nx/4+255)/256, 256, 0, xh,x,nx);
     if (!launched()) return 0;
+    if (wb) {
+        static int wopted[2] = {-1,-1}, wsms = 0;
+        auto kernel = down ? matrix_half_wb<39,true> : matrix_half_wb<12,false>;
+        if (wopted[down] < 0) {
+            int dev = 0;
+            wopted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, WB_SMEM) == cudaSuccess &&
+                           cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                           cudaGetDevice(&dev) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&wsms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && wsms > 0;
+            (void)cudaGetLastError();
+        }
+        if (!wopted[down]) return 0;
+        const unsigned wrows = down ? WB_AR : WB_AR/2;
+        const uint64_t wjobs = ((uint64_t)T*NS+WB_NT-1)/WB_NT+NE, wblocks = wjobs*((M+wrows-1)/wrows);
+        launch(kernel, (unsigned)std::min<uint64_t>(wblocks,(uint64_t)wsms), 384, WB_SMEM,
+               out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+        return launched();
+    }
     const unsigned rows = down ? 256 : 128;
     const uint64_t jobs = ((uint64_t)T*NS+XW_NT-1)/XW_NT+NE, blocks = jobs*((M+rows-1)/rows);
     if (blocks > INT_MAX) return 0;
