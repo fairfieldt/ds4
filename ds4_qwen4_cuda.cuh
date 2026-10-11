@@ -3124,15 +3124,14 @@ __global__ void rows_tc_reduce(float *out, const float *part, unsigned n, unsign
     out[i] = v;
 }
 
-/* Which 4..32-row projections run on tensor cores.  F16 weights from
- * K = 1024 (the HC down projections; short F16 inputs keep the GEMV).  Q8
- * weights except the output head up to eight rows, which streams faster
- * through the GEMV, and four rows of a long input, where the GEMV keeps
- * up. */
-static bool rows_tc_shape(unsigned type, unsigned T, unsigned K, unsigned M) {
+/* Which 4..32-row projections run on tensor cores: F16 weights (the HC down
+ * and up projections), and Q8 weights except four rows of a long input,
+ * where the GEMV keeps up.  The output head (248K rows) also takes them from
+ * five rows: 481 against 581 to 713 us on the GEMV at five to eight. */
+static bool rows_tc_shape(unsigned type, unsigned T, unsigned K) {
     if (T < 4 || T > 32 || K%32 || !ds4_cuda_attn_tokentile_arch_ok()) return false;
-    if (type == 1) return T < 32 && K >= 1024;
-    return type == 8 && (M < 65536 || T > 8) && (T > 4 || K < 1024);
+    if (type == 1) return T < 32;
+    return type == 8 && (T > 4 || K < 1024);
 }
 
 /* A narrow launch (few 16-row tiles) leaves most of the GPU idle, so its
@@ -5301,7 +5300,7 @@ static int qwen4_dense_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     const unsigned S = select_rows(T);
     if (!ref && type == 0 && split_shape(S,K,M,(const float *)x->ptr))
         if (const char *b = bf16_copy(w,(uint64_t)K*M)) { w = b; type = 30; }
-    if (rows_tc_shape(type,S,K,M) && T <= 32 && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
+    if (rows_tc_shape(type,S,K) && T <= 32 && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
         rows_projections p = {};
         p.n = 1; p.p[0] = {w,(float *)out->ptr,M,(M+15)/16};
         return rows_tc_dispatch(p,(const float *)x->ptr,T,K,type,S);
@@ -5398,7 +5397,7 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t
     }
     bool fuse = tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15);
     for (unsigned i = 0; fuse && i < N; i++) {
-        fuse = types[i] == types[0] && rows_tc_shape(types[i],S,K,rows[i]) && T <= 32;
+        fuse = types[i] == types[0] && rows_tc_shape(types[i],S,K) && T <= 32;
         if (!fuse) break;
         const char *w = weight(map,size,offsets[i],row_bytes(types[i],K)*rows[i]);
         if (!w || !tensor(outs[i],(uint64_t)T*rows[i]*4)) return 0;
