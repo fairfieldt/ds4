@@ -26,6 +26,15 @@ The 95.37 GiB n-gram table stays on disk. The runtime reads selected rows
 directly from the GGUF, without mapping or preloading the table. Keep the
 file on a fast local SSD. No sidecar or n-gram option is needed.
 
+To halve the table, rewrite it as 8-bit rows:
+`gguf-tools/qwen4_ngram_8bit.py --model MODEL.gguf --output OUT.gguf --encoding i8`
+(an F32 scale and 160 int8 codes per row, 48.88 GiB). On the official
+fixtures with Q4 weights, int8 n-grams scored an NLL of 0.29043 against BF16's
+0.29051 on the 100 short cases and 0.12598 against 0.12594 on the 12 long ones,
+with 99.5% and 99.2% of greedy tokens unchanged. `--encoding e4m3` loses more
+(0.29072 and 0.12690). Warm decode speed is unchanged; a cold start reads half
+as much.
+
 The Q2 model uses IQ2_XXS gate/up experts and Q2_K down projections padded
 from 640 to 768 columns, calibrated with an imatrix. Q4 uses calibrated
 Q4_K gate/up and MXFP4 down experts. Context and runtime buffers still need
@@ -176,6 +185,7 @@ make tests/test_qwen4_ngram_state
 make -B -C gguf-tools quants-shared
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
+python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_ngram_8bit.py
 ```
 
 On CUDA, use `make test-qwen4-cuda` for the kernel tests. They compare the
