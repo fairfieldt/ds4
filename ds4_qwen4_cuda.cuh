@@ -405,6 +405,154 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
     out[(uint64_t)t * tiles + tile] = v;
 }
 
+/* Prefill rows: the scores of idx_score_body, bit for bit, for tiles of
+ * SCORE_ROWS rows x SCORE_BLOCKS blocks whose queries and keys are staged
+ * in shared memory once.  The per-warp kernels read every key again for
+ * every row (16 MB a row at 250K tokens of context) and reduce each score
+ * with five shuffles.  4 heads of 128 dims.
+ *
+ * idx_score_body gives lane l the products of dims l, l+32, l+64, l+96, in
+ * that order, as fused multiply-adds, then adds the 32 lane values with a
+ * butterfly over lanes (l, l^16), then (l, l^8), down to (l, l^1).  Taken in
+ * bit-reversed lane order that butterfly is a binary counter: each lane
+ * value merges at once with the pending subtrees of its size, so a score
+ * keeps at most four partial sums per half of the lanes (the even lanes,
+ * then the odd ones, whose two subtrees make the final add).  Shared memory
+ * holds each lane value's four dims together, as floats: queries [l][row],
+ * keys [l][block].  A thread scores rows 16 wr + lr + 4 m of blocks
+ * 32 wc + lc + 8 j (m, j < 4), and loads the next head's queries while it
+ * multiplies this head's. */
+enum { SCORE_ROWS = 32, SCORE_BLOCKS = 128 };
+constexpr unsigned SCORE_MM_SMEM = (32 * SCORE_ROWS + 32 * SCORE_BLOCKS) * 16;
+
+__device__ __forceinline__ unsigned u4_word(const uint4 &v, unsigned k) {
+    return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w;
+}
+
+__global__ void __launch_bounds__(256, 1) idx_score_mm(float *out, unsigned *tiles, const float *q,
+        const __half *key, unsigned N, unsigned T, unsigned pos0, unsigned ratio, unsigned nt) {
+    extern __shared__ float4 score_smem[];
+    float4 (*qs)[SCORE_ROWS] = (float4 (*)[SCORE_ROWS])score_smem;
+    float4 (*ks)[SCORE_BLOCKS] = (float4 (*)[SCORE_BLOCKS])(score_smem + 32 * SCORE_ROWS);
+    pdl_enter_early();
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lr = lane & 3, lc = lane >> 2;
+    const unsigned wr = w & 1, wc = w >> 1;
+    const unsigned t0 = blockIdx.y * SCORE_ROWS, b0 = blockIdx.x * SCORE_BLOCKS;
+    const unsigned rows = min(T - t0, (unsigned)SCORE_ROWS);
+    if (b0 >= (pos0 + t0 + rows) / ratio) {
+        /* no row of the tile sees these blocks */
+        for (unsigned m = 0; m < 4; m++) {
+            const unsigned t = t0 + 16 * wr + lr + 4 * m;
+            for (unsigned j = 0; j < 4 && t < T; j++) {
+                const unsigned b = b0 + 32 * wc + lc + 8 * j;
+                if (b < N) out[(uint64_t)t * N + b] = -3e38f;
+                if (tiles && !lc && b < N) tiles[(uint64_t)t * nt + b / 8] = 0;
+            }
+        }
+        return;
+    }
+    #pragma unroll
+    for (unsigned k = 0; k < 2; k++) {
+        /* dims 8 cg .. 8 cg + 7 of each quarter of a key: lane values 8 cg + e */
+        const unsigned bi = (w & 3) * 32 + lane, cg = (w >> 2) * 2 + k, b = b0 + bi;
+        uint4 v[4];
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            v[i] = b < N ? *(const uint4 *)(key + (uint64_t)b * 128 + 32 * i + 8 * cg) : make_uint4(0, 0, 0, 0);
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) {
+            float f[4];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                const unsigned x = u4_word(v[i], e / 2);
+                f[i] = __half2float(__ushort_as_half((unsigned short)(e & 1 ? x >> 16 : x & 0xffff)));
+            }
+            ks[8 * cg + e][bi] = make_float4(f[0], f[1], f[2], f[3]);
+        }
+    }
+    /* dims 4 w .. 4 w + 3 of each quarter of row lane's query: lane values 4 w + e */
+    float4 pf[4];
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++)
+        pf[i] = lane < rows ? *(const float4 *)(q + (uint64_t)(t0 + lane) * 512 + 32 * i + 4 * w) : make_float4(0, 0, 0, 0);
+    float acc[4][4];
+    #pragma unroll
+    for (unsigned m = 0; m < 4; m++)
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) acc[m][j] = 0;
+    for (unsigned h = 0; h < 4; h++) {
+        __syncthreads();
+        qs[4 * w + 0][lane] = make_float4(pf[0].x, pf[1].x, pf[2].x, pf[3].x);
+        qs[4 * w + 1][lane] = make_float4(pf[0].y, pf[1].y, pf[2].y, pf[3].y);
+        qs[4 * w + 2][lane] = make_float4(pf[0].z, pf[1].z, pf[2].z, pf[3].z);
+        qs[4 * w + 3][lane] = make_float4(pf[0].w, pf[1].w, pf[2].w, pf[3].w);
+        __syncthreads();
+        if (h < 3) {
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++)
+                pf[i] = lane < rows ? *(const float4 *)(q + (uint64_t)(t0 + lane) * 512 + (h + 1) * 128 + 32 * i + 4 * w)
+                                    : make_float4(0, 0, 0, 0);
+        }
+        float even[16], sum[16];
+        #pragma unroll 1
+        for (unsigned half = 0; half < 2; half++) {
+            const float4 *qp = &qs[half][16 * wr + lr];
+            const float4 *kp = &ks[half][32 * wc + lc];
+            float st[4][16], node[16];
+            #pragma unroll
+            for (unsigned s = 0; s < 16; s++) {
+                /* lane value l2 + half, l2 = 2 bitrev4(s) */
+                const unsigned l2 = ((s & 1) << 4) | ((s & 2) << 2) | (s & 4) | ((s & 8) >> 2);
+                float4 qv[4], kv[4];
+                #pragma unroll
+                for (unsigned m = 0; m < 4; m++) qv[m] = qp[l2 * SCORE_ROWS + 4 * m];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) kv[j] = kp[l2 * SCORE_BLOCKS + 8 * j];
+                #pragma unroll
+                for (unsigned p = 0; p < 16; p++) {
+                    const float4 a = qv[p >> 2], c = kv[p & 3];
+                    float v = __fmaf_rn(a.x, c.x, 0.0f);
+                    v = __fmaf_rn(a.y, c.y, v);
+                    v = __fmaf_rn(a.z, c.z, v);
+                    v = __fmaf_rn(a.w, c.w, v);
+                    #pragma unroll
+                    for (unsigned lv = 0; lv < 4; lv++) {
+                        if (!(s >> lv & 1)) { st[lv][p] = v; break; }
+                        v = st[lv][p] + v;
+                    }
+                    if (s == 15) node[p] = v;
+                }
+            }
+            #pragma unroll
+            for (unsigned p = 0; p < 16; p++) {
+                if (half) sum[p] = even[p] + node[p];
+                else even[p] = node[p];
+            }
+        }
+        #pragma unroll
+        for (unsigned p = 0; p < 16; p++) acc[p >> 2][p & 3] += fmaxf(sum[p], 0);
+    }
+    #pragma unroll
+    for (unsigned m = 0; m < 4; m++) {
+        const unsigned t = t0 + 16 * wr + lr + 4 * m, visible = (pos0 + t + 1) / ratio;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const unsigned b = b0 + 32 * wc + lc + 8 * j;
+            const bool in = t < T && b < N;
+            const float sc = b < visible ? acc[m][j] : -3e38f;
+            if (in) __stcs(out + (uint64_t)t * N + b, sc);
+            if (tiles) {
+                /* the tile's eight blocks sit in the lanes of this row */
+                unsigned top = in ? __float_as_uint(fmaxf(sc, 0)) : 0;
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 4));
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 8));
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 16));
+                if (!lc && in) tiles[(uint64_t)t * nt + b / 8] = top;
+            }
+        }
+    }
+}
+
 /* Inclusive prefix sums of a and b over the 256 threads of the block, in
  * thread order: a warp shuffle scan, then the preceding warps' totals. */
 __device__ __forceinline__ void block_scan256(unsigned &a, unsigned &b, unsigned (*tot)[8]) {
@@ -4863,6 +5011,26 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
     return launched();
 }
 
+namespace qwen4_cuda {
+/* Launches of at least 16 rows (prefill chunks) take idx_score_mm, which
+ * gives the per-warp kernels' scores; DS4_QWEN4_IDX_SCORE_MM=0 keeps those.
+ * Read per call: decode-sized launches do not reach it. */
+static bool score_mm(unsigned T, unsigned H, unsigned D, const void *q, const void *key) {
+    if (T < 16 || H != 4 || D != 128 || ((uintptr_t)q & 15) || ((uintptr_t)key & 15)) return false;
+    const char *env = getenv("DS4_QWEN4_IDX_SCORE_MM");
+    if (env && env[0] == '0') return false;
+    static int opted = -1;
+    if (opted < 0) {
+        opted = cudaFuncSetAttribute(idx_score_mm, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)SCORE_MM_SMEM) == cudaSuccess &&
+                cudaFuncSetAttribute(idx_score_mm, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    return opted;
+}
+}
+
 extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *key, uint32_t T, uint32_t N,
         uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {
@@ -4871,6 +5039,12 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    if (score_mm(T, H, D, q->ptr, key->ptr)) {
+        launch(idx_score_mm, dim3((N + SCORE_BLOCKS - 1) / SCORE_BLOCKS, (T + SCORE_ROWS - 1) / SCORE_ROWS), 256,
+            SCORE_MM_SMEM, (float *)out->ptr, tiles ? (unsigned *)tiles->ptr : (unsigned *)NULL,
+            (const float *)q->ptr, (const __half *)key->ptr, N, T, pos0, ratio, nt);
+        return launched();
+    }
     if (tiles && H <= 4 && D % 32 == 0 && D <= 128) {
 #define QWEN_SCORE_TILES(DPL) case DPL: launch(idx_score_tiles<DPL>, dim3((nt + 7) / 8, T), 256, 0, (float *)out->ptr, \
         (unsigned *)tiles->ptr, (const float *)q->ptr, (const __half *)key->ptr, N, H, pos0, ratio, nt); break
