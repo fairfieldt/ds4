@@ -1219,6 +1219,160 @@ __global__ void attention_group(float *out, float *partial, const float *q, cons
         sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,scale,splits,(keys+splits-1)/splits,0);
 }
 
+/* Prefill rows (one split): attention_group_body's arithmetic with the key
+ * gathers overlapped.  attention_group_body waits for each tile's
+ * positions, then its keys, then its values; here the values load during
+ * the tile's key products, the next tile's keys during its softmax and
+ * value products, and the positions two tiles ahead.  Keys and values get
+ * a tile each, so the queries keep only their group's rows (rows past it
+ * read a zero chunk) and the tiles swizzle their 16-byte chunks by row
+ * instead of padding: two blocks per SM.  Groups of at most 12 heads. */
+__device__ __forceinline__ unsigned kv_chunk(unsigned r, unsigned c) { return (c ^ (r & 7)) * 8; }
+
+__global__ void __launch_bounds__(256, 2) attention_group_pipe(float *out, const float *q, const float *gate,
+        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+#if __CUDA_ARCH__ >= 800
+    pdl_enter_early();
+    const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32, t = blockIdx.y;
+    const unsigned kh = blockIdx.x, group = H/Hkv;
+    const unsigned qr = tid/16, col = tid%16, h = kh*group+qr, pos = pos0+t;
+    q += (uint64_t)t*H*D; gate += (uint64_t)t*H*D; out += (uint64_t)t*H*D;
+    if (sparse) { sel += (uint64_t)t*stride; counts += t; }
+    const unsigned n = sparse ? counts[0] : pos+1, tiles = (n+31)/32;
+    __shared__ __align__(128) __half kt[32][256], vt[32][256];
+    __shared__ __align__(16) __half qh[12][264], ql[12][264];
+    __shared__ __align__(16) __half zero[8];
+    union Scores { float part[2][12][32]; __half prob[2][12][40]; };
+    __shared__ __align__(16) Scores scores;
+    __shared__ float qs[16], max_score[16], denom[16], correction[16];
+    __shared__ unsigned positions[2][32];
+    float mx = 0;
+    for (unsigned d = col; d < D; d += 16)
+        if (qr < group) mx = fmaxf(mx,fabsf(q[(uint64_t)h*D+d]*scale));
+    for (unsigned off = 8; off; off /= 2) mx = fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,off,16));
+    const int exp = mx > 0 ? max(-120,min(120,(int)((__float_as_uint(mx)>>23)&255)-127)) : 0;
+    const float inv = ldexpf(1,-exp);
+    if (!col) { qs[qr] = ldexpf(1,exp); max_score[qr] = -3e38f; denom[qr] = 0; correction[qr] = 0; }
+    if (qr < 12)
+        for (unsigned d = col; d < D; d += 16) {
+            const float v = qr < group ? q[(uint64_t)h*D+d]*scale*inv : 0;
+            qh[qr][d] = __float2half_rn(v);
+            ql[qr][d] = __float2half_rn((v-__half2float(qh[qr][d]))*4096);
+        }
+    if (tid < 8) zero[tid] = __float2half_rn(0);
+    /* tile j's positions, as attention_group_body takes them */
+    auto position = [&](unsigned j) {
+        const unsigned p = j < n ? (sparse ? (unsigned)sel[j] : j) : UINT_MAX;
+        return p <= pos ? p : UINT_MAX;
+    };
+    unsigned next = 0;
+    if (tid < 32) { positions[0][tid] = position(tid); next = position(32+tid); }
+    __syncthreads();
+    auto gather = [&](__half (*dst)[256], const __half *src, const unsigned *ps) {
+        for (unsigned i = tid*8; i < 32*D; i += 256*8) {
+            const unsigned r = i/D, c = (i%D)/8, p = ps[r];
+            tt_cp_async_16B(&dst[r][kv_chunk(r,c)],src+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+c*8,p != UINT_MAX);
+        }
+        tt_cp_async_commit();
+    };
+    if (tiles) gather(kt,kc,positions[0]);
+    float result[4][4] = {};
+    const unsigned split = warp/4, key0 = (warp%4)*8;
+    for (unsigned j = 0; j < tiles; j++) {
+        const unsigned *ps = positions[j&1];
+        if (tid < 32) positions[(j+1)&1][tid] = next;
+        tt_cp_async_wait_group<0>();
+        __syncthreads();
+        gather(vt,vc,ps);
+        if (tid < 32) next = position((j+2)*32+tid);
+        float hi[4] = {}, lo[4] = {};
+        for (unsigned k = split*128; k < (split+1)*128; k += 16) {
+            uint32_t ah[4], al[4], b[2];
+            const unsigned r = lane%16, c = k+(lane/16)*8;
+            tt_ldmatrix_x4(ah,r < 12 ? &qh[r][c] : zero);
+            tt_ldmatrix_x4(al,r < 12 ? &ql[r][c] : zero);
+            tt_ldmatrix_x2(b,&kt[key0+lane%8][kv_chunk(key0+lane%8,k/8+(lane%16)/8)]);
+            tt_mma_m16n8k16_f16_f32(hi,ah,b);
+            tt_mma_m16n8k16_f16_f32(lo,al,b);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            if (tt_mma_c_i(lane,i) < 12)
+                scores.part[split][tt_mma_c_i(lane,i)][key0+tt_mma_c_j(lane,i)] = hi[i]+lo[i]*0x1p-12f;
+        __syncthreads();
+        const bool more = j+1 < tiles;
+        if (more) gather(kt,kc,positions[(j+1)&1]);
+        float prob[2] = {}, peak = 0, old = 0, total = 0;
+        if (qr < 12) {
+            peak = max_score[qr];
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                const unsigned key = col+i*16;
+                prob[i] = ps[key] != UINT_MAX ? (scores.part[0][qr][key]+scores.part[1][qr][key])*qs[qr] : -3e38f;
+                peak = fmaxf(peak,prob[i]);
+            }
+        }
+        for (unsigned off = 8; off; off /= 2) peak = fmaxf(peak,__shfl_xor_sync(0xffffffff,peak,off,16));
+        if (qr < 12) {
+            old = expf(max_score[qr]-peak);
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                prob[i] = ps[col+i*16] != UINT_MAX ? expf(prob[i]-peak) : 0;
+                total += prob[i];
+            }
+        }
+        for (unsigned off = 8; off; off /= 2) total += __shfl_xor_sync(0xffffffff,total,off,16);
+        __syncthreads();
+        if (qr < 12) {
+            if (!col) {
+                correction[qr] = old;
+                max_score[qr] = peak;
+                denom[qr] = denom[qr]*old+total;
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                const __half p = __float2half_rn(prob[i]);
+                scores.prob[0][qr][col+i*16] = p;
+                scores.prob[1][qr][col+i*16] = __float2half_rn((prob[i]-__half2float(p))*4096);
+            }
+        }
+        if (more) tt_cp_async_wait_group<1>();
+        else tt_cp_async_wait_group<0>();
+        __syncthreads();
+        #pragma unroll
+        for (unsigned tile = 0; tile < 4; tile++) {
+            float hi[4] = {}, lo[4] = {};
+            #pragma unroll
+            for (unsigned k = 0; k < 32; k += 16) {
+                uint32_t ah[4], al[4], b[2];
+                const unsigned r = lane%16, c = k+(lane/16)*8, vr = k+lane%16;
+                tt_ldmatrix_x4(ah,r < 12 ? &scores.prob[0][r][c] : zero);
+                tt_ldmatrix_x4(al,r < 12 ? &scores.prob[1][r][c] : zero);
+                tt_ldmatrix_x2_trans(b,&vt[vr][kv_chunk(vr,warp*4+tile)]);
+                tt_mma_m16n8k16_f16_f32(hi,ah,b);
+                tt_mma_m16n8k16_f16_f32(lo,al,b);
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) result[tile][i] =
+                result[tile][i]*correction[tt_mma_c_i(lane,i)]+(hi[i]+lo[i]*0x1p-12f);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned tile = 0; tile < 4; tile++) {
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++) {
+            const unsigned r = tt_mma_c_i(lane,i), d = warp*32+tile*8+tt_mma_c_j(lane,i);
+            if (r < group) {
+                const uint64_t dst = (uint64_t)(kh*group+r)*D+d;
+                out[dst] = (denom[r] > 0 ? result[tile][i]/denom[r] : 0)*sigmoid(gate[dst]);
+            }
+        }
+    }
+#endif
+}
+
 static bool tensor(const ds4_gpu_tensor *t, uint64_t bytes) {
     return t && t->ptr && bytes <= t->bytes;
 }
@@ -5723,6 +5877,24 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     return ok;
 }
 
+namespace qwen4_cuda {
+/* Prefill rows take attention_group_pipe (the same outputs as
+ * attention_group); DS4_QWEN4_ATTN_PIPE=0 keeps attention_group.  Read per
+ * call: decode rows have partial scratch and do not reach it. */
+static bool attn_pipe() {
+    const char *env = getenv("DS4_QWEN4_ATTN_PIPE");
+    if (env && env[0] == '0') return false;
+    static int carved = -1;
+    if (carved < 0) {
+        /* two blocks of 49 KB per SM */
+        carved = cudaFuncSetAttribute(attention_group_pipe, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                      cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    return true;
+}
+}
+
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
@@ -5759,7 +5931,11 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         else { QWEN_ATTN(256); }
 #undef QWEN_ATTN
     }
-    if (g0 < T) {
+    if (g0 < T && !split && H/Hkv <= 12 && attn_pipe()) {
+        const uint64_t r = (uint64_t)g0*H*D;
+        launch(attention_group_pipe, dim3(Hkv,T-g0), 256, 0, o+r, qp+r, gp+r, kp, vp,
+            sp ? sp+(uint64_t)g0*stride : nullptr, cp ? cp+g0 : nullptr, H, Hkv, pos0+g0, stride, sparse, scale);
+    } else if (g0 < T) {
         const uint64_t r = (uint64_t)g0*H*D;
         launch(attention_group, dim3(Hkv,T-g0,max_splits), 256, 0, o+r,
             part ? part+(uint64_t)g0*H*64*(D+2) : nullptr, qp+r, gp+r, kp, vp,
