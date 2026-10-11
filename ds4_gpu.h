@@ -3537,6 +3537,10 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
 /* snap_state/snap2_state (optional) receive the state right after tokens
  * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
+/* CUDA: make every width-dependent kernel choice for `rows` rows until reset
+ * with 0.  A speculative session batch sets its session count, so each of
+ * its rows, drafts included, rounds as in the plain batch of those sessions. */
+void ds4_gpu_qwen4_set_select_rows(uint32_t rows);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,

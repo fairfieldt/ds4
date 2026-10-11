@@ -4778,6 +4778,117 @@ static void bench_idx_select(void) {
     }
 }
 
+#ifndef __APPLE__
+/* A speculative batch of S sessions runs S..2S rows (a row per session, one
+ * more per draft) with the kernel choices of the plain batch of S rows
+ * (ds4_gpu_qwen4_set_select_rows).  Every row must come out byte-identical
+ * to the plain batch's: greedy acceptance compares the two. */
+typedef int (*select_rows_fn)(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T);
+
+static void select_rows_case(const char *what, select_rows_fn fn, void *ctx, uint32_t K,
+                             uint32_t n_out, const uint32_t *out_width) {
+    static const uint32_t widths[] = { 2, 3, 4, 5, 8, 9, 12, 16 };
+    float *input = rand_vec((uint64_t)32 * K, 1.0f);
+    ds4_gpu_tensor *x = upload(input, (uint64_t)32 * K);
+    ds4_gpu_tensor *ref[4], *got[4];
+    for (uint32_t o = 0; o < n_out; o++) {
+        ref[o] = upload(NULL, (uint64_t)32 * out_width[o]);
+        got[o] = upload(NULL, (uint64_t)32 * out_width[o]);
+    }
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const uint32_t S = widths[wi];
+        /* the plain batch: S rows at a time, choices for S rows */
+        for (uint32_t r0 = 0; r0 < 2 * S; r0 += S) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, (uint64_t)r0 * K * 4, (uint64_t)S * K * 4), *ov[4];
+            for (uint32_t o = 0; o < n_out; o++)
+                ov[o] = ds4_gpu_tensor_view(ref[o], (uint64_t)r0 * out_width[o] * 4, (uint64_t)S * out_width[o] * 4);
+            require_ok(xv && fn(ctx, xv, ov, S), what);
+            for (uint32_t o = 0; o < n_out; o++) ds4_gpu_tensor_free(ov[o]);
+            ds4_gpu_tensor_free(xv);
+        }
+        /* the speculative batch: every draft count */
+        for (uint32_t T = S; T <= 2 * S; T++) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, 0, (uint64_t)T * K * 4), *ov[4];
+            for (uint32_t o = 0; o < n_out; o++) {
+                require_ok(ds4_gpu_tensor_fill_f32(got[o], 17.25f, (uint64_t)32 * out_width[o]), what);
+                ov[o] = ds4_gpu_tensor_view(got[o], 0, (uint64_t)T * out_width[o] * 4);
+            }
+            ds4_gpu_qwen4_set_select_rows(S);
+            const int ok = xv && fn(ctx, xv, ov, T);
+            ds4_gpu_qwen4_set_select_rows(0);
+            require_ok(ok, what);
+            for (uint32_t o = 0; o < n_out; o++) {
+                char name[128];
+                snprintf(name, sizeof(name), "%s out %u, %u sessions, %u rows", what, o, S, T);
+                same_bytes(name, T, ref[o], 0, got[o], 0, (uint64_t)T * out_width[o] * 4);
+                ds4_gpu_tensor_free(ov[o]);
+            }
+            ds4_gpu_tensor_free(xv);
+        }
+    }
+    for (uint32_t o = 0; o < n_out; o++) { ds4_gpu_tensor_free(ref[o]); ds4_gpu_tensor_free(got[o]); }
+    ds4_gpu_tensor_free(x);
+    free(input);
+}
+
+typedef struct { arena_t *a; uint64_t off[2]; uint32_t type, K, M[2], n; } select_rows_proj;
+
+static int select_rows_dense(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T) {
+    const select_rows_proj *p = ctx;
+    if (p->n == 1)
+        return ds4_gpu_qwen4_dense_mm_tensor(outs[0], x, p->a->base, p->a->size, p->off[0], p->type, T, p->K, p->M[0]);
+    const uint32_t types[2] = { p->type, p->type };
+    return ds4_gpu_qwen4_multi_gemv_tensor(x, T, p->K, 2, (ds4_gpu_tensor *const *)outs, p->a->base, p->a->size,
+                                           p->off, types, p->M);
+}
+
+typedef struct { arena_t *a; uint64_t gamma, inject; uint32_t E, hc; } select_rows_norm;
+
+static int select_rows_hc_norm(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T) {
+    const select_rows_norm *p = ctx;
+    return ds4_gpu_qwen4_hc_norm_tensor(outs[0], outs[1], x, p->a->base, p->a->size, p->gamma, p->inject, 1u,
+                                        T, p->E, p->hc, p->hc, 1e-6f);
+}
+
+static void test_select_rows(arena_t *a) {
+    const uint64_t arena_used = a->used;   /* the weights below are this test's alone */
+    /* Q8 projections on both sides of the GEMV / tensor-core boundaries,
+     * the output head's rule (M >= 65536), the K split, pairs; the F16 HC
+     * down and up projections; the F32 router (a BF16 copy below 32 rows) */
+    static const struct { uint32_t type, K, M; } dense[] = {
+        { 8, 2560, 6144 }, { 8, 6144, 2560 }, { 8, 640, 2560 }, { 8, 2560, 48 }, { 8, 1024, 65536 },
+        { 1, 10240, 320 }, { 1, 320, 1024 }, { 0, 2560, 512 },
+    };
+    for (size_t i = 0; i < sizeof(dense) / sizeof(dense[0]); i++) {
+        select_rows_proj p = { .a = a, .type = dense[i].type, .K = dense[i].K, .M = { dense[i].M, 0 }, .n = 1 };
+        double *sh;
+        p.off[0] = p.type == 8 ? arena_q8_0(a, p.M[0], p.K, &sh, 0.05f) :
+                   p.type == 1 ? arena_f16(a, (uint64_t)p.M[0] * p.K, &sh, 0.05f) :
+                                 arena_f32(a, (uint64_t)p.M[0] * p.K, &sh, -0.05f, 0.05f);
+        free(sh);
+        char what[64];
+        snprintf(what, sizeof(what), "select rows: dense type %u %ux%u", p.type, p.M[0], p.K);
+        select_rows_case(what, select_rows_dense, &p, p.K, 1, p.M);
+    }
+    static const uint32_t pairs[][2] = { { 48, 48 }, { 512, 512 }, { 10240, 6144 } };
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        select_rows_proj p = { .a = a, .type = 8, .K = 2560, .M = { pairs[i][0], pairs[i][1] }, .n = 2 };
+        for (int j = 0; j < 2; j++) { double *sh; p.off[j] = arena_q8_0(a, p.M[j], p.K, &sh, 0.05f); free(sh); }
+        char what[64];
+        snprintf(what, sizeof(what), "select rows: Q8 pair %u+%u", p.M[0], p.M[1]);
+        select_rows_case(what, select_rows_dense, &p, p.K, 2, p.M);
+    }
+    select_rows_norm n = { .a = a, .E = 2560, .hc = 4 };
+    double *sh;
+    n.gamma = arena_f32(a, (uint64_t)n.E * n.hc, &sh, 0.5f, 1.5f); free(sh);
+    n.inject = arena_f16(a, (uint64_t)n.hc * n.E * n.hc, &sh, 0.05f); free(sh);
+    const uint32_t norm_out[2] = { n.E * n.hc, n.hc * 8 * n.hc };
+    select_rows_case("select rows: HC norm", select_rows_hc_norm, &n, n.E * n.hc, 2, norm_out);
+    a->used = arena_used;
+    puts("  select rows: every row of a 2..16-session batch with its drafts byte-exact against the plain batch");
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -4792,6 +4903,7 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_GDN_FRONT")) { test_gdn_front_exact(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ROUTER")) { test_router_paths(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_PRESYNC")) { test_presync_load(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
@@ -4863,6 +4975,7 @@ int main(void) {
     test_qwen4_argmax();
 #ifndef __APPLE__
     test_argmax_rows();
+    test_select_rows(&arena);
     test_host_argmax();
     test_host_staging();
     test_presync_load(&arena);

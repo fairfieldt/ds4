@@ -165,6 +165,19 @@ static unsigned bulk_phases() {
  * after the norm reduction (the MTP verify rows gained nothing from it). */
 static unsigned hc_norm_late(unsigned T) { return T == 1; }
 
+/* A speculative session batch has a row per session plus a row per draft,
+ * so its width moves with the drafts, while the plain batch of the same
+ * sessions has exactly one row each.  The dispatchers below pick kernels by
+ * width (GEMV or tensor cores and their K split, the decode or prefill HC
+ * norm, the BF16 gate copies), and a row rounds as its kernel does, so the
+ * drafts would be verified against logits the plain batch does not
+ * compute.  ds4.c sets g_select_rows to the session count for such a batch:
+ * every choice is then made for that width, and each kernel computes a row
+ * the same way at any row count, so every row rounds as in the plain batch.
+ * 0: the row count. */
+static unsigned g_select_rows;
+static unsigned select_rows(unsigned T) { return g_select_rows ? g_select_rows : T; }
+
 
 
 /* Reports the virtual architecture these kernels were compiled for. */
@@ -3125,13 +3138,14 @@ static bool rows_tc_shape(unsigned type, unsigned T, unsigned K, unsigned M) {
 /* A narrow launch (few 16-row tiles) leaves most of the GPU idle, so its
  * K is split over 2 or 4 grid slices whose planes are then added in a
  * fixed order. */
-static int rows_tc_dispatch(rows_projections projections, const float *x, unsigned T, unsigned K, unsigned type) {
+static int rows_tc_dispatch(rows_projections projections, const float *x, unsigned T, unsigned K, unsigned type,
+                            unsigned S) {
     const unsigned Tp = (T + 7) / 8 * 8;
     unsigned splits = 1, blocks = 0;
     uint64_t floats = 0;
     for (unsigned i = 0; i < projections.n; i++) { blocks += projections.p[i].tiles; floats += (uint64_t)T*projections.p[i].M; }
     if (K >= 8192 && blocks <= 64) splits = 4;
-    else if (type == 8 && K >= 1024 && blocks <= 40) splits = T > 16 ? 4 : 2;
+    else if (type == 8 && K >= 1024 && blocks <= 40) splits = S > 16 ? 4 : 2;
     __half *xh = (__half *)cuda_tmp_alloc((uint64_t)Tp*K*4+(splits > 1 ? floats*splits*4 : 0), "Qwen rows f16 activations");
     if (!xh) return 0;
     __half *xl = xh + (uint64_t)Tp * K;
@@ -4937,6 +4951,8 @@ extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor
 
 extern "C" void ds4_gpu_qwen4_set_verify_rows_exact(bool on) { (void)on; }
 
+extern "C" void ds4_gpu_qwen4_set_select_rows(uint32_t rows) { qwen4_cuda::g_select_rows = rows; }
+
 extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *state,
         const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
         uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D,
@@ -5014,7 +5030,7 @@ static int qwen4_hc_norm(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
     const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
     if (!gamma || !wi || (type != 0 && type != 1 && type != 8)) return 0;
-    if (T > 8) {
+    if (select_rows(T) > 8) {
 #define QWEN_HC_NORM(TYPE) launch(hc_norm_prefill<TYPE>, dim3(hc,T), 256, 0, (float *)xn->ptr, \
         ni ? (float *)inj->ptr : nullptr,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
         if (type == 0) { QWEN_HC_NORM(0); }
@@ -5282,19 +5298,19 @@ static int qwen4_dense_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
-    if (!ref && type == 0 && split_shape(T,K,M,(const float *)x->ptr))
+    const unsigned S = select_rows(T);
+    if (!ref && type == 0 && split_shape(S,K,M,(const float *)x->ptr))
         if (const char *b = bf16_copy(w,(uint64_t)K*M)) { w = b; type = 30; }
-    if (rows_tc_shape(type,T,K,M) && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
+    if (rows_tc_shape(type,S,K,M) && T <= 32 && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
         rows_projections p = {};
         p.n = 1; p.p[0] = {w,(float *)out->ptr,M,(M+15)/16};
-        return rows_tc_dispatch(p,(const float *)x->ptr,T,K,type);
+        return rows_tc_dispatch(p,(const float *)x->ptr,T,K,type,S);
     }
-    if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M, ref);
-    /* Decode batches of 9..31 rows (sessions, or sessions with drafts): the
-     * row-batched GEMV in chunks of eight still reads the weights T / 8
+    /* Decode batches of up to 31 rows (sessions, or sessions with drafts):
+     * the row-batched GEMV in chunks of eight still reads the weights T / 8
      * times, where the tiled GEMM below is sized for prefill and leaves
      * most of the GPU idle at this width. */
-    if (T < 32) {
+    if (S < 32) {
         for (uint32_t t0 = 0; t0 < T; t0 += 8) {
             if (!matvec_dispatch((float *)out->ptr + (uint64_t)t0 * M, w, (const float *)x->ptr + (uint64_t)t0 * K,
                                  type, T - t0 < 8 ? T - t0 : 8, K, M, ref)) return 0;
@@ -5346,7 +5362,8 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t
     using namespace qwen4_cuda;
     if (!N || N > 4 || !outs || !offsets || !types || !rows) return 0;
     rows_projections p = {};
-    if (T && T <= 3 && K && !(K%128) && tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15)) {
+    const unsigned S = select_rows(T);
+    if (T && S <= 3 && K && !(K%128) && tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15)) {
         bool same_q8 = true;
         unsigned blocks[2] = {};
         rows_projections groups[2] = {};
@@ -5360,26 +5377,35 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t
             blocks[group] += tiles;
         }
         if (same_q8) {
+            /* four rows a launch at most: a speculative batch of three
+             * sessions carries up to six */
+            for (unsigned t0 = 0; t0 < T; t0 += 4) {
+                const unsigned n = std::min(4u, T - t0);
+                const float *xt = (const float *)x->ptr + (uint64_t)t0 * K;
+                rows_projections g[2] = {groups[0], groups[1]};
+                for (unsigned j = 0; j < 2; j++)
+                    for (unsigned i = 0; i < g[j].n; i++) g[j].p[i].out += (uint64_t)t0 * g[j].p[i].M;
 #define QWEN_MULTI(NT) \
-            if (groups[0].n) launch(multi_q8<NT,false>,blocks[0],128,0,groups[0],(const float *)x->ptr,T,K); \
-            if (groups[1].n) launch(multi_q8<NT,true>,blocks[1],256,0,groups[1],(const float *)x->ptr,T,K)
-            if (T == 1) { QWEN_MULTI(1); }
-            else if (T == 2) { QWEN_MULTI(2); }
-            else { QWEN_MULTI(4); }
+                if (g[0].n) launch(multi_q8<NT,false>,blocks[0],128,0,g[0],xt,n,K); \
+                if (g[1].n) launch(multi_q8<NT,true>,blocks[1],256,0,g[1],xt,n,K)
+                if (n == 1) { QWEN_MULTI(1); }
+                else if (n == 2) { QWEN_MULTI(2); }
+                else { QWEN_MULTI(4); }
 #undef QWEN_MULTI
+            }
             return launched();
         }
     }
     bool fuse = tensor(x,(uint64_t)T*K*4) && !((uintptr_t)x->ptr&15);
     for (unsigned i = 0; fuse && i < N; i++) {
-        fuse = types[i] == types[0] && rows_tc_shape(types[i],T,K,rows[i]);
+        fuse = types[i] == types[0] && rows_tc_shape(types[i],S,K,rows[i]) && T <= 32;
         if (!fuse) break;
         const char *w = weight(map,size,offsets[i],row_bytes(types[i],K)*rows[i]);
         if (!w || !tensor(outs[i],(uint64_t)T*rows[i]*4)) return 0;
         fuse = types[i] == 8 || !((uintptr_t)w&15);
         p.p[i] = {w,(float *)outs[i]->ptr,rows[i],(rows[i]+15)/16};
     }
-    if (fuse) { p.n = N; return rows_tc_dispatch(p,(const float *)x->ptr,T,K,types[0]); }
+    if (fuse) { p.n = N; return rows_tc_dispatch(p,(const float *)x->ptr,T,K,types[0],S); }
     for (unsigned i = 0; i < N; i++)
         if (!ds4_gpu_qwen4_dense_mm_tensor(outs[i], x, map, size, offsets[i], types[i], T, K, rows[i])) return 0;
     return 1;
