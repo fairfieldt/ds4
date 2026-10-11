@@ -59101,6 +59101,27 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
 }
 
 /* rows > 0 limits the product to a contiguous leading prefix of w. */
+/* The width the kernel choices are made for.  A speculative session batch
+ * computes one row per session plus one per draft; ds4.c and the CUDA
+ * dispatchers then choose as for its session count, the width of the plain
+ * batch of the same sessions, so every row rounds as that batch rounds it
+ * (see ds4_gpu_qwen4_set_select_rows).  Zero elsewhere: the row count. */
+static uint32_t qwen4_select_rows_n;
+
+static uint32_t qwen4_select_rows(uint32_t T) {
+    return qwen4_select_rows_n ? qwen4_select_rows_n : T;
+}
+
+/* CUDA only: Metal's projections choose by their own widths, untouched. */
+static void qwen4_set_select_rows(uint32_t rows) {
+#ifndef DS4_HAS_QWEN4_METAL
+    qwen4_select_rows_n = rows;
+    ds4_gpu_qwen4_set_select_rows(rows);
+#else
+    (void)rows;
+#endif
+}
+
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t rows) {
     const uint64_t in_dim = w->dim[0], full_dim = w->ndim >= 2 ? w->dim[1] : 1u;
@@ -59285,7 +59306,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
-    if (T > 8u &&
+    if (qwen4_select_rows(T) > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
@@ -59618,7 +59639,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * through that width to match single-token experts. */
     const uint32_t mm_min = 32u;
 #endif
-    const bool mm = T > mm_min &&
+    const bool mm = qwen4_select_rows(T) > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
@@ -59670,7 +59691,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
     /* From eight rows on RTX PRO 6000; four-row batches were slower. */
-    const bool shared_dense = T >= 8u &&
+    const bool shared_dense = qwen4_select_rows(T) >= 8u &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #endif
@@ -80789,6 +80810,8 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
     uint32_t *ple_ids = xmalloc((size_t)N * DS4_MAX_PLE_HEADS * sizeof(uint32_t));
     bool ok = qwen4_batch_rows_build_ragged(views, mem, count, g);
+    /* the drafts ride along: kernels are chosen as for the plain batch */
+    qwen4_set_select_rows((uint32_t)count);
     for (int i = 0; ok && i < count; i++) qwen4_batch_row_graph(&rowg[i], mem[i].session, &views[i]);
     if (ok) ok = qwen4_batch_scratch_ensure(g, N > 32u ? N : 32u);
     if (ok) ok = qwen4_batch_stage_embeddings_ragged(mem, count, N, m, w, g, ple_ids);
@@ -80882,6 +80905,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
+    qwen4_set_select_rows(0);
     qwen4_batch_rows_free(views, count);
     free(ple_ids);
     free(rowg);
