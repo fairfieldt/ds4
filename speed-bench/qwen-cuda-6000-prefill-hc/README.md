@@ -59,3 +59,7 @@ Decode, `rf-xab` ([method](../qwen-cuda-6000-roofline/README.md#method), [`xab.c
 Dropped, with numbers:
 
 - `hc_up_rows` with 128-token tiles and sigmoid(up) through shared memory (64 KB), one block an SM: 639 µs, 529 µs with the L2 prefetch.
+
+## The combine
+
+A later commit (`c7d1b25`, on top of `19137f2`) folds the residual combine before the experts' mix (`hc_combine`: R += w · the attention or delta-net block's output, w from the injection partials the previous mix left) into that mix's `hc_norm_split` launch: the block updates its token's streams, stores them and normalizes them from shared memory, so the residual is read once there instead of twice; the tests compare the combined residual, mix, injection partials and down projection with `hc_combine` and the separate path byte for byte. Chunk at 24,576 tokens: `hc_combine` 24.6 ms gone, `hc_norm_split` 51.2 → 64.9 ms, the chunk 1,277.1 → 1,266.0 ms (at 245,760: 1,313.6 → 1,306.9). Prefill +0.3% to +0.7% at 2K to 32K, −0.1% to +0.4% in the long sweep (inside its spread between processes); the same greedy text at every frontier; decode +0.01% to +0.08% ([`combine.csv`](combine.csv)).
