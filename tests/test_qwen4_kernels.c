@@ -1205,6 +1205,67 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor_free(partial);
 }
 
+#ifndef __APPLE__
+/* Prefill rows (no partial scratch, 32+ rows) take attention_group_pipe:
+ * its outputs equal attention_group's bit for bit (DS4_QWEN4_ATTN_PIPE=0),
+ * with empty rows, invalid and future positions among the selections. */
+static void test_attn_pipe_exact(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks) {
+    const uint32_t H = 24, Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio, cap = pos0 + T;
+    const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
+    float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
+    _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2);
+    for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(frand() - 0.5f); vc[i] = (_Float16)(frand() - 0.5f); }
+    int32_t *sel = calloc((uint64_t)T * sel_stride, 4);
+    uint32_t *cnt = malloc((uint64_t)T * 4);
+    require_ok(kc && vc && sel && cnt, "attn pipe alloc");
+    for (uint32_t t = 0; t < T; t++) {
+        const uint32_t pos = pos0 + t, nb = (pos + 1) / ratio, take = nb < k_blocks ? nb : k_blocks;
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < take; i++) {
+            const uint32_t b = (uint32_t)((uint64_t)i * nb / take) + (t % 3 == 0 && i + 1 < take ? 1u : 0u);
+            for (uint32_t r = 0; r < ratio; r++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)(b * ratio + r);
+        }
+        for (uint32_t k = nb * ratio; k <= pos; k++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)k;
+        cnt[t] = n;
+        const float amplitude = t % 3 == 0 ? 64 : t % 3 == 1 ? 0.00001f : 1;
+        for (uint32_t i = 0; i < H * D; i++) q[(uint64_t)t * H * D + i] *= amplitude;
+        if (sparse && t % 7 == 0) cnt[t] = 0;
+        else if (sparse && t % 11 == 1) { cnt[t] = 1; sel[(uint64_t)t * sel_stride] = -1; }
+        else if (sparse && t % 5 == 2) sel[(uint64_t)t * sel_stride + n / 2] = (int32_t)(pos + 1);   /* a future key */
+    }
+    ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc((uint64_t)T * 4);
+    ds4_gpu_tensor *go[2] = { upload(NULL, qn), upload(NULL, qn) };
+    require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
+               ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, (uint64_t)T * 4),
+               "attn pipe setup");
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_ATTN_PIPE", pipe ? "1" : "0", 1);
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(go[pipe], gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse,
+                                                    sel_stride, 0.0625f), "attn pipe");
+    }
+    unsetenv("DS4_QWEN4_ATTN_PIPE");
+    float *a = download(go[0], qn), *b = download(go[1], qn);
+    char name[96];
+    snprintf(name, sizeof(name), "attn pipe exact T=%u pos0=%u %s k=%u", T, pos0, sparse ? "sparse" : "dense", k_blocks);
+    require_ok(memcmp(a, b, qn * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(a); free(b); ds4_gpu_tensor_free(go[0]); ds4_gpu_tensor_free(go[1]);
+    ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
+    ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
+}
+
+static void test_attn_pipe_exact_all(void) {
+    test_attn_pipe_exact(32, 100, false, 512);
+    test_attn_pipe_exact(45, 3000, false, 512);
+    test_attn_pipe_exact(40, 9000, true, 512);
+    test_attn_pipe_exact(77, 2040, true, 512);       /* rows of 2041.. keys around one tile boundary */
+    test_attn_pipe_exact(33, 500, true, 16);
+}
+
+#endif
+
 static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
 }
@@ -4637,6 +4698,57 @@ static void bench_idx_score_prefill(void) {
 }
 #endif
 
+#ifndef __APPLE__
+/* DS4_TEST_QWEN4_ATTN_BENCH=1: the sparse attention of one prefill chunk
+ * (8192 rows, 512 blocks plus the tail each), rows sharing most blocks
+ * with their neighbours as real selections do */
+typedef struct { ds4_gpu_tensor *o, *q, *gate, *k, *v, *sel, *cnt; uint32_t T, pos0, stride; } attn_bench;
+static int bench_attn_one(void *ud) {
+    attn_bench *c = ud;
+    return ds4_gpu_qwen4_attn_decode_tensor(c->o, c->q, c->gate, c->k, c->v, c->sel, c->cnt, NULL, c->T, 24, 2, 256,
+                                            c->pos0, true, c->stride, 0.0625f);
+}
+
+static void bench_attn_prefill(void) {
+    const uint32_t T = 8192, H = 24, Hkv = 2, D = 256, ratio = 4, k_blocks = 512, stride = k_blocks * ratio + ratio;
+    const uint32_t pos0s[] = { 24576, 245760 };
+    for (unsigned pi = 0; pi < 2; pi++) {
+        const uint32_t pos0 = pos0s[pi], cap = pos0 + T;
+        const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
+        int32_t *sel = malloc((uint64_t)T * stride * 4);
+        uint32_t *cnt = malloc((uint64_t)T * 4), base[512];
+        require_ok(sel && cnt, "attn bench alloc");
+        for (uint32_t t = 0; t < T; t++) {
+            const uint32_t pos = pos0 + t, nb = (pos + 1) / ratio, span = nb / k_blocks;
+            if (t % 32 == 0) for (uint32_t i = 0; i < k_blocks; i++) base[i] = i * span + (g_rng = g_rng * 1664525u + 1013904223u) % span;
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < k_blocks; i++) {
+                /* one block in eight differs from the group's */
+                const uint32_t b = i % 8 == t % 8 ? i * span + (t * 7919u + i) % span : base[i];
+                for (uint32_t r = 0; r < ratio; r++) sel[(uint64_t)t * stride + n++] = (int32_t)(b * ratio + r);
+            }
+            for (uint32_t k = nb * ratio; k <= pos; k++) sel[(uint64_t)t * stride + n++] = (int32_t)k;
+            cnt[t] = n;
+        }
+        float *q = rand_vec(qn, 1.0f);
+        attn_bench c = { upload(NULL, qn), upload(q, qn), upload(q, qn), ds4_gpu_tensor_alloc(kvn * 2), ds4_gpu_tensor_alloc(kvn * 2),
+                         ds4_gpu_tensor_alloc((uint64_t)T * stride * 4), ds4_gpu_tensor_alloc((uint64_t)T * 4), T, pos0, stride };
+        require_ok(c.k && c.v && c.sel && c.cnt && ds4_gpu_tensor_fill_f32(c.k, 0.01f, kvn / 2) && ds4_gpu_tensor_fill_f32(c.v, 0.02f, kvn / 2) &&
+                   ds4_gpu_tensor_write(c.sel, 0, sel, (uint64_t)T * stride * 4) && ds4_gpu_tensor_write(c.cnt, 0, cnt, (uint64_t)T * 4),
+                   "attn bench setup");
+        for (int pipe = 0; pipe < 2; pipe++) {
+            setenv("DS4_QWEN4_ATTN_PIPE", pipe ? "1" : "0", 1);
+            char name[64];
+            snprintf(name, sizeof(name), "attn prefill %s pos0=%u", pipe ? "pipe" : "group", pos0);
+            bench_run(name, bench_attn_one, &c, 5);
+        }
+        unsetenv("DS4_QWEN4_ATTN_PIPE");
+        ds4_gpu_tensor_free(c.o); ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.gate); ds4_gpu_tensor_free(c.k);
+        ds4_gpu_tensor_free(c.v); ds4_gpu_tensor_free(c.sel); ds4_gpu_tensor_free(c.cnt); free(q); free(sel); free(cnt);
+    }
+}
+#endif
+
 static void bench_idx_select(void) {
     const uint32_t ns[] = { 1024, 2048, 4096, 8192, 16384, 32768, 50000, 65536, 131072, 262144 };
     for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
@@ -4718,6 +4830,8 @@ int main(void) {
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_IDX_SCORE_ONLY")) { test_idx_score_exact_all(); printf("all qwen4 idx score tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_IDX_SCORE_BENCH")) { bench_idx_score_prefill(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ATTN_PIPE_ONLY")) { test_attn_pipe_exact_all(); printf("all qwen4 attention pipe tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ATTN_BENCH")) { bench_attn_prefill(); return 0; }
 #endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
@@ -4791,6 +4905,7 @@ int main(void) {
     test_attn_mm(9, 128, false);
 #ifndef __APPLE__
     test_attn_groups();
+    test_attn_pipe_exact_all();
     test_attn_decode_rows();
 #endif
     test_gdn(&arena, 2, 6, 32, 7);
