@@ -1,0 +1,16 @@
+kernel,replaces,power_limit_w,rows,us_per_launch,note
+matrix_half_ws gate/up,,600,8192,2732.9,"routed experts of one chunk (10 of 512 Q4_K gate/up, uniform random routing), DS4_TEST_QWEN4_EXPERT_BENCH=1, QWEN4_BENCH_T for the rows"
+matrix_half_wb gate/up,matrix_half_ws gate/up,600,8192,2092.8,
+matrix_half_ws down,,600,8192,1799.8,"MXFP4 down"
+matrix_half_wb down,matrix_half_ws down,600,8192,1399.1,
+matrix_half_ws gate/up,,600,4096,1866.1,
+matrix_half_wb gate/up,matrix_half_ws gate/up,600,4096,1675.2,
+matrix_half_ws down,,600,4096,1077.9,
+matrix_half_wb down,matrix_half_ws down,600,4096,951.7,
+matrix_half_ws gate/up,,600,2048,1703.3,
+matrix_half_wb gate/up,matrix_half_ws gate/up,600,2048,1552.9,
+matrix_half_ws down,,600,2048,661.1,"keeps matrix_half_ws: experts average 40 tokens"
+matrix_half_wb down,matrix_half_ws down,600,2048,733.3,not taken
+matrix_half_wb gate/up with activation rows by TMA,matrix_half_ws gate/up,600,8192,4636.7,"dropped: a 2D copy per token row, 192 a step from one warp"
+matrix_half_wb down with activation rows by TMA,matrix_half_ws down,600,8192,3724.5,dropped
+matrix_half_md gate/up,matrix_half_ws gate/up,600,8192,2871.8,"dropped: dequant in the multiplying warps, 64-token tiles"
