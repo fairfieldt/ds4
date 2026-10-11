@@ -145,7 +145,10 @@ static void test_8bit(const char *path, const uint32_t *rows, size_t n, float *o
 }
 
 int main(void) {
-    char path[] = "/tmp/ds4-qwen-ngrams-XXXXXX";
+    /* the fixture goes under TMPDIR when it is set */
+    const char *dir = getenv("TMPDIR");
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/ds4-qwen-ngrams-XXXXXX", dir && dir[0] ? dir : "/tmp");
     int fd = mkstemp(path);
     assert(fd >= 0);
     close(fd);
