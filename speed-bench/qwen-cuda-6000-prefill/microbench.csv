@@ -1,0 +1,33 @@
+kernel,power_limit_w,rows,context_tokens,us_per_launch,note
+idx_score (base),450,8192,8192,3824.2,"one 8192-row chunk, the last row seeing all context_tokens / 4 blocks"
+idx_score_mm,450,8192,8192,197.9,
+idx_score (base),450,8192,32768,15599.2,
+idx_score_mm,450,8192,32768,1311.3,
+idx_score_tiles (base),450,8192,131072,32204.1,with tile maxima
+idx_score_mm,450,8192,131072,6993.1,with tile maxima
+idx_score_tiles (base),450,8192,253952,65380.7,with tile maxima
+idx_score_mm,450,8192,253952,13845.4,with tile maxima
+idx_score (base),600,8192,8192,3873.6,
+idx_score_mm,600,8192,8192,201.2,
+idx_score (base),600,8192,32768,15807.5,
+idx_score_mm,600,8192,32768,1282.0,
+idx_score_tiles (base),600,8192,131072,28962.7,
+idx_score_mm,600,8192,131072,6152.0,
+idx_score_tiles (base),600,8192,253952,57597.7,
+idx_score_mm,600,8192,253952,12136.9,
+first exact layout (dropped),450,8192,32768,1552.1,"halves in shared memory converted per use, 4 rows x 2 blocks per step, two blocks per SM"
+first exact layout (dropped),450,8192,253952,16245.4,
+tensor cores (not exact; dropped),450,8192,32768,693.0,queries rounded to half
+tensor cores (not exact; dropped),450,8192,253952,5600.7,queries rounded to half
+tensor cores hi+lo (not exact; dropped),450,8192,32768,849.0,queries as hi + lo/4096 halves
+tensor cores hi+lo (not exact; dropped),450,8192,253952,7010.9,queries as hi + lo/4096 halves
+attention_group (base),450,8192,32768,8045.8,"sparse rows of 2051 keys, neighbouring rows sharing 7 of 8 blocks"
+attention_group_pipe,450,8192,32768,6003.1,
+attention_group (base),450,8192,253952,8348.2,
+attention_group_pipe,450,8192,253952,6239.2,
+attention_group (base),600,8192,32768,8058.1,
+attention_group_pipe,600,8192,32768,6002.6,
+attention_group (base),600,8192,253952,8352.0,
+attention_group_pipe,600,8192,253952,6195.6,
+attention_group max-shared carveout (dropped),450,8192,32768,8131.3,
+attention_group max-shared carveout (dropped),450,8192,253952,8652.2,
