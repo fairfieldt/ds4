@@ -59299,18 +59299,22 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
 }
 
 /* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
-static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
-                               const ds4_tensor *norm, const ds4_tensor *down,
-                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+/* comb: the residual combine of the previous block (R += its weights * comb)
+ * runs first; NULL: none */
+static bool qwen4_graph_hc_mix_comb(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                    const ds4_tensor *norm, const ds4_tensor *down,
+                                    const ds4_tensor *up, const ds4_tensor *inject, uint32_t T,
+                                    const ds4_gpu_tensor *comb) {
 #ifndef DS4_HAS_QWEN4_METAL
-    /* CUDA prefill: the norm with the down projection's pack, and the up
-     * projection with the mix (xn is not kept; hc_u is free scratch here) */
+    /* CUDA prefill: the combine and the norm with the down projection's pack,
+     * and the up projection with the mix (xn is not kept; hc_u is free scratch here) */
     if (qwen4_select_rows(T) > 8u && down->type == DS4_TENSOR_F16 && up->type == DS4_TENSOR_F16 &&
         ds4_gpu_qwen4_hc_mix_prefill_tensor(g->mixed, g->inj, g->lo, g->hc_lo_act, g->xn, g->hc_u, g->R,
             m->map, m->size, norm->abs_offset, inject ? inject->abs_offset : 0,
             inject ? inject->type : DS4_TENSOR_F32, down->abs_offset, up->abs_offset, T, DS4_N_EMBD, DS4_N_HC,
-            inject ? DS4_N_HC : 0u, DS4_N_HC_LOWRANK, DS4_RMS_EPS)) return true;
+            inject ? DS4_N_HC : 0u, DS4_N_HC_LOWRANK, DS4_RMS_EPS, comb)) return true;
 #endif
+    if (comb && !ds4_gpu_qwen4_hc_combine_tensor(g->R, comb, g->inj, T, DS4_N_EMBD, DS4_N_HC)) return false;
     bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
@@ -59363,6 +59367,12 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 #endif
     return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+}
+
+static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                               const ds4_tensor *norm, const ds4_tensor *down,
+                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+    return qwen4_graph_hc_mix_comb(g, m, norm, down, up, inject, T, NULL);
 }
 
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
@@ -59957,8 +59967,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                         l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
             }
         } else {
-            if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
-            if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+            if (ok) ok = qwen4_graph_hc_mix_comb(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject,
+                                                 T, g->blk);
         }
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */

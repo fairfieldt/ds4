@@ -1868,7 +1868,7 @@ static void test_hc_up_rows_exact(arena_t *a, uint32_t T, uint32_t E, uint32_t h
  * those of hc_norm, dense_mm (down), hc_lo_act, dense_mm (up) and
  * hc_mix_rows bit for bit. */
 static void test_hc_mix_prefill_exact(arena_t *a, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, uint32_t rank,
-                                      uint32_t itype) {
+                                      uint32_t itype, bool combine) {
     const uint32_t K = E * hc;
     /* one set of weights for every shape (prefixes of the largest) */
     static uint64_t gamma, inj16, inj32, down, up;
@@ -1882,26 +1882,35 @@ static void test_hc_mix_prefill_exact(arena_t *a, uint32_t T, uint32_t E, uint32
         up = arena_f16(a, (uint64_t)10240 * 320, &sh, 0.05f); free(sh);
     }
     const uint64_t inj_w = itype == 1u ? inj16 : inj32;
-    float *R = rand_vec((uint64_t)T * K, 1.0f);
-    ds4_gpu_tensor *gR = upload(R, (uint64_t)T * K), *xn = upload(NULL, (uint64_t)T * K), *u = upload(NULL, (uint64_t)T * K);
+    /* combine: R += the previous block's out (comb) weighted by the injection partials in inj */
+    float *R = rand_vec((uint64_t)T * K, 1.0f), *cb = combine ? rand_vec((uint64_t)T * E, 1.0f) : NULL;
+    float *inj0 = combine ? rand_vec((uint64_t)T * hc * 8 * hc, 0.5f) : NULL;
+    ds4_gpu_tensor *gRr = upload(R, (uint64_t)T * K), *gR = upload(R, (uint64_t)T * K), *xn = upload(NULL, (uint64_t)T * K),
+                   *u = upload(NULL, (uint64_t)T * K), *gc = combine ? upload(cb, (uint64_t)T * E) : NULL;
     ds4_gpu_tensor *t[2][4];
     for (int f = 0; f < 2; f++) {
         t[f][0] = upload(NULL, (uint64_t)T * E);
-        t[f][1] = upload(NULL, (uint64_t)T * hc * 8 * (ni ? ni : 1));
+        t[f][1] = upload(inj0, (uint64_t)T * hc * 8 * (ni ? ni : 1));
         t[f][2] = upload(NULL, (uint64_t)T * rank);
         t[f][3] = upload(NULL, (uint64_t)T * rank);
     }
-    require_ok(ds4_gpu_qwen4_hc_norm_tensor(xn, t[0][1], gR, a->base, a->size, gamma, inj_w, itype, T, E, hc, ni, 1e-6f) &&
+    if (combine) require_ok(ds4_gpu_qwen4_hc_combine_tensor(gRr, gc, t[0][1], T, E, hc), "hc mix prefill combine");
+    require_ok(ds4_gpu_qwen4_hc_norm_tensor(xn, t[0][1], gRr, a->base, a->size, gamma, inj_w, itype, T, E, hc, ni, 1e-6f) &&
                ds4_gpu_qwen4_dense_mm_tensor(t[0][2], xn, a->base, a->size, down, 1u, T, K, rank) &&
                ds4_gpu_qwen4_hc_lo_act_tensor(t[0][3], t[0][2], T, hc, rank) &&
                ds4_gpu_qwen4_dense_mm_tensor(u, t[0][3], a->base, a->size, up, 1u, T, rank, K) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(t[0][0], u, xn, T, E, hc), "hc mix prefill reference");
     ds4_gpu_tensor *hilo = upload(NULL, (uint64_t)T * K), *sc = upload(NULL, (uint64_t)T * (1 + hc));
     require_ok(ds4_gpu_qwen4_hc_mix_prefill_tensor(t[1][0], t[1][1], t[1][2], t[1][3], hilo, sc, gR, a->base, a->size,
-                                                   gamma, inj_w, itype, down, up, T, E, hc, ni, rank, 1e-6f) == 1,
+                                                   gamma, inj_w, itype, down, up, T, E, hc, ni, rank, 1e-6f, gc) == 1,
                "hc mix prefill");
     char name[96];
-    snprintf(name, sizeof(name), "hc mix prefill exact T=%u E=%u hc=%u ni=%u", T, E, hc, ni);
+    snprintf(name, sizeof(name), "hc mix prefill exact T=%u E=%u hc=%u ni=%u%s", T, E, hc, ni, combine ? " comb" : "");
+    if (combine) {
+        float *r = download(gRr, (uint64_t)T * K), *g = download(gR, (uint64_t)T * K);
+        require_ok(memcmp(r, g, (uint64_t)T * K * 4) == 0, name);
+        free(r); free(g);
+    }
     const uint64_t n[4] = { (uint64_t)T * E, (uint64_t)T * hc * 8 * ni, (uint64_t)T * rank, (uint64_t)T * rank };
     for (int i = 0; i < 4; i++) {
         if (!n[i]) continue;
@@ -1911,8 +1920,9 @@ static void test_hc_mix_prefill_exact(arena_t *a, uint32_t T, uint32_t E, uint32
     }
     printf("  %-44s ok\n", name);
     for (int f = 0; f < 2; f++) for (int i = 0; i < 4; i++) ds4_gpu_tensor_free(t[f][i]);
-    ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(xn); ds4_gpu_tensor_free(u); ds4_gpu_tensor_free(hilo); ds4_gpu_tensor_free(sc);
-    free(R);
+    ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(gRr); ds4_gpu_tensor_free(xn); ds4_gpu_tensor_free(u);
+    ds4_gpu_tensor_free(hilo); ds4_gpu_tensor_free(sc); ds4_gpu_tensor_free(gc);
+    free(R); free(cb); free(inj0);
 }
 
 /* The Q8 projections of a prefill chunk's shapes, and partial chunks
@@ -1941,11 +1951,14 @@ static void test_prefill_pipes_exact_all(arena_t *a) {
     test_hc_up_rows_exact(a, 33, 2560, 4, 320);
     test_hc_up_rows_exact(a, 4099, 2560, 4, 320);
     test_hc_up_rows_exact(a, 300, 64, 3, 128);
-    test_hc_mix_prefill_exact(a, 8192, 2560, 4, 4, 320, 1u);
-    test_hc_mix_prefill_exact(a, 8192, 2560, 4, 0, 320, 1u);
-    test_hc_mix_prefill_exact(a, 33, 2560, 4, 4, 320, 1u);
-    test_hc_mix_prefill_exact(a, 4099, 2560, 4, 4, 320, 1u);
-    test_hc_mix_prefill_exact(a, 300, 192, 3, 3, 128, 0u);
+    test_hc_mix_prefill_exact(a, 8192, 2560, 4, 4, 320, 1u, false);
+    test_hc_mix_prefill_exact(a, 8192, 2560, 4, 0, 320, 1u, false);
+    test_hc_mix_prefill_exact(a, 33, 2560, 4, 4, 320, 1u, false);
+    test_hc_mix_prefill_exact(a, 4099, 2560, 4, 4, 320, 1u, false);
+    test_hc_mix_prefill_exact(a, 300, 192, 3, 3, 128, 0u, false);
+    test_hc_mix_prefill_exact(a, 8192, 2560, 4, 4, 320, 1u, true);
+    test_hc_mix_prefill_exact(a, 4099, 2560, 4, 4, 320, 1u, true);
+    test_hc_mix_prefill_exact(a, 300, 192, 3, 3, 128, 0u, true);
     if (getenv("DS4_TEST_QWEN4_HC_ONLY")) return;
     test_split_exact_all(a);
     if (getenv("DS4_TEST_QWEN4_SPLIT_ONLY")) return;
