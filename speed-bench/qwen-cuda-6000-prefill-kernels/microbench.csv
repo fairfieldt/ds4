@@ -1,0 +1,16 @@
+kernel,replaces,power_limit_w,rows,us_per_launch,note
+conv,,600,8192,3957.7,"GDN conv of one chunk (10,240 channels, K = 4), DS4_TEST_QWEN4_GDN_BENCH=1"
+conv_seg,conv,600,8192,521.5,
+gdn_scan,,600,8192,13908.3,"GDN scan of one chunk (16/48 heads of 128)"
+gdn_scan_pipe,gdn_scan,600,8192,2344.0,
+matrix_half_tile gate/up,,600,8192,8410.6,"routed experts of one chunk (10 of 512 Q4_K gate/up), weights copied to the device, DS4_TEST_QWEN4_EXPERT_BENCH=1"
+matrix_half_ws gate/up,matrix_half_tile gate/up,600,8192,2900.3,
+matrix_half_tile down,,600,8192,5838.9,"routed experts of one chunk (10 of 512 MXFP4 down)"
+matrix_half_ws down,matrix_half_tile down,600,8192,1813.4,
+dense_f16_components,,600,8192,651.7,"HC up projection (K = 320, 10,240 outputs), DS4_TEST_QWEN4_F16_BENCH=1"
+dense_f16_pipe,dense_f16_components,600,8192,423.6,
+matrix_half_pipe gate/up (dropped),matrix_half_tile gate/up,600,8192,3336.7,"two blocks per SM, every warp dequantizing and multiplying"
+matrix_half_pipe down (dropped),matrix_half_tile down,600,8192,2104.7,
+gdn_scan_pipe four stages (dropped),gdn_scan,600,8192,3980.3,"36 KB blocks, 8 of 384 in a second wave"
+gdn_scan_pipe four rows per thread (dropped),gdn_scan,600,8192,2486.4,"scattered butterflies, 64-thread blocks"
+gdn_scan_pipe without butterflies (diagnostic),gdn_scan,600,8192,1471.8,"wrong results; the shuffles' share of the scan"
