@@ -82007,6 +82007,22 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         }
     }
 #ifdef DS4_HAS_QWEN4_BATCH
+    /* More sessions than the speculative batch holds (a row per session and
+     * per draft, at most 32) run as the plain batch of those sessions, which
+     * is native up to QWEN4_BATCH_MAX_ROWS: its tokens are the ones plain
+     * batched decode commits, and speculating one session at a time would
+     * round like single-token decode instead and take longer.  Pending
+     * drafts are dropped, as the plain batch always does. */
+    if (count > 16 && e->backend == DS4_BACKEND_CUDA && ds4_session_is_qwen4(items[0].session) &&
+        !e->tp.active && qwen4_graph_native_session_batch_supported(items, count, e)) {
+        if (ds4_sessions_eval_batch(items, count, err, errlen) != 0) return 1;
+        for (int i = 0; i < count; i++) {
+            n_accepted[i] = 1;
+            accepted[i][0] = items[i].token;
+            accepted[i][1] = -1;
+        }
+        return 0;
+    }
     if (count >= 2 && count <= 16 && ds4_session_is_qwen4(items[0].session) && e->glm_mtp &&
         !e->tp.active && (e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA) &&
         qwen4_graph_native_session_batch_check(items, count, e, true)) {
