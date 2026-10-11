@@ -15,7 +15,7 @@ Hardware and software are the same as [`../qwen-cuda-6000`](../qwen-cuda-6000/RE
 
 Greedy output is unchanged. All 10 short prompts and both ~3K-token prompts give the same 256-token hash as the base, plain and MTP. Every change in the stack is bit-identical by construction; on main one of them, the catch-up row trim, could still change MTP draft rounding (never committed tokens), which it no longer can on top of the fused-decode series (see [Exactness](#exactness)).
 
-Two items measured in the same round are **not** in this series. Each is on its own branch with one commit on top of it (see [Side branches](#side-branches)):
+Two items measured in the same round are **not** in this series. Each was kept on its own branch with one commit on top of it (see [Side branches](#side-branches)); both were dropped on 2026-10-10 and their numbers are kept here:
 - `qwen-cuda-mtp-depth-ev`: an expected-value MTP draft-depth policy. This series keeps the existing fixed depth rule.
 - `qwen-cuda-q8-split-k`: an opt-in split-K geometry for the 2560×6144 Q8 projections. It changes summation order.
 
@@ -349,7 +349,7 @@ Gain = EV / old rule − 1, MTP, on top of this stack. Outputs were identical in
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | +0.45 | −3.20 | +3.64 | 0.00 | +6.41 | −3.37 | +5.84 | +1.53 | +6.23 | −2.77 | +1.48 |
 
-**Why it is not in this stack:** it costs 2.8–3.4% on the three prose-like prompts (prose, oped, translate). In the faster stack, k fitted to the base's cycle times over-engages depth 3 on low-acceptance text. Raising k does not fix it: on the measured series, k = 0.35 gave a mean of −0.8% and k = 0.5 −3.1%, with code, json and table losing 4–10%. The rule needs rework (for example, cycle costs measured at run time) before it is revisited. Its lead has also shrunk: on its own on the base it gained +7.4% on explain, +8.8% on math and +8.9% on rust, against +3.6%, +6.4% and +5.8% here.
+**Why it is not in this stack:** it costs 2.8–3.4% on the three prose-like prompts (prose, oped, translate). In the faster stack, k fitted to the base's cycle times over-engages depth 3 on low-acceptance text. Raising k does not fix it: on the measured series, k = 0.35 gave a mean of −0.8% and k = 0.5 −3.1%, with code, json and table losing 4–10%. The rule needs rework (for example, cycle costs measured at run time) before it is revisited; the branch was dropped. Its lead has also shrunk: on its own on the base it gained +7.4% on explain, +8.8% on math and +8.9% on rust, against +3.6%, +6.4% and +5.8% here.
 
 ### Q8 split-K (`qwen-cuda-q8-split-k`)
 
@@ -373,6 +373,8 @@ One split-K block of the longdoc plain run was slow (range 162.68–165.70 t/s),
 - **Quality:** NLL is neutral. On 100 cases of qwen38-flash-alibaba-100 at ctx 4096 (measured series), NLL is 0.290510 off and 0.290498 on, with API top-1 5127/5568 and first_match 83 both ways.
 
 Enabling it by default is a one-line change in `split_matvec_shape` if the gate is relaxed for it; otherwise the branch should be dropped.
+
+**Re-measured on 2026-10-10 and dropped.** The staged-projection series ([`../qwen-cuda-6000-staging`](../qwen-cuda-6000-staging/README.md)) now loads these projections' weights before their dependency wait, which takes most of the latency split-K removed. On main after that series, in-process ABBA at 600 W (the bench host's limit from that day), 3 pairs, split-K on against off: plain +0.12%, +0.09%, −0.33% and −0.41%, MTP +0.35%, +0.77%, −0.03% and +0.66% on code, prose, longcode and longdoc, with longdoc's output changed. Not worth relaxing the exactness gate for.
 
 ## Pre-existing base bugs
 
