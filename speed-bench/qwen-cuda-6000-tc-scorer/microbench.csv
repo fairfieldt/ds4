@@ -1,0 +1,41 @@
+scorer,launches,power_limit_w,rows,blocks,us,data
+idx_score_mm,score,600,8192,63488,12022.6,"real chunk at 245760 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,63488,3097.4,"real chunk at 245760 tokens, mean of 12 layers"
+idx_score_mm,score+select,600,8192,63488,12924.9,"real chunk at 245760 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,63488,3624.3,"real chunk at 245760 tokens, mean of 12 layers"
+idx_score_mm,score,600,8192,32768,6539.2,"real chunk at 122880 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,32768,2233.1,"real chunk at 122880 tokens, mean of 12 layers"
+idx_score_mm,score+select,600,8192,32768,7207.2,"real chunk at 122880 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,32768,2621.5,"real chunk at 122880 tokens, mean of 12 layers"
+idx_score_mm,score,600,8192,16384,3211.2,"real chunk at 57344 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,16384,1560.6,"real chunk at 57344 tokens, mean of 12 layers"
+idx_score_mm,score+select,600,8192,16384,3584.2,"real chunk at 57344 tokens, mean of 12 layers"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,16384,1934.1,"real chunk at 57344 tokens, mean of 12 layers"
+idx_score_mm,score,600,8192,9000,1569.1,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,9000,1284.5,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score+select,600,8192,9000,1959.3,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,9000,1635.2,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score,600,8192,10240,1808.8,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,10240,1254.8,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score+select,600,8192,10240,2196.5,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,10240,1620.2,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score,600,8192,12288,2204.5,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,12288,1265.3,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score+select,600,8192,12288,2594.5,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,12288,1625.5,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score,600,8192,14336,2599.4,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,14336,1310.8,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score+select,600,8192,14336,2990.4,"real chunk at 57344 tokens, layer 5, first n blocks"
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,14336,1668.2,"real chunk at 57344 tokens, layer 5, first n blocks"
+idx_score_mm,score,600,8192,16384,2983.4,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,16384,1153.2,random queries and keys
+idx_score_mm,score+select,600,8192,16384,3365.5,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,16384,1517.8,random queries and keys
+idx_score_mm,score,600,8192,32768,6170.6,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,32768,2025.5,random queries and keys
+idx_score_mm,score+select,600,8192,32768,6918.0,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,32768,2414.2,random queries and keys
+idx_score_mm,score,600,8192,63488,12409.9,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score,600,8192,63488,3586.1,random queries and keys
+idx_score_mm,score+select,600,8192,63488,13847.7,random queries and keys
+tc (prep + idx_score_tc + idx_tc_exact),score+select,600,8192,63488,4117.8,random queries and keys
