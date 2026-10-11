@@ -5063,6 +5063,25 @@ __global__ void stage_host(uint4 *dst, const uint4 *src, unsigned n) {
     if (i < n) dst[i] = a;
 }
 
+/* A token's BF16 embedding row widened to f32 (the bits shifted up, as the
+ * host widens it) into each of its hc streams.  One block a token. */
+__global__ void embed_rows_bf16(float *R, const int *ids, const uint16_t *table, unsigned E, unsigned hc) {
+    pdl_enter();
+    const uint4 *row = (const uint4 *)(table + (uint64_t)ids[blockIdx.x] * E);
+    float4 *dst = (float4 *)(R + (uint64_t)blockIdx.x * E * hc);
+    for (unsigned i = threadIdx.x; i < E / 8; i += blockDim.x) {
+        const uint4 v = row[i];
+        const float4 a = make_float4(__uint_as_float(v.x << 16), __uint_as_float(v.x & 0xffff0000u),
+                                     __uint_as_float(v.y << 16), __uint_as_float(v.y & 0xffff0000u));
+        const float4 b = make_float4(__uint_as_float(v.z << 16), __uint_as_float(v.z & 0xffff0000u),
+                                     __uint_as_float(v.w << 16), __uint_as_float(v.w & 0xffff0000u));
+        for (unsigned s = 0; s < hc; s++) {
+            dst[s * (E / 4) + 2 * i] = a;
+            dst[s * (E / 4) + 2 * i + 1] = b;
+        }
+    }
+}
+
 /* Start of the residual stream: the learned side x side position table
  * resampled to the patch grid (bilinear, align_corners, the arithmetic of
  * qwen4_vision_pos_embed in ds4.c) plus the patch bias.  One block per
@@ -7699,6 +7718,43 @@ extern "C" int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off
     launch(stage_host, (unsigned)((n + 255u) / 256u), 256, 0,
            (uint4 *)((char *)dst->ptr + off), (const uint4 *)src, (unsigned)n);
     return launched();
+}
+
+/* R[t][s] = embedding row ids[t] for each of the hc streams; BF16 tables
+ * only (0 otherwise, before any launch).  ids holds T in-vocabulary rows. */
+extern "C" int ds4_gpu_qwen4_embed_rows_tensor(ds4_gpu_tensor *R, const ds4_gpu_tensor *ids,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t vocab,
+        uint32_t T, uint32_t E, uint32_t hc) {
+    using namespace qwen4_cuda;
+    if (type != 30 || !T || !E || E % 8 || !hc || !tensor(ids, (uint64_t)T * 4) ||
+        !tensor(R, (uint64_t)T * E * hc * 4)) return 0;
+    const char *w = weight(map, size, off, (uint64_t)vocab * E * 2);
+    if (!w || (uintptr_t)w % 16) return 0;
+    launch(embed_rows_bf16, T, 320, 0, (float *)R->ptr, (const int *)ids->ptr, (const uint16_t *)w, E, hc);
+    return launched();
+}
+
+/* A copy from page-locked memory queued behind the kernels before it, and
+ * the wait for the last such copy before the host reuses its source. */
+static cudaEvent_t qwen4_upload_done;
+static bool qwen4_upload_pending;
+
+extern "C" int ds4_gpu_qwen4_upload_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes) {
+    if (!dst || !src || !bytes || off > dst->bytes || bytes > dst->bytes - off) return 0;
+    if (!qwen4_upload_done && !cuda_ok(cudaEventCreateWithFlags(&qwen4_upload_done, cudaEventDisableTiming),
+                                       "Qwen upload event")) return 0;
+    const cudaStream_t stream = cuda_decode_stream();
+    if (!cuda_ok(cudaMemcpyAsync((char *)dst->ptr + off, src, (size_t)bytes, cudaMemcpyHostToDevice, stream),
+                 "Qwen upload") ||
+        !cuda_ok(cudaEventRecord(qwen4_upload_done, stream), "Qwen upload event")) return 0;
+    qwen4_upload_pending = true;
+    return 1;
+}
+
+extern "C" int ds4_gpu_qwen4_upload_wait(void) {
+    if (!qwen4_upload_pending) return 1;
+    qwen4_upload_pending = false;
+    return cuda_ok(cudaEventSynchronize(qwen4_upload_done), "Qwen upload wait");
 }
 
 /* pos_embed must be NULL: the position table is resampled on the device */
