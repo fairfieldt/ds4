@@ -59462,9 +59462,17 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *tiles = n_blocks_after > 8192u ? g->tile_max : NULL;
 #endif
     const bool ok = q && gate && o && iqn &&
+#ifdef DS4_HAS_QWEN4_METAL
         ds4_gpu_qwen4_idx_score_tensor(g->score, tiles, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
+#else
+        /* scores as the top-k selection sees them (see the declaration) */
+        ds4_gpu_qwen4_idx_score_topk_tensor(g->score, tiles, iqn,
+                                            g->layer_block_key[il], n_sparse, n_blocks_after,
+                                            DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio,
+                                            g->k_blocks) &&
+#endif
         qwen4_idx_select(g->sel_blocks, g->score, tiles,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,

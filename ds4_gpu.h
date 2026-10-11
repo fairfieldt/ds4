@@ -3598,6 +3598,15 @@ int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
         uint32_t pos0, uint32_t ratio);
+/* CUDA: the scores as the top_k selection over them sees them.  Prefill
+ * launches of long rows keep approximate scores wherever they stay below
+ * the row's top_k-th largest exact key, and exact ones elsewhere, so
+ * ds4_gpu_qwen4_idx_select_tensor selects the same blocks as from
+ * ds4_gpu_qwen4_idx_score_tensor; top_k 0 gives that function's scores. */
+int ds4_gpu_qwen4_idx_score_topk_tensor(
+        ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
+        uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
+        uint32_t pos0, uint32_t ratio, uint32_t top_k);
 int ds4_gpu_qwen4_idx_select_tensor(
         ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
         uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k);
