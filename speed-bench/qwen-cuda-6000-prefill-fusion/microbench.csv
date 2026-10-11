@@ -1,0 +1,17 @@
+kernel,replaces,power_limit_w,rows,us_per_launch,note
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,6586.5,"GDN qkv (10,240 rows) and gate (6,144) of K = 2560, one packed input, packs included, DS4_TEST_QWEN4_Q8_BENCH=1 (DS4_QWEN4_SPLIT_TMA=0)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,5568.5,"the same, one launch for both weights"
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,4154.1,"K = 2560, 10,240 rows (qkv alone)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,3412.4,
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,2543.6,"K = 2560, 6,144 rows (gate alone)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,2084.7,
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,2488.3,"K = 6144, 2,560 rows (delta-net and attention outputs)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,2318.1,
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,308.5,"K = 2560, 640 rows (one shared-expert projection; the model fuses gate and up)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,338.9,
+Q8 three cuBLAS GEMMs + dense_rescale2,,600,8192,365.7,"K = 640, 2,560 rows (shared-expert down)"
+dense_split_tma,Q8 three cuBLAS GEMMs + dense_rescale2,600,8192,247.9,
+matrix_half_ws gate/up,,600,8192,2743.1,"routed experts of one chunk, DS4_TEST_QWEN4_EXPERT_BENCH=1 (dropped variant below)"
+matrix_half_ws gate/up with unit loads,matrix_half_ws gate/up,600,8192,2807.6,"dropped: superblocks of every row loaded by consecutive threads into shared memory, 32-k A steps"
+matrix_half_ws down,,600,8192,1807.7,
+matrix_half_ws down with unit loads,matrix_half_ws down,600,8192,1974.9,dropped
