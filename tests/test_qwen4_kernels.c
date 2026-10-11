@@ -1594,6 +1594,84 @@ static void test_ngram_conv_seg_exact(arena_t *a, uint32_t T, uint32_t C, uint32
     free(R); free(gt); free(nm); free(hist);
 }
 
+/* Prefill projections pack their activations with pack_half_rows: the
+ * outputs equal pack_half_components<0>'s bit for bit
+ * (DS4_QWEN4_PACK_ROWS=0), with zero, huge and tiny rows. */
+static void test_pack_rows_exact(arena_t *a, uint32_t K, uint32_t M, uint32_t T, uint32_t type) {
+    double *sh;
+    const uint64_t w = type == 8u ? arena_q8_0(a, M, K, &sh, 0.05f) : arena_f16(a, (uint64_t)M * K, &sh, 0.05f);
+    free(sh);
+    float *x = rand_vec((uint64_t)T * K, 1.0f);
+    for (uint32_t k = 0; k < K; k++) {
+        x[k] = 0.0f;                                   /* row 0: zeros */
+        x[(uint64_t)K + k] *= 1e30f;                   /* row 1: exponent clamped */
+        x[2ull * K + k] *= 1e-30f;                     /* row 2: tiny, flushed products */
+        if (k % 7 == 0) x[3ull * K + k] = 0.0f;
+    }
+    float *got[2];
+    for (int pk = 0; pk < 2; pk++) {
+        setenv("DS4_QWEN4_PACK_ROWS", pk ? "1" : "0", 1);
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *go = upload(NULL, (uint64_t)T * M);
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(go, gx, a->base, a->size, w, type, T, K, M), "pack rows mm");
+        got[pk] = download(go, (uint64_t)T * M);
+        ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(go);
+    }
+    unsetenv("DS4_QWEN4_PACK_ROWS");
+    char name[96];
+    snprintf(name, sizeof(name), "pack rows exact K=%u M=%u T=%u type=%u", K, M, T, type);
+    require_ok(memcmp(got[0], got[1], (uint64_t)T * M * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(got[0]); free(got[1]); free(x);
+}
+
+/* F16 projections of K <= 512 (the HC up mixers) take dense_f16_pipe: the
+ * outputs equal dense_f16_components' bit for bit (DS4_QWEN4_F16_PIPE=0). */
+static void test_f16_pipe_exact(arena_t *a, uint32_t K, uint32_t M, uint32_t T) {
+    double *sh;
+    const uint64_t w = arena_f16(a, (uint64_t)M * K, &sh, 0.05f);
+    free(sh);
+    float *x = rand_vec((uint64_t)T * K, 1.0f), *got[2];
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_F16_PIPE", pipe ? "1" : "0", 1);
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *go = upload(NULL, (uint64_t)T * M);
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(go, gx, a->base, a->size, w, 1u, T, K, M), "f16 pipe mm");
+        got[pipe] = download(go, (uint64_t)T * M);
+        ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(go);
+    }
+    unsetenv("DS4_QWEN4_F16_PIPE");
+    char name[96];
+    snprintf(name, sizeof(name), "f16 pipe exact K=%u M=%u T=%u", K, M, T);
+    require_ok(memcmp(got[0], got[1], (uint64_t)T * M * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(got[0]); free(got[1]); free(x);
+}
+
+/* Q8 prefill projections of one input pack it once (multi_gemv): each
+ * output equals its own dense_mm bit for bit (DS4_QWEN4_PACK_ONCE=0). */
+static void test_pack_once_exact(arena_t *a, uint32_t T, uint32_t K, uint32_t N, const uint32_t *M) {
+    uint64_t off[4];
+    for (uint32_t i = 0; i < N; i++) { double *sh; off[i] = arena_q8_0(a, M[i], K, &sh, 0.05f); free(sh); }
+    float *x = rand_vec((uint64_t)T * K, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *o[2][4];
+    const uint32_t types[4] = { 8u, 8u, 8u, 8u };
+    for (int once = 0; once < 2; once++) {
+        setenv("DS4_QWEN4_PACK_ONCE", once ? "1" : "0", 1);
+        for (uint32_t i = 0; i < N; i++) o[once][i] = upload(NULL, (uint64_t)T * M[i]);
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, K, N, o[once], a->base, a->size, off, types, M), "pack once");
+    }
+    unsetenv("DS4_QWEN4_PACK_ONCE");
+    char name[96];
+    snprintf(name, sizeof(name), "pack once exact T=%u K=%u N=%u", T, K, N);
+    for (uint32_t i = 0; i < N; i++) {
+        float *r = download(o[0][i], (uint64_t)T * M[i]), *g = download(o[1][i], (uint64_t)T * M[i]);
+        require_ok(memcmp(r, g, (uint64_t)T * M[i] * 4) == 0, name);
+        free(r); free(g);
+        ds4_gpu_tensor_free(o[0][i]); ds4_gpu_tensor_free(o[1][i]);
+    }
+    printf("  %-44s ok\n", name);
+    ds4_gpu_tensor_free(gx); free(x);
+}
+
 static void test_gdn_pipe_exact(uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t st, uint32_t st2) {
     const uint32_t D = 128, C = (2 * Hk + Hv) * D;
     const uint64_t ns = (uint64_t)Hv * D * D, no = (uint64_t)T * Hv * D, nq = (uint64_t)T * C;
@@ -1697,6 +1775,21 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
 }
 
 static void test_prefill_pipes_exact_all(arena_t *a) {
+    {
+        static const uint32_t m2[2] = { 4096, 2048 }, m4[4] = { 512, 512, 512, 128 }, m3[3] = { 640, 3300, 64 };
+        test_pack_once_exact(a, 2048, 2560, 2, m2);
+        test_pack_once_exact(a, 300, 2560, 4, m4);
+        test_pack_once_exact(a, 33, 640, 3, m3);
+    }
+    test_pack_rows_exact(a, 2560, 512, 40, 8u);
+    test_pack_rows_exact(a, 6144, 256, 35, 8u);
+    test_pack_rows_exact(a, 10240, 320, 33, 1u);
+    test_pack_rows_exact(a, 320, 1024, 40, 1u);
+    test_pack_rows_exact(a, 100, 96, 37, 1u);
+    test_f16_pipe_exact(a, 320, 10240, 8192);
+    test_f16_pipe_exact(a, 320, 1000, 200);
+    test_f16_pipe_exact(a, 128, 77, 33);
+    test_f16_pipe_exact(a, 512, 256, 129);
     test_expert_ws_exact(a, 2048);
     test_expert_ws_exact(a, 4099);
     test_conv_seg_exact(a, 9, 10240, 4, true);
@@ -5321,6 +5414,32 @@ static int bench_expert_down(void *ud) {
                                             39u, 512, c->T, 10, 10, 640, 2560, c->T);
 }
 
+/* DS4_TEST_QWEN4_F16_BENCH=1: one prefill chunk's HC up projection (8192
+ * rows, K = 320 to 10240), per kernel (DS4_QWEN4_F16_PIPE=0 for
+ * dense_f16_components); weights copied to the device first */
+typedef struct { arena_t *a; ds4_gpu_tensor *x, *out; uint64_t w; } f16_bench;
+static int bench_f16_one(void *ud) {
+    f16_bench *c = ud;
+    return ds4_gpu_qwen4_dense_mm_tensor(c->out, c->x, c->a->base, c->a->size, c->w, 1u, 8192, 320, 10240);
+}
+
+static void bench_f16_prefill(arena_t *a) {
+    double *sh;
+    f16_bench c = { a, NULL, NULL, arena_f16(a, (uint64_t)10240 * 320, &sh, 0.05f) };
+    free(sh);
+    setenv("DS4_CUDA_COPY_MODEL", "1", 1);
+    require_ok(ds4_gpu_set_model_map(a->base, (a->used + 4095) & ~(uint64_t)4095), "f16 bench device copy");
+    float *x = rand_vec((uint64_t)8192 * 320, 1.0f);
+    c.x = upload(x, (uint64_t)8192 * 320);
+    c.out = upload(NULL, (uint64_t)8192 * 10240);
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_F16_PIPE", pipe ? "1" : "0", 1);
+        bench_run(pipe ? "hc up f16 pipe T=8192" : "hc up f16 components T=8192", bench_f16_one, &c, 20);
+    }
+    unsetenv("DS4_QWEN4_F16_PIPE");
+    ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.out); free(x);
+}
+
 static void bench_expert_prefill(arena_t *a) {
     const uint32_t T = 8192, NE = 512, NS = 10, E = 2560, F = 640;
     const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * 17;
@@ -5573,6 +5692,7 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_ATTN_BENCH")) { bench_attn_prefill(); return 0; }
     if (getenv("DS4_TEST_QWEN4_PREFILL_PIPES_ONLY")) { test_prefill_pipes_exact_all(&arena); printf("all qwen4 prefill pipe tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_EXPERT_BENCH")) { bench_expert_prefill(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_F16_BENCH")) { bench_f16_prefill(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_GDN_BENCH")) { bench_gdn_prefill(&arena); return 0; }
 #endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
