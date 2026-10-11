@@ -12695,25 +12695,14 @@ static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total == 88576ull,
 static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
 static int ds4_cuda_attn_tokentile_arch_ok(void) {
-    /* Called for every Qwen dispatch; cudaGetDeviceProperties is slow, so
-     * query only the attribute, once per device. */
-    static int cached_device = -1;
-    static int cached_ok = 0;
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
-    if (device != cached_device) {
-        int major = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return 0;
-        }
-        cached_ok = major >= 8;
-        cached_device = device;
-    }
-    return cached_ok;
+    return prop.major >= 8;
 }
 
 /* Online decode attention: each warp walks one head's visible KV rows in
