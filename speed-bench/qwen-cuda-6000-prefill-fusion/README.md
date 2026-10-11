@@ -66,3 +66,4 @@ Dropped, with numbers:
 - `dense_split_pipe`: the same tiles loaded by every thread with cp.async and a `__syncthreads` per stage: 4,050 µs against 4,139 for cuBLAS (qkv), 2,948 against 2,488 (K = 6144); the copy addresses computed once per block changed nothing.
 - A producer warp for the copies (nine warps): one sub-partition then holds three warps and its 16K registers cap each thread at 168, so the kernel spilled.
 - The group's weight budget at 12, 24, 48 and 96 MB: within noise of each other.
+- `dense_split_tma3` (on main `19137f2`): the chains split over twelve warps on 128 × 128 tiles, eight warps taking wl·xh and wh·xh on 32 rows by 64 tokens and four taking wh·xl on 64 × 64, the wh·xl sums through shared memory: exact; 1% to 7% faster in the microbenchmarks, the chunk 1,206.0 → 1,207.0 ms, prefill +0.7% to +0.9%.
