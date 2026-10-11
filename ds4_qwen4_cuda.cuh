@@ -1823,12 +1823,13 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
 /* Prefill takes matrix_half_ws, dense_f16_pipe, pack_half_rows,
- * conv_seg, ngram_conv_seg and gdn_scan_pipe (the outputs of
- * matrix_half_tile, dense_f16_components, pack_half_components, conv,
- * ngram_conv and gdn_scan); DS4_QWEN4_EXPERT_WS=0, DS4_QWEN4_F16_PIPE=0,
- * DS4_QWEN4_PACK_ROWS=0, DS4_QWEN4_CONV_SEG=0 (both convs) and
- * DS4_QWEN4_GDN_PIPE=0 keep the originals, DS4_QWEN4_PACK_ONCE=0 a pack of
- * the shared input per projection.  Read per call for the tests. */
+ * conv_seg, ngram_conv_seg, gdn_scan_pipe and dense_split_tma (the outputs
+ * of matrix_half_tile, dense_f16_components, pack_half_components, conv,
+ * ngram_conv, gdn_scan and the Q8 projections' cuBLAS GEMMs and rescale);
+ * DS4_QWEN4_EXPERT_WS=0, DS4_QWEN4_F16_PIPE=0, DS4_QWEN4_PACK_ROWS=0,
+ * DS4_QWEN4_CONV_SEG=0 (both convs), DS4_QWEN4_GDN_PIPE=0 and
+ * DS4_QWEN4_SPLIT_TMA=0 keep the originals, DS4_QWEN4_PACK_ONCE=0 a pack
+ * of the shared input per projection.  Read per call for the tests. */
 static bool env_on(const char *name) {
     const char *env = getenv(name);
     return !env || env[0] != '0';
@@ -4351,27 +4352,241 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
     }
 }
 
-/* Q8 projections of one input: its components are packed once, then
- * each weight's tiles take the three GEMMs and the rescale (a weight's
- * tiling depends only on its own row count). */
+/* The three GEMMs and the rescale of Q8 projections in one kernel.  Where
+ * cuBLAS does not split k, its hss GEMMs take each output's m16n8k16
+ * products over k in order, the same as an in-order HMMA chain bit for bit,
+ * so the three chains here (wl.xh, wh.xl, wh.xh) equal its three GEMMs; the
+ * epilogue repeats their accumulation (2^-12 wl.xh, plus 2^-12 wh.xl, plus
+ * wh.xh) and dense_rescale2's (out * xs) * ws.  Each output is written once,
+ * where the GEMMs and the rescale write it four times and read it three
+ * times, and the projections of one input share a launch.
+ *
+ * Tiles of 128 weight rows by 96 tokens, 32 k a stage, three stages; warp
+ * tile 32 rows by 48 tokens.  Blocks take groups of G row tiles across all
+ * token tiles, so a group's weights (up to 48 MB) stay in L2 while the
+ * token tiles stream past them.  The tensor memory accelerator brings the tiles
+ * in: thread 0 issues one copy per operand and stage, refilling the stage
+ * the warps finished a step earlier, and the warps only multiply.  mbarriers
+ * hand the stages over (full: the copies' bytes landed; empty: every warp is
+ * done with it). */
+constexpr unsigned SP_BM = 128, SP_BN = 96, SP_STAGES = 3, SP_ROWS = 2*SP_BM+2*SP_BN;
+constexpr unsigned SP_STAGE = SP_ROWS*64, SP_SMEM = SP_STAGES*SP_STAGE+1024+64;
+
+/* 16-byte chunk c of row r in a stage: the copies' 64-byte swizzle, so the
+ * ldmatrix rows hit distinct banks */
+__device__ __forceinline__ unsigned sp_chunk(unsigned r, unsigned c) { return r*64+((c^(r/2%4))*16); }
+
+__device__ __forceinline__ void tma_2d(void *dst, const CUtensorMap *map, int x, int y, uint64_t *bar) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 :: "r"(smem_addr(dst)), "l"(map), "r"(x), "r"(y), "r"(smem_addr(bar)) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void mbar_init(uint64_t *bar, unsigned count) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(smem_addr(bar)), "r"(count) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void mbar_arrive(uint64_t *bar) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(smem_addr(bar)) : "memory");
+#endif
+}
+
+/* the projections of a launch: rows start[i].. of the packed weights are
+ * output i's, of row stride ld[i] */
+struct sp_outs { float *out[4]; unsigned start[5], ld[4]; };
+
+__global__ void __launch_bounds__(256, 1) dense_split_tma(const sp_outs o,
+        const __grid_constant__ CUtensorMap mwh, const __grid_constant__ CUtensorMap mwl,
+        const __grid_constant__ CUtensorMap mxh, const __grid_constant__ CUtensorMap mxl,
+        const float *ws, const float *xs, unsigned n, unsigned T, unsigned K, unsigned G) {
+    extern __shared__ unsigned char sp_raw[];
+#if __CUDA_ARCH__ >= 900
+    unsigned char *sm = (unsigned char *)(((uintptr_t)sp_raw+1023)&~(uintptr_t)1023);
+    uint64_t *full = (uint64_t *)(sm+SP_STAGES*SP_STAGE), *empty = full+SP_STAGES;
+    const unsigned tid = threadIdx.x, lane = tid%32, warp = tid/32;
+    const unsigned mb = (n+SP_BM-1)/SP_BM, nb = (T+SP_BN-1)/SP_BN, group = blockIdx.x/(G*nb), in = blockIdx.x%(G*nb);
+    const unsigned gs = G < mb-group*G ? G : mb-group*G;
+    const unsigned m0 = (group*G+in%gs)*SP_BM, t0 = in/gs*SP_BN, KT = K/32;
+    if (tid == 0) {
+        for (unsigned s = 0; s < SP_STAGES; s++) { mbar_init(&full[s],1); mbar_init(&empty[s],8); }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    pdl_enter();
+    /* stage rows: wh rows m0.., wl rows m0.., xh rows t0.., xl rows t0.. (64 bytes each) */
+    auto issue = [&](unsigned kt) {
+        const unsigned s = kt%SP_STAGES;
+        unsigned char *st = sm+s*SP_STAGE;
+        bulk_expect(&full[s],SP_STAGE);
+        tma_2d(st,&mwh,kt*32,m0,&full[s]);
+        tma_2d(st+SP_BM*64,&mwl,kt*32,m0,&full[s]);
+        tma_2d(st+2*SP_BM*64,&mxh,kt*32,t0,&full[s]);
+        tma_2d(st+(2*SP_BM+SP_BN)*64,&mxl,kt*32,t0,&full[s]);
+    };
+    if (tid == 0)
+        for (unsigned kt = 0; kt < SP_STAGES && kt < KT; kt++) issue(kt);
+    const unsigned wm = warp%4, wn = warp/4;
+    float acc[3][2][6][4] = {};
+    for (unsigned kt = 0; kt < KT; kt++) {
+        const unsigned s = kt%SP_STAGES;
+        if (tid == 0 && kt && kt-1+SP_STAGES < KT) {
+            /* the stage of step kt - 1, once every warp is done with it */
+            bulk_wait_phase(&empty[(kt-1)%SP_STAGES],(kt-1)/SP_STAGES);
+            issue(kt-1+SP_STAGES);
+        }
+        bulk_wait_phase(&full[s],kt/SP_STAGES);
+        const unsigned char *st = sm+s*SP_STAGE;
+        #pragma unroll
+        for (unsigned k16 = 0; k16 < 2; k16++) {
+            uint32_t ah[2][4], al[2][4], bh[3][4], bl[3][4];
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                const unsigned r = wm*32+i*16+lane%16, c = k16*2+lane/16;
+                tt_ldmatrix_x4(ah[i],st+sp_chunk(r,c));
+                tt_ldmatrix_x4(al[i],st+sp_chunk(SP_BM+r,c));
+            }
+            #pragma unroll
+            for (unsigned j = 0; j < 3; j++) {
+                const unsigned r = 2*SP_BM+wn*48+j*16+lane%8+lane/16*8, c = k16*2+lane/8%2;
+                tt_ldmatrix_x4(bh[j],st+sp_chunk(r,c));
+                tt_ldmatrix_x4(bl[j],st+sp_chunk(SP_BN+r,c));
+            }
+            /* one B fragment for consecutive products: wh.xh and wl.xh, then wh.xl */
+            #pragma unroll
+            for (unsigned j = 0; j < 6; j++) {
+                const uint32_t h2[2] = {bh[j/2][j%2*2],bh[j/2][j%2*2+1]}, l2[2] = {bl[j/2][j%2*2],bl[j/2][j%2*2+1]};
+                #pragma unroll
+                for (unsigned i = 0; i < 2; i++) tt_mma_m16n8k16_f16_f32(acc[2][i][j],ah[i],h2);
+                #pragma unroll
+                for (unsigned i = 0; i < 2; i++) tt_mma_m16n8k16_f16_f32(acc[0][i][j],al[i],h2);
+                #pragma unroll
+                for (unsigned i = 0; i < 2; i++) tt_mma_m16n8k16_f16_f32(acc[1][i][j],ah[i],l2);
+            }
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty[s]);
+    }
+    /* c0,c1: weight row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+    #pragma unroll
+    for (unsigned i = 0; i < 2; i++)
+        #pragma unroll
+        for (unsigned v2 = 0; v2 < 2; v2++) {
+            const unsigned m = m0+wm*32+i*16+lane/4+v2*8;
+            if (m >= n) continue;
+            const unsigned p = (m >= o.start[1])+(m >= o.start[2])+(m >= o.start[3]);
+            float *orow = (p == 0 ? o.out[0] : p == 1 ? o.out[1] : p == 2 ? o.out[2] : o.out[3])+
+                          (m-(p == 0 ? 0 : p == 1 ? o.start[1] : p == 2 ? o.start[2] : o.start[3]));
+            const unsigned ld = p == 0 ? o.ld[0] : p == 1 ? o.ld[1] : p == 2 ? o.ld[2] : o.ld[3];
+            const float wsm = ws[m];
+            #pragma unroll
+            for (unsigned j = 0; j < 6; j++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const unsigned t = t0+wn*48+j*8+lane%4*2+h, v = v2*2+h;
+                    if (t >= T) continue;
+                    float r = acc[0][i][j][v]*0x1p-12f;
+                    r = acc[1][i][j][v]*0x1p-12f+r;
+                    r = acc[2][i][j][v]+r;
+                    orow[(uint64_t)t*ld] = r*xs[t]*wsm;
+                }
+        }
+#endif
+}
+
+/* cuTensorMapEncodeTiled from the driver, without linking it */
+static PFN_cuTensorMapEncodeTiled_v12000 tmap_encode() {
+    static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        void *p = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",&p,12000,cudaEnableDefault,&q) == cudaSuccess &&
+            q == cudaDriverEntryPointSuccess) fn = (PFN_cuTensorMapEncodeTiled_v12000)p;
+        (void)cudaGetLastError();
+    }
+    return fn;
+}
+
+/* rows x K halves, boxes of 32 k by box rows, 64-byte swizzle */
+static bool tmap_rows(CUtensorMap *m, const __half *base, unsigned rows, unsigned K, unsigned box) {
+    PFN_cuTensorMapEncodeTiled_v12000 enc = tmap_encode();
+    if (!enc || ((uintptr_t)base&15) || K%8) return false;
+    const cuuint64_t dims[2] = {K,rows}, strides[1] = {(cuuint64_t)K*2};
+    const cuuint32_t boxd[2] = {32,box}, es[2] = {1,1};
+    return enc(m,CU_TENSOR_MAP_DATA_TYPE_FLOAT16,2,(void *)base,dims,strides,boxd,es,CU_TENSOR_MAP_INTERLEAVE_NONE,
+               CU_TENSOR_MAP_SWIZZLE_64B,CU_TENSOR_MAP_L2_PROMOTION_L2_128B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
+/* Whether cuBLAS computes an n x T x K hss GEMM without splitting k, so
+ * that dense_split_tma reproduces it: every shape of n * T >= 2.3M tried on
+ * this GPU with K = 640, 2560 or 6144 does (the K = 6144, n = 3264, T = 700
+ * GEMM is the largest that splits), and this asks for 3M. */
+static bool split_exact(unsigned n, unsigned T, unsigned K) {
+    return K >= 640 && K <= 6144 && (uint64_t)n*T >= (UINT64_C(3) << 20);
+}
+
+/* Q8 projections of one input: its components are packed once.  A
+ * weight's tiles (its tiling depends only on its own row count) that cuBLAS
+ * runs without split k are packed together with the other weights' and take
+ * dense_split_tma; the rest take the three GEMMs and the rescale.  Only the
+ * last tile is smaller, so the fused rows of a weight are a prefix. */
 static int dense_q8_blas_n(float *const *out, const float *x, const char *const *w, const unsigned *M,
         unsigned N, unsigned T, unsigned K) {
     const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(32)<<20)/((uint64_t)K*4));
     auto tile_of = [&](unsigned m) { return std::min(m,bound >= 64 ? bound/64*64 : bound); };
-    unsigned maxtile = 0;
-    for (unsigned i = 0; i < N; i++) maxtile = std::max(maxtile,tile_of(M[i]));
-    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)maxtile*K;
-    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+T+maxtile)*4,"Qwen Q8 projection scratch");
+    static int opted = -1;
+    if (opted < 0) {
+        opted = bulk_supported() && ds4_cuda_attn_tokentile_arch_ok() && tmap_encode() &&
+                cudaFuncSetAttribute(dense_split_tma, cudaFuncAttributeMaxDynamicSharedMemorySize, SP_SMEM) == cudaSuccess &&
+                cudaFuncSetAttribute(dense_split_tma, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    const bool can = opted && N <= 4 && !(K%32) && env_on("DS4_QWEN4_SPLIT_TMA");
+    unsigned fused[4] = {}, frows = 0, maxtile = 0;
+    for (unsigned i = 0; i < N; i++) {
+        const unsigned tile = tile_of(M[i]), full = M[i]/tile*tile;
+        if (can && split_exact(tile,T,K)) fused[i] = full == M[i] || split_exact(M[i]-full,T,K) ? M[i] : full;
+        frows += fused[i];
+        if (fused[i] < M[i]) maxtile = std::max(maxtile,tile);
+    }
+    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)std::max(frows,maxtile)*K;
+    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+T+std::max(frows,maxtile))*4,"Qwen Q8 projection scratch");
     if (!xh) return 0;
     __half *xl = xh+xn, *wh = xl+xn, *wl = wh+wn;
     float *xs = (float *)(wl+wn), *ws = xs+T;
     pack_rows(xs,xh,xl,x,T,K);
     if (!launched()) return 0;
-    const float zero = 0, one = 1, low = 0x1p-12f;
     const uint64_t rb = row_bytes(8,K);
+    if (frows) {
+        sp_outs o = {};
+        unsigned p = 0;
+        for (unsigned i = 0; i < N; i++) {
+            if (!fused[i]) continue;
+            launch(pack_half_components<8>, fused[i], 256, 0, ws+o.start[p],wh+(uint64_t)o.start[p]*K,
+                   wl+(uint64_t)o.start[p]*K,w[i],K,rb);
+            o.out[p] = out[i]; o.ld[p] = M[i];
+            o.start[p+1] = o.start[p]+fused[i];
+            p++;
+        }
+        for (unsigned q = p+1; q < 5; q++) o.start[q] = UINT_MAX;
+        CUtensorMap mw[2], mx[2];
+        if (!launched() || !tmap_rows(&mw[0],wh,frows,K,SP_BM) || !tmap_rows(&mw[1],wl,frows,K,SP_BM) ||
+            !tmap_rows(&mx[0],xh,T,K,SP_BN) || !tmap_rows(&mx[1],xl,T,K,SP_BN)) return 0;
+        const unsigned mb = (frows+SP_BM-1)/SP_BM, nb = (T+SP_BN-1)/SP_BN;
+        const unsigned G = (unsigned)std::max(UINT64_C(1),std::min((uint64_t)mb,(UINT64_C(48)<<20)/((uint64_t)SP_BM*K*4)));
+        launch(dense_split_tma, mb*nb, 256, SP_SMEM, o,mw[0],mw[1],mx[0],mx[1],ws,xs,frows,T,K,G);
+        if (!launched()) return 0;
+    }
+    const float zero = 0, one = 1, low = 0x1p-12f;
     for (unsigned i = 0; i < N; i++) {
         const unsigned tile = tile_of(M[i]);
-        for (unsigned r = 0; r < M[i]; r += tile) {
+        for (unsigned r = fused[i]; r < M[i]; r += tile) {
             const unsigned n = std::min(tile,M[i]-r);
             launch(pack_half_components<8>, n, 256, 0, ws,wh,wl,w[i]+(uint64_t)r*rb,K,rb);
             if (!launched()) return 0;
