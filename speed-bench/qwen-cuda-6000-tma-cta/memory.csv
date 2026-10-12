@@ -1,0 +1,9 @@
+build,commit,streams,ctx,mode,stack_watch,status,peak_device_mib,device_total_mib,headroom_mib,stack_limits_seen_bytes,prefill_tps,decode_tps_total,decode_tps_per_stream,step_p95_ms
+main,9b2e06d,6,65536,plain,no,ok,93510,97887,4377,,6567.28,407.06,67.84,14.821
+new,25f3e93,6,65536,plain,no,ok,89622,97887,8265,,6498.13,405.98,67.66,14.858
+new,25f3e93,6,100000,plain,yes,ok,96172,97887,1715,1024,6621.87,400.09,66.68,15.226
+new,25f3e93,6,100000,spec,yes,ok,97322,97887,565,1024,6421.38,399.95,66.66,23.013
+new,25f3e93,6,100000,plain,no,ok,96172,97887,1715,,6362.32,399.70,66.62,15.095
+new,25f3e93,1,8192,plain,yes,ok,,97887,,1024,,,,
+main,9b2e06d,1,8192,plain,yes,ok,,97887,,1024;14624,,,,
+main,9b2e06d,6,100000,plain,no,out of memory,,97887,,,,,,
