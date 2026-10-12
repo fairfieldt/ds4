@@ -74,6 +74,18 @@ __device__ __forceinline__ unsigned smem_addr(const void *p) {
     return (unsigned)__cvta_generic_to_shared(p);
 }
 
+/* Destination state space of the bulk copies.  On sm_120 the .shared::cluster
+ * form compiles to a driver syscall, and the first launch of a kernel with one
+ * raises the stack limit from 1 KiB to 14 KiB for every thread slot of the
+ * device (3.9 GiB on 188 SMs) for the rest of the process.  The .shared::cta
+ * form (PTX 8.6, CUDA 12.8) is a native copy.  These kernels run without
+ * clusters, so the two address the same shared memory. */
+#if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8)
+#define BULK_DST "shared::cta"
+#else
+#define BULK_DST "shared::cluster"
+#endif
+
 __device__ __forceinline__ void bulk_start(uint64_t *bar, unsigned bytes) {
 #if __CUDA_ARCH__ >= 900
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(smem_addr(bar)) : "memory");
@@ -85,7 +97,7 @@ __device__ __forceinline__ void bulk_start(uint64_t *bar, unsigned bytes) {
 
 __device__ __forceinline__ void bulk_copy(void *dst, const void *src, unsigned bytes, uint64_t *bar) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+    asm volatile("cp.async.bulk." BULK_DST ".global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  :: "r"(smem_addr(dst)), "l"(src), "r"(bytes), "r"(smem_addr(bar)) : "memory");
 #else
     __trap();
@@ -4669,7 +4681,7 @@ constexpr unsigned SP_STAGE = SP_ROWS*64, SP_SMEM = SP_STAGES*SP_STAGE+1024+64;
 
 __device__ __forceinline__ void tma_2d(void *dst, const CUtensorMap *map, int x, int y, uint64_t *bar) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    asm volatile("cp.async.bulk.tensor.2d." BULK_DST ".global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  :: "r"(smem_addr(dst)), "l"(map), "r"(x), "r"(y), "r"(smem_addr(bar)) : "memory");
 #endif
 }
