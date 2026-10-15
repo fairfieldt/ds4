@@ -1,0 +1,225 @@
+config,engine,weights,mode,options,test,prompt,target_tokens,rep,prompt_tokens,completion_tokens,ttft_s,prefill_tps,decode_tps,finish,text_sha1
+A0,ds4,DS4 Q4,plain,,mix,code,,0,73,256,0.147,496.5,179.86,length,cabbc1b1b9f0
+A0,ds4,DS4 Q4,plain,,mix,explain,,0,66,256,0.0863,764.6,179.88,length,e31e19e472c9
+A0,ds4,DS4 Q4,plain,,mix,json,,0,71,256,0.0848,836.8,179.8,length,6f597b3a5172
+A0,ds4,DS4 Q4,plain,,mix,math,,0,88,256,0.0907,970.4,180.04,length,9bca7f6639c9
+A0,ds4,DS4 Q4,plain,,mix,oped,,0,53,256,0.0814,651.0,179.59,length,45e1cce25b62
+A0,ds4,DS4 Q4,plain,,mix,prose,,0,47,256,0.0752,624.9,179.56,length,7571da76dd29
+A0,ds4,DS4 Q4,plain,,mix,rust,,0,60,256,0.0788,761.9,179.73,length,2f8515d7d7bb
+A0,ds4,DS4 Q4,plain,,mix,sql,,0,68,256,0.0823,826.3,179.82,length,13e7eb02ab52
+A0,ds4,DS4 Q4,plain,,mix,table,,0,57,256,0.0796,715.9,179.76,length,b212b0b75e3d
+A0,ds4,DS4 Q4,plain,,mix,translate,,0,469,256,0.1846,2540.3,179.88,length,e373f2880940
+A0,ds4,DS4 Q4,plain,,mix,code,,1,73,256,0.0848,861.0,179.7,length,cabbc1b1b9f0
+A0,ds4,DS4 Q4,plain,,mix,explain,,1,66,256,0.0834,791.6,179.72,length,e31e19e472c9
+A0,ds4,DS4 Q4,plain,,mix,json,,1,71,256,0.0851,834.7,179.65,length,6f597b3a5172
+A0,ds4,DS4 Q4,plain,,mix,math,,1,88,256,0.0879,1000.8,179.85,length,9bca7f6639c9
+A0,ds4,DS4 Q4,plain,,mix,oped,,1,53,256,0.0792,669.6,179.46,length,45e1cce25b62
+A0,ds4,DS4 Q4,plain,,mix,prose,,1,47,256,0.0739,636.0,179.43,length,7571da76dd29
+A0,ds4,DS4 Q4,plain,,mix,rust,,1,60,256,0.0784,765.3,179.53,length,2f8515d7d7bb
+A0,ds4,DS4 Q4,plain,,mix,sql,,1,68,256,0.0823,826.7,179.67,length,13e7eb02ab52
+A0,ds4,DS4 Q4,plain,,mix,table,,1,57,256,0.0796,715.8,179.61,length,b212b0b75e3d
+A0,ds4,DS4 Q4,plain,,mix,translate,,1,469,256,0.1733,2705.9,179.94,length,e373f2880940
+A0,ds4,DS4 Q4,plain,,depth,,1000,0,1071,256,0.3079,3478.3,178.53,length,1b4d30695b74
+A0,ds4,DS4 Q4,plain,,depth,,8000,0,8074,256,1.1541,6995.6,172.19,length,cf8f95d81747
+A0,ds4,DS4 Q4,plain,,depth,,32000,0,32940,256,4.7856,6883.1,169.74,length,e94d0ec169c3
+A0,ds4,DS4 Q4,plain,,depth,,128000,0,130845,256,18.9133,6918.2,167.84,length,b6fcbc9e21ca
+A0,ds4,DS4 Q4,plain,,depth,,1000,1,1143,256,0.3128,3653.9,178.3,length,5cb652c058e8
+A0,ds4,DS4 Q4,plain,,depth,,8000,1,8459,256,1.3076,6469.1,172.21,length,a981ab693186
+A0,ds4,DS4 Q4,plain,,depth,,32000,1,33013,256,4.8534,6802.1,169.54,length,612f27cd935b
+A0,ds4,DS4 Q4,plain,,depth,,128000,1,131080,256,19.1579,6842.1,167.72,length,e749f63dbea6
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,code,,0,73,256,0.1066,684.5,106.43,length,364f6937dfbd
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,explain,,0,66,256,0.1021,646.7,105.99,length,7afa15a705e3
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,json,,0,71,256,0.1046,679.0,106.04,length,baf51c5736f2
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,math,,0,88,256,0.1099,800.7,106.06,length,976fd13e6565
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,oped,,0,53,256,0.0988,536.5,105.89,length,a32087a74361
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,prose,,0,47,256,0.0932,504.4,106.02,length,1886c696cc80
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,rust,,0,60,256,0.0978,613.5,105.89,length,c84da11de101
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,sql,,0,68,256,0.0982,692.6,105.99,length,ee7736c72dae
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,table,,0,57,256,0.0975,584.5,106.01,length,4f6d9054717d
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,translate,,0,469,256,0.1907,2458.7,105.8,length,01cd8fbd2325
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,code,,1,73,256,0.1051,694.9,106.17,length,364f6937dfbd
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,explain,,1,66,256,0.0692,954.3,106.28,length,7afa15a705e3
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,json,,1,71,256,0.0731,971.8,106.26,length,baf51c5736f2
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,math,,1,88,256,0.0511,1723.2,106.38,length,976fd13e6565
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,oped,,1,53,256,0.0965,549.4,106.04,length,a32087a74361
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,prose,,1,47,256,0.063,745.7,106.2,length,1886c696cc80
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,rust,,1,60,256,0.0673,891.9,106.16,length,c84da11de101
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,sql,,1,68,256,0.0684,994.9,106.21,length,ee7736c72dae
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,table,,1,57,256,0.0681,837.5,106.27,length,4f6d9054717d
+B0,llama.cpp,DS4 Q4,plain,ub=4096,mix,translate,,1,469,256,0.0537,8726.4,106.1,length,01cd8fbd2325
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,1000,0,1072,256,0.2936,3651.0,104.9,length,88c42505dd29
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,8000,0,8071,256,1.7692,4562.0,103.04,length,30e33d065eee
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,32000,0,32939,256,6.4362,5117.7,100.76,length,e236e0d110d3
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,128000,0,130847,256,26.3455,4966.6,92.52,length,9fd0d687a3c9
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,1000,1,1145,256,1.2963,883.3,105.32,length,0b2af1546492
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,8000,1,8457,256,1.6477,5132.7,103.39,length,786d5f46c4a5
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,32000,1,33013,256,6.42,5142.2,100.88,length,57ff8c4463a9
+B0,llama.cpp,DS4 Q4,plain,ub=4096,depth,,128000,1,131080,256,26.4479,4956.2,92.31,length,0c5f1e18a19b
+A1,ds4,DS4 Q4,mtp,,mix,code,,0,73,256,0.1484,491.8,271.23,length,cabbc1b1b9f0
+A1,ds4,DS4 Q4,mtp,,mix,explain,,0,66,256,0.0876,753.2,230.73,length,e31e19e472c9
+A1,ds4,DS4 Q4,mtp,,mix,json,,0,71,256,0.0858,827.1,258.86,length,6f597b3a5172
+A1,ds4,DS4 Q4,mtp,,mix,math,,0,88,256,0.0914,962.7,251.79,length,9bca7f6639c9
+A1,ds4,DS4 Q4,mtp,,mix,oped,,0,53,256,0.0829,639.6,212.86,length,45e1cce25b62
+A1,ds4,DS4 Q4,mtp,,mix,prose,,0,47,256,0.0757,621.2,223.46,length,7571da76dd29
+A1,ds4,DS4 Q4,mtp,,mix,rust,,0,60,256,0.0798,751.8,252.1,length,2f8515d7d7bb
+A1,ds4,DS4 Q4,mtp,,mix,sql,,0,68,256,0.0831,818.8,250.42,length,13e7eb02ab52
+A1,ds4,DS4 Q4,mtp,,mix,table,,0,57,256,0.0806,707.6,254.71,length,b212b0b75e3d
+A1,ds4,DS4 Q4,mtp,,mix,translate,,0,469,256,0.1865,2514.6,227.56,length,e373f2880940
+A1,ds4,DS4 Q4,mtp,,mix,code,,1,73,256,0.0857,852.2,250.93,length,cabbc1b1b9f0
+A1,ds4,DS4 Q4,mtp,,mix,explain,,1,66,256,0.0845,781.3,232.03,length,e31e19e472c9
+A1,ds4,DS4 Q4,mtp,,mix,json,,1,71,256,0.0861,824.9,258.79,length,6f597b3a5172
+A1,ds4,DS4 Q4,mtp,,mix,math,,1,88,256,0.0892,986.2,251.44,length,9bca7f6639c9
+A1,ds4,DS4 Q4,mtp,,mix,oped,,1,53,256,0.0801,661.6,215.28,length,45e1cce25b62
+A1,ds4,DS4 Q4,mtp,,mix,prose,,1,47,256,0.0748,627.9,223.67,length,7571da76dd29
+A1,ds4,DS4 Q4,mtp,,mix,rust,,1,60,256,0.0794,756.1,252.81,length,2f8515d7d7bb
+A1,ds4,DS4 Q4,mtp,,mix,sql,,1,68,256,0.0833,816.7,250.93,length,13e7eb02ab52
+A1,ds4,DS4 Q4,mtp,,mix,table,,1,57,256,0.0807,706.0,254.84,length,b212b0b75e3d
+A1,ds4,DS4 Q4,mtp,,mix,translate,,1,469,256,0.1766,2655.3,228.27,length,e373f2880940
+A1,ds4,DS4 Q4,mtp,,depth,,1000,0,1070,256,0.313,3418.6,195.23,length,8f43f6ccfc7a
+A1,ds4,DS4 Q4,mtp,,depth,,8000,0,8074,256,1.1849,6813.8,188.52,length,8b46f30eb738
+A1,ds4,DS4 Q4,mtp,,depth,,32000,0,32939,256,4.899,6723.6,198.32,length,388a55b64039
+A1,ds4,DS4 Q4,mtp,,depth,,128000,0,130846,256,19.3109,6775.8,197.12,length,78590aac86a5
+A1,ds4,DS4 Q4,mtp,,depth,,1000,1,1145,256,0.3206,3572.0,208.0,length,85eb131942dd
+A1,ds4,DS4 Q4,mtp,,depth,,8000,1,8459,256,1.3329,6346.4,198.2,length,1be99b92c70e
+A1,ds4,DS4 Q4,mtp,,depth,,32000,1,33011,256,4.9524,6665.7,192.51,length,62b8d85eff13
+A1,ds4,DS4 Q4,mtp,,depth,,128000,1,131080,256,19.5233,6714.0,194.5,length,37144c20920e
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,code,,0,73,256,0.1212,602.5,222.35,length,364f6937dfbd
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,explain,,0,66,256,0.1159,569.3,187.97,length,606cd3c5637a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,json,,0,71,256,0.1179,602.2,246.47,length,6f597b3a5172
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,math,,0,88,256,0.1244,707.3,203.88,length,6117e746631a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,oped,,0,53,256,0.1121,472.6,116.94,length,a62595daa11e
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,prose,,0,47,256,0.1066,440.9,120.93,length,d5cd4aa867b2
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,rust,,0,60,256,0.1099,546.0,208.12,length,3f4a5a312eb4
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,sql,,0,68,256,0.1124,605.1,222.33,length,82bdd8070d2a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,table,,0,57,256,0.111,513.6,206.88,length,4f6d9054717d
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,translate,,0,469,256,0.2161,2170.2,134.22,length,71339f9d3469
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,code,,1,73,256,0.1178,619.8,223.8,length,364f6937dfbd
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,explain,,1,66,256,0.0829,796.2,189.15,length,606cd3c5637a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,json,,1,71,256,0.0871,815.5,246.86,length,6f597b3a5172
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,math,,1,88,256,0.0546,1612.5,204.62,length,6117e746631a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,oped,,1,53,256,0.11,482.0,118.22,length,a62595daa11e
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,prose,,1,47,256,0.0763,615.9,122.48,length,d5cd4aa867b2
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,rust,,1,60,256,0.0803,747.5,209.98,length,3f4a5a312eb4
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,sql,,1,68,256,0.0815,834.7,224.4,length,82bdd8070d2a
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,table,,1,57,256,0.0813,701.5,208.09,length,4f6d9054717d
+B1,llama.cpp,DS4 Q4,mtp,n=5,mix,translate,,1,469,256,0.057,8233.9,135.4,length,71339f9d3469
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,1000,0,1071,256,0.3316,3229.6,86.94,length,989d50c42965
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,8000,0,8073,256,1.9689,4100.2,94.25,length,f0867e5d08c4
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,32000,0,32940,256,8.0394,4097.3,90.39,length,c5cbc3dc68bc
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,128000,0,130847,256,34.2241,3823.2,60.96,length,1c6447ef16c4
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,1000,1,1145,256,0.936,1223.3,100.05,length,0f4f34e088a7
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,8000,1,8456,256,1.9079,4432.2,85.72,length,7513492a029e
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,32000,1,33011,256,7.7107,4281.2,89.43,length,440e84efdcea
+B1,llama.cpp,DS4 Q4,mtp,n=5,depth,,128000,1,131079,256,33.6944,3890.2,55.46,length,68fb94d07788
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,code,,0,73,256,0.1304,559.8,113.24,length,eca46ed7e59d
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,explain,,0,66,256,0.1029,641.6,112.6,length,a36e611b16b3
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,json,,0,71,256,0.1082,656.3,112.99,length,1ee0709c8eb2
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,math,,0,88,256,0.1152,763.7,112.98,length,378b99175733
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,oped,,0,53,256,0.0994,533.3,112.74,length,6f95c43709ca
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,prose,,0,47,256,0.0937,501.7,112.76,length,265900bd2c63
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,rust,,0,60,256,0.0987,607.7,112.84,length,a9b8b692f6d0
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,sql,,0,68,256,0.1007,675.1,112.86,length,cbffd0f02146
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,table,,0,57,256,0.0996,572.2,112.82,length,4f6d9054717d
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,translate,,0,469,256,0.1971,2379.0,112.27,length,7a88f09e80a6
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,code,,1,73,256,0.1079,676.8,113.02,length,eca46ed7e59d
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,explain,,1,66,256,0.0723,912.6,112.76,length,a36e611b16b3
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,json,,1,71,256,0.079,898.2,113.03,length,1ee0709c8eb2
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,math,,1,88,256,0.0499,1763.4,112.83,length,378b99175733
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,oped,,1,53,256,0.0983,539.4,112.85,length,6f95c43709ca
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,prose,,1,47,256,0.0643,731.4,112.84,length,265900bd2c63
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,rust,,1,60,256,0.07,857.5,112.82,length,a9b8b692f6d0
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,sql,,1,68,256,0.0715,951.3,112.71,length,cbffd0f02146
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,table,,1,57,256,0.0708,804.9,112.93,length,4f6d9054717d
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,mix,translate,,1,469,256,0.0523,8964.4,113.08,length,7a88f09e80a6
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,1000,0,1072,256,0.293,3659.1,111.91,length,67adabb18ee2
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,8000,0,8073,256,1.6778,4811.8,109.74,length,22edcb37de5e
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,32000,0,32939,256,6.3764,5165.8,106.77,length,e4b127a7d581
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,128000,0,130845,256,26.1474,5004.1,97.26,length,4b6f0c810524
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,1000,1,1145,256,0.8104,1412.9,111.97,length,9975dc4b11ad
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,8000,1,8459,256,1.6726,5057.4,109.74,length,331293179d67
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,32000,1,33012,256,6.4184,5143.3,107.09,length,d99e669a006a
+C0,llama.cpp,UD-Q4_K_XL,plain,ub=4096,depth,,128000,1,131081,256,26.3083,4982.5,97.22,length,1f99e347fcd0
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,code,,0,73,256,0.1427,511.6,238.52,length,cabbc1b1b9f0
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,explain,,0,66,256,0.1167,565.5,163.57,length,e7f11372fc67
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,json,,0,71,256,0.1224,580.2,258.3,length,ebe239177386
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,math,,0,88,256,0.1297,678.7,219.12,length,307500f18061
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,oped,,0,53,256,0.1138,465.6,119.62,length,e6f2549db0d5
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,prose,,0,47,256,0.1067,440.4,119.54,length,7c70eac0f333
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,rust,,0,60,256,0.1121,535.2,220.85,length,7e71349b57c5
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,sql,,0,68,256,0.1144,594.2,230.55,length,82bdd8070d2a
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,table,,0,57,256,0.1135,502.3,216.12,length,4f6d9054717d
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,translate,,0,469,256,0.2228,2104.9,141.82,length,f61072c45ad7
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,code,,1,73,256,0.1234,591.8,238.21,length,cabbc1b1b9f0
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,explain,,1,66,256,0.0857,770.2,164.16,length,e7f11372fc67
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,json,,1,71,256,0.0919,772.5,256.62,length,ebe239177386
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,math,,1,88,256,0.0531,1657.3,215.31,length,307500f18061
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,oped,,1,53,256,0.1133,467.7,120.27,length,e6f2549db0d5
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,prose,,1,47,256,0.0775,606.3,120.32,length,7c70eac0f333
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,rust,,1,60,256,0.0829,723.7,222.59,length,7e71349b57c5
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,sql,,1,68,256,0.0846,804.1,231.29,length,82bdd8070d2a
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,table,,1,57,256,0.0843,676.1,216.88,length,4f6d9054717d
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,mix,translate,,1,469,256,0.0552,8494.2,142.6,length,f61072c45ad7
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,1000,0,1070,256,0.3401,3146.3,97.19,length,e35c3bf59e1c
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,8000,0,8071,256,1.9487,4141.7,97.16,length,78596d1477fd
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,32000,0,32939,256,7.9661,4134.9,95.05,length,a558895bc8d9
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,128000,0,130846,256,34.0359,3844.3,68.09,length,521342a8b243
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,1000,1,1143,256,0.9165,1247.2,110.52,length,bb1f4cc24dab
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,8000,1,8457,256,1.9345,4371.7,99.75,length,f7ebd2fd0bc7
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,32000,1,33011,256,7.8148,4224.2,83.76,length,4432fb5527bc
+C1,llama.cpp,UD-Q4_K_XL,mtp,n=5,depth,,128000,1,131080,256,34.001,3855.2,68.29,length,ed61913c72ce
+D1,strata,UD-Q4_K_XL,mtp,,mix,code,,0,73,256,0.2786,262.0,280.07,length,07e2b2363e46
+D1,strata,UD-Q4_K_XL,mtp,,mix,explain,,0,66,256,0.1821,362.5,239.93,length,7a34a7870bed
+D1,strata,UD-Q4_K_XL,mtp,,mix,json,,0,71,256,0.1908,372.1,298.91,length,6f597b3a5172
+D1,strata,UD-Q4_K_XL,mtp,,mix,math,,0,88,256,0.2162,407.0,254.75,length,cd0c57b45ac3
+D1,strata,UD-Q4_K_XL,mtp,,mix,oped,,0,53,256,0.1489,356.0,183.59,length,61498b3d71d5
+D1,strata,UD-Q4_K_XL,mtp,,mix,prose,,0,47,256,0.1334,352.3,183.31,length,48bf51d81d31
+D1,strata,UD-Q4_K_XL,mtp,,mix,rust,,0,60,256,0.1634,367.1,243.46,length,491d90fd9ad0
+D1,strata,UD-Q4_K_XL,mtp,,mix,sql,,0,68,256,0.187,363.6,253.43,length,a342049ee3ca
+D1,strata,UD-Q4_K_XL,mtp,,mix,table,,0,57,256,0.1594,357.5,264.08,length,4f6d9054717d
+D1,strata,UD-Q4_K_XL,mtp,,mix,translate,,0,469,256,0.3721,1260.4,202.16,length,a5a32d8e7b8b
+D1,strata,UD-Q4_K_XL,mtp,,mix,code,,1,73,256,0.2071,352.5,286.48,length,07e2b2363e46
+D1,strata,UD-Q4_K_XL,mtp,,mix,explain,,1,66,256,0.1755,376.0,241.11,length,7a34a7870bed
+D1,strata,UD-Q4_K_XL,mtp,,mix,json,,1,71,256,0.1888,376.1,298.96,length,6f597b3a5172
+D1,strata,UD-Q4_K_XL,mtp,,mix,math,,1,88,256,0.2122,414.8,254.76,length,cd0c57b45ac3
+D1,strata,UD-Q4_K_XL,mtp,,mix,oped,,1,53,256,0.1472,360.1,183.64,length,61498b3d71d5
+D1,strata,UD-Q4_K_XL,mtp,,mix,prose,,1,47,256,0.1322,355.4,183.41,length,48bf51d81d31
+D1,strata,UD-Q4_K_XL,mtp,,mix,rust,,1,60,256,0.162,370.4,240.03,length,491d90fd9ad0
+D1,strata,UD-Q4_K_XL,mtp,,mix,sql,,1,68,256,0.1848,368.0,253.49,length,a342049ee3ca
+D1,strata,UD-Q4_K_XL,mtp,,mix,table,,1,57,256,0.158,360.7,264.18,length,4f6d9054717d
+D1,strata,UD-Q4_K_XL,mtp,,mix,translate,,1,469,256,0.3392,1382.7,202.23,length,a5a32d8e7b8b
+D1,strata,UD-Q4_K_XL,mtp,,depth,,1000,0,1072,256,0.5333,2010.1,154.21,length,23b33fd264b4
+D1,strata,UD-Q4_K_XL,mtp,,depth,,8000,0,8072,256,2.017,4002.1,156.1,length,956eec0106b5
+D1,strata,UD-Q4_K_XL,mtp,,depth,,32000,0,32940,256,6.2958,5232.0,154.53,length,26d7c1538493
+D1,strata,UD-Q4_K_XL,mtp,,depth,,128000,0,130845,256,24.2608,5393.3,152.51,length,16111d9a2bbe
+D1,strata,UD-Q4_K_XL,mtp,,depth,,1000,1,1146,256,0.5406,2119.7,168.21,length,164b95047a68
+D1,strata,UD-Q4_K_XL,mtp,,depth,,8000,1,8459,256,2.0328,4161.3,157.76,length,927781a698c1
+D1,strata,UD-Q4_K_XL,mtp,,depth,,32000,1,33012,256,6.2843,5253.1,156.3,length,4884e202e724
+D1,strata,UD-Q4_K_XL,mtp,,depth,,128000,1,131080,256,24.3168,5390.5,146.83,length,3b97f8abebce
+D0,strata,UD-Q4_K_XL,plain,,mix,code,,0,73,256,0.2859,255.3,134.22,length,07e2b2363e46
+D0,strata,UD-Q4_K_XL,plain,,mix,explain,,0,66,256,0.3054,216.1,134.24,length,7a34a7870bed
+D0,strata,UD-Q4_K_XL,plain,,mix,json,,0,71,256,0.3275,216.8,134.28,length,6f597b3a5172
+D0,strata,UD-Q4_K_XL,plain,,mix,math,,0,88,256,0.225,391.0,134.24,length,cd0c57b45ac3
+D0,strata,UD-Q4_K_XL,plain,,mix,oped,,0,53,256,0.2462,215.3,134.17,length,61498b3d71d5
+D0,strata,UD-Q4_K_XL,plain,,mix,prose,,0,47,256,0.2197,213.9,134.2,length,48bf51d81d31
+D0,strata,UD-Q4_K_XL,plain,,mix,rust,,0,60,256,0.2797,214.5,134.24,length,491d90fd9ad0
+D0,strata,UD-Q4_K_XL,plain,,mix,sql,,0,68,256,0.3155,215.5,134.28,length,a342049ee3ca
+D0,strata,UD-Q4_K_XL,plain,,mix,table,,0,57,256,0.2639,216.0,134.19,length,4f6d9054717d
+D0,strata,UD-Q4_K_XL,plain,,mix,translate,,0,469,256,0.3787,1238.4,133.96,length,a5a32d8e7b8b
+D0,strata,UD-Q4_K_XL,plain,,mix,code,,1,73,256,0.2164,337.3,134.43,length,07e2b2363e46
+D0,strata,UD-Q4_K_XL,plain,,mix,explain,,1,66,256,0.3053,216.2,134.42,length,7a34a7870bed
+D0,strata,UD-Q4_K_XL,plain,,mix,json,,1,71,256,0.3251,218.4,134.43,length,6f597b3a5172
+D0,strata,UD-Q4_K_XL,plain,,mix,math,,1,88,256,0.2214,397.5,134.41,length,cd0c57b45ac3
+D0,strata,UD-Q4_K_XL,plain,,mix,oped,,1,53,256,0.2461,215.4,134.45,length,61498b3d71d5
+D0,strata,UD-Q4_K_XL,plain,,mix,prose,,1,47,256,0.2196,214.1,134.49,length,48bf51d81d31
+D0,strata,UD-Q4_K_XL,plain,,mix,rust,,1,60,256,0.2796,214.6,134.39,length,491d90fd9ad0
+D0,strata,UD-Q4_K_XL,plain,,mix,sql,,1,68,256,0.3153,215.7,134.42,length,a342049ee3ca
+D0,strata,UD-Q4_K_XL,plain,,mix,table,,1,57,256,0.2639,216.0,134.41,length,4f6d9054717d
+D0,strata,UD-Q4_K_XL,plain,,mix,translate,,1,469,256,0.347,1351.5,134.24,length,a5a32d8e7b8b
+D0,strata,UD-Q4_K_XL,plain,,depth,,1000,0,1069,256,0.539,1983.4,133.58,length,200b923242dc
+D0,strata,UD-Q4_K_XL,plain,,depth,,8000,0,8072,256,2.0242,3987.7,129.9,length,ad4f8b27548f
+D0,strata,UD-Q4_K_XL,plain,,depth,,32000,0,32938,256,6.2517,5268.6,129.24,length,1196e2fa56d2
+D0,strata,UD-Q4_K_XL,plain,,depth,,128000,0,130845,256,24.173,5412.9,126.87,length,5564e01c65a6
+D0,strata,UD-Q4_K_XL,plain,,depth,,1000,1,1145,256,0.537,2132.0,133.65,length,0bfe87d89038
+D0,strata,UD-Q4_K_XL,plain,,depth,,8000,1,8456,256,2.0211,4183.8,129.83,length,f707b2c33d6b
+D0,strata,UD-Q4_K_XL,plain,,depth,,32000,1,33012,256,6.2383,5291.8,129.13,length,450c0bf34db7
+D0,strata,UD-Q4_K_XL,plain,,depth,,128000,1,131080,256,24.2294,5410.0,126.86,length,b486aa316ee5

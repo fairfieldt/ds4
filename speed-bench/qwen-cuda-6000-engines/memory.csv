@@ -1,0 +1,9 @@
+config,engine,weights,mode,ready_s,peak_device_mib
+A0,ds4,DS4 Q4,plain,12.0,83640
+B0,llama.cpp,DS4 Q4,plain,8.1,78502
+A1,ds4,DS4 Q4,mtp,12.0,83950
+B1,llama.cpp,DS4 Q4,mtp,8.5,84464
+C0,llama.cpp,UD-Q4_K_XL,plain,10.3,87810
+C1,llama.cpp,UD-Q4_K_XL,mtp,12.6,95628
+D1,strata,UD-Q4_K_XL,mtp,22.1,84888
+D0,strata,UD-Q4_K_XL,plain,20.1,83426

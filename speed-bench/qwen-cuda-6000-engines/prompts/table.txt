@@ -1,0 +1,1 @@
+Write a markdown table of the 25 most populous countries with columns: rank, country, capital, population (millions, approximate), continent, and official language(s). Then add two sentences on the trends it shows.
