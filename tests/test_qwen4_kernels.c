@@ -6365,13 +6365,7 @@ int main(void) {
     }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
-    if (getenv("DS4_TEST_QWEN4_GROUPED")) {
-        test_moe_grouped(&arena, 39u);
-#ifndef __APPLE__
-        test_moe_grouped(&arena, 2u);
-#endif
-        return 0;
-    }
+    if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena, 39u); test_moe_grouped(&arena, 2u); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
@@ -6444,9 +6438,7 @@ int main(void) {
 #endif
     test_mv_ext_groups(&arena);
     test_moe_grouped(&arena, 39u);
-#ifndef __APPLE__
     test_moe_grouped(&arena, 2u);
-#endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
@@ -6516,13 +6508,11 @@ int main(void) {
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 39u);
-#ifndef __APPLE__
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 2u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 2u);
     test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 2u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 12u, 2u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 12u, 2u);
-#endif
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
@@ -6539,9 +6529,7 @@ int main(void) {
     test_q4k_ordered_exact(&arena, 2, 641, true);
     test_moe_mm_tiles_exact(&arena, 8u);
     test_moe_mm_tiles_exact(&arena, 39u);
-#ifndef __APPLE__
     test_moe_mm_tiles_exact(&arena, 2u);
-#endif
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
