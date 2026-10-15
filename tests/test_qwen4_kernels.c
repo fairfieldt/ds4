@@ -1767,19 +1767,21 @@ static void test_gdn_pipe_exact(uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t s
     free(qkv); free(state); free(av); free(bv);
 }
 
-/* Prefill chunks (T >= 2048) of Q4_K gate/up and MXFP4 down experts take
- * matrix_half_ws: mid and down outputs equal matrix_half_tile's bit for bit
- * (DS4_QWEN4_EXPERT_WS=0), with random scales (FTZ-flushed and overflowing
- * ones included), an expert of fewer tokens than a tile and an empty one,
- * and nothing written outside the selected slots. */
-static void test_expert_ws_exact(arena_t *a, uint32_t T) {
+/* Prefill chunks (T >= 2048) of Q4_K gate/up and MXFP4 or Q4_0 (dtype)
+ * down experts take matrix_half_ws: mid and down outputs equal
+ * matrix_half_tile's bit for bit (DS4_QWEN4_EXPERT_WS=0), with random scales
+ * (FTZ-flushed, subnormal and overflowing ones included), an expert of fewer
+ * tokens than a tile and an empty one, and nothing written outside the
+ * selected slots. */
+static void test_expert_ws_exact(arena_t *a, uint32_t T, uint32_t dtype) {
     const uint32_t NE = 8, NS = 4, E = 2560, F = 640, cap = T, guard = 64;
-    const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * 17;
-    static uint64_t off[3];
-    static bool made;
+    const uint32_t bb = dtype == 2u ? 18u : 17u;
+    const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * bb;
+    static uint64_t off[3], doff[2];
+    static bool made, dmade[2];
     if (!made) {
         made = true;
-        off[0] = arena_alloc(a, gb); off[1] = arena_alloc(a, gb); off[2] = arena_alloc(a, db);
+        off[0] = arena_alloc(a, gb); off[1] = arena_alloc(a, gb);
         for (int m = 0; m < 2; m++) {
             uint8_t *w = a->base + off[m];
             for (uint64_t b = 0; b < gb / 144; b++, w += 144) {
@@ -1790,12 +1792,26 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
                 memcpy(w, &hd, 2); memcpy(w + 2, &hm, 2);
             }
         }
-        uint8_t *w = a->base + off[2];
-        for (uint64_t b = 0; b < db / 17; b++, w += 17) {
-            for (int i = 1; i < 17; i++) w[i] = (uint8_t)(frand() * 128 + 128);
-            w[0] = b % 53 == 0 ? 0 : b % 47 == 0 ? 1 : b % 43 == 0 ? 160 : (uint8_t)(116 + (b * 7) % 8);
+    }
+    if (!dmade[dtype == 2u]) {
+        dmade[dtype == 2u] = true;
+        doff[dtype == 2u] = arena_alloc(a, db);
+        uint8_t *w = a->base + doff[dtype == 2u];
+        for (uint64_t b = 0; b < db / bb; b++, w += bb) {
+            if (dtype == 2u) {
+                for (int i = 2; i < 18; i++) w[i] = (uint8_t)(frand() * 128 + 128);
+                /* d: ordinary halves of both signs, a few subnormal or large enough that 8d overflows */
+                const float d = b % 53 == 0 ? 6e-8f : b % 47 == 0 ? 3e-6f : b % 43 == 0 ? 9000.0f :
+                                (b % 2 ? -0.002f : 0.002f) * (1.0f + frand());
+                const uint16_t hd = f32_to_f16(d);
+                memcpy(w, &hd, 2);
+            } else {
+                for (int i = 1; i < 17; i++) w[i] = (uint8_t)(frand() * 128 + 128);
+                w[0] = b % 53 == 0 ? 0 : b % 47 == 0 ? 1 : b % 43 == 0 ? 160 : (uint8_t)(116 + (b * 7) % 8);
+            }
         }
     }
+    off[2] = doff[dtype == 2u];
     float *x = rand_vec((uint64_t)T * E, 1.0f);
     int32_t *sel = malloc((uint64_t)T * NS * 4);
     require_ok(sel != NULL, "expert ws selections");
@@ -1822,7 +1838,7 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
         require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(mid[ws], gx, gl, gc, a->base, a->size, off[0], off[1], 12u,
                                                    NE, T, NS, NS, E, F, cap), "expert ws mid");
         /* every down kernel reads the reference mid */
-        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(part[ws], mid[0], gl, gc, a->base, a->size, off[2], 39u,
+        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(part[ws], mid[0], gl, gc, a->base, a->size, off[2], dtype,
                                                     NE, T, NS, NS, F, E, cap), "expert ws down");
     }
     unsetenv("DS4_QWEN4_EXPERT_WS");
@@ -1831,7 +1847,8 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
     for (int which = 0; which < 4; which++) {
         const uint64_t n = (which % 2 ? np : nm) + guard;
         float *r = download(which % 2 ? part[0] : mid[0], n), *g = download(which % 2 ? part[1 + which / 2] : mid[1 + which / 2], n);
-        snprintf(name, sizeof(name), "expert %s exact T=%u %s", which / 2 ? "ws" : "wb", T, which % 2 ? "down" : "gate/up");
+        snprintf(name, sizeof(name), "expert %s exact T=%u %s", which / 2 ? "ws" : "wb", T,
+                 which % 2 ? (dtype == 2u ? "Q4_0 down" : "MXFP4 down") : "gate/up");
         require_ok(memcmp(r, g, n * 4) == 0, name);
         printf("  %-44s ok\n", name);
         free(r); free(g);
@@ -2014,8 +2031,10 @@ static void test_prefill_pipes_exact_all(arena_t *a) {
     test_f16_pipe_exact(a, 320, 1000, 200);
     test_f16_pipe_exact(a, 128, 77, 33);
     test_f16_pipe_exact(a, 512, 256, 129);
-    test_expert_ws_exact(a, 2048);
-    test_expert_ws_exact(a, 4099);
+    test_expert_ws_exact(a, 2048, 39u);
+    test_expert_ws_exact(a, 4099, 39u);
+    test_expert_ws_exact(a, 2048, 2u);
+    test_expert_ws_exact(a, 4099, 2u);
     test_conv_seg_exact(a, 9, 10240, 4, true);
     test_conv_seg_exact(a, 47, 10240, 4, true);
     test_conv_seg_exact(a, 8192, 10240, 4, true);
@@ -2958,6 +2977,7 @@ static void test_router_paths(arena_t *a) {
 
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
+    if (wtype == 2u) return arena_q4_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
            wtype == 10u ? arena_q2_K(a, rows, cols, shadow, 0.05f) :
            wtype == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8_0(a, rows, cols, shadow, 0.05f);
@@ -3080,7 +3100,7 @@ static void test_idx_prefilter(void) {
  * for quantized cases and F32 for the F32 case. */
 #ifndef __APPLE__
 /* ds4_qwen4_cuda.cuh, tests only: moe_down_tensor with the original MXFP4
- * down kernel. */
+ * or Q4_0 down kernel. */
 int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
@@ -3213,10 +3233,10 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         free(bp); free(ap);
     }
 #ifndef __APPLE__
-    if (wtype == 12u && dtype == 39u) {
+    if (wtype == 12u && (dtype == 39u || dtype == 2u)) {
         /* The shared-expert L2 prefetch must leave gate/up untouched (against
          * moe_mid_tensor, which does not prefetch), and the latency-ordered
-         * MXFP4 down kernel must match the original one
+         * MXFP4 or Q4_0 down kernel must match the original one
          * (ds4_gpu_qwen4_moe_down_ref_tensor) bit for bit, shared slot
          * included. */
         const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
@@ -3241,8 +3261,8 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
                    ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
                    ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "MoE new kernels");
         check_exact_f32("Q4K gate/up with shared L2 prefetch", am, bm, nm);
-        check_exact_f32("MXFP4 down, latency order", ap, bp, np);
-        printf("  moe T=%u: shared prefetch and latency-ordered MXFP4 down byte-exact\n", T);
+        check_exact_f32(dtype == 2u ? "Q4_0 down, latency order" : "MXFP4 down, latency order", ap, bp, np);
+        printf("  moe T=%u: shared prefetch and latency-ordered %s down byte-exact\n", T, dtype == 2u ? "Q4_0" : "MXFP4");
         free(bm); free(am); free(bp); free(ap);
     }
 #endif
@@ -3267,7 +3287,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : dtype == 2u ? "q4_0" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
@@ -3303,7 +3323,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         free(cnt);
         snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: mid", tier_name, E, F, slots, T);
         check_tensor(name, gmid2, mid_r, (uint64_t)T * slots * F, 3e-3);
-        snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: down", tier_name, E, F, slots, T);
+        snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: down", dname, E, F, slots, T);
         check_tensor(name, gpart2, part_r, (uint64_t)T * slots * E, 3e-3);
         free(part_r); free(mid_r);
         ds4_gpu_tensor_free(gpart2); ds4_gpu_tensor_free(gmid2); ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists);
@@ -3608,13 +3628,14 @@ static void test_mv_ext_groups(arena_t *a) {
 }
 
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
- * for bit under heavy expert reuse (sixteen rows over eight experts). */
-static void test_moe_grouped(arena_t *a) {
+ * for bit under heavy expert reuse (sixteen rows over eight experts), with
+ * MXFP4 (39) or Q4_0 (2) down rows. */
+static void test_moe_grouped(arena_t *a, uint32_t dtype) {
     const uint32_t NE = 8, slots = 6, E = 2560, F = 640, T = 16, cap = 64;
     double *gate_w, *up_w, *down_w;
     const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
     const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
-    const uint64_t down_off = arena_mxfp4(a, (uint64_t)NE * E, F, &down_w);
+    const uint64_t down_off = arena_tier(a, dtype, (uint64_t)NE * E, F, &down_w);
     free(gate_w); free(up_w); free(down_w);
     float *x = rand_vec((uint64_t)T * E, 1.0f);
     int32_t *sel = malloc((uint64_t)T * slots * 4);
@@ -3629,19 +3650,20 @@ static void test_moe_grouped(arena_t *a) {
     require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "grouped sel");
     require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid[0], gx, gsel, a->base, a->size, gate_off, up_off, 12u, NE, T, slots, E, F,
                                             0, 0, UINT32_MAX), "grouped: per-token mid");
-    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart[0], gmid[0], gsel, a->base, a->size, down_off, 39u, NE, T, slots, F, E,
+    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart[0], gmid[0], gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              0, UINT32_MAX), "grouped: per-token down");
     require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, cap), "grouped: lists");
     require_ok(ds4_gpu_qwen4_moe_mid_grouped_tensor(gmid[1], gx, gsel, glists, gcounts, cap, a->base, a->size, gate_off,
                                                     up_off, 12u, NE, T, slots, E, F), "grouped: mid");
     require_ok(ds4_gpu_qwen4_moe_down_grouped_tensor(gpart[1], gmid[0], gsel, glists, gcounts, cap, a->base, a->size,
-                                                     down_off, 39u, NE, T, slots, F, E), "grouped: down");
+                                                     down_off, dtype, NE, T, slots, F, E), "grouped: down");
     const uint64_t nm = (uint64_t)T * slots * F, np = (uint64_t)T * slots * E;
     float *am = download(gmid[0], nm), *bm = download(gmid[1], nm);
     float *ap = download(gpart[0], np), *bp = download(gpart[1], np);
     check_exact_f32("grouped Q4_K mid", bm, am, nm);
-    check_exact_f32("grouped MXFP4 down", bp, ap, np);
-    printf("  MoE grouped kernels: mid and down byte-exact against the per-token kernels under expert reuse\n");
+    check_exact_f32(dtype == 2u ? "grouped Q4_0 down" : "grouped MXFP4 down", bp, ap, np);
+    printf("  MoE grouped kernels: mid and %s down byte-exact against the per-token kernels under expert reuse\n",
+           dtype == 2u ? "Q4_0" : "MXFP4");
     free(bp); free(ap); free(bm); free(am);
     for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gpart[i]); ds4_gpu_tensor_free(gmid[i]); }
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
@@ -4160,7 +4182,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     require_ok(counts[0] == (int32_t)T && counts[1] == (int32_t)((T + 1u) / 2u) && counts[2] == (int32_t)(T / 2u) && counts[3] == 0,
                "MoE tile caps hot, partial, and empty experts");
     double *mid_exact = NULL, *part_exact = NULL;
-    if (down_type == 39u) {
+    if (down_type == 39u || down_type == 2u) {
         /* full-precision reference: double products of the dequantized weights
          * and the float activations, accumulated in double; part takes the
          * exact mid, so mid and down tile paths are judged end to end */
@@ -4259,7 +4281,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         unsetenv("DS4_QWEN4_MOE_MID_NT");
         unsetenv("DS4_QWEN4_MOE_TAILS");
     }
-    if (down_type == 39u) for (uint32_t nax = 1; nax <= 5; nax++) {
+    if (down_type == 39u || down_type == 2u) for (uint32_t nax = 1; nax <= 5; nax++) {
         /* tensor-op tiles of 32/64 tokens, half (1/2), float (3/4) or
          * compensated (5) activation operands: cooperative accumulation;
          * bound the drift against the simdgroup tiles and print the
@@ -4373,7 +4395,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         free(dmid); free(dgs); free(dus);
     }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
-           T, down_type == 39u ? "mxfp4" : "q8_0");
+           T, down_type == 39u ? "mxfp4" : down_type == 2u ? "q4_0" : "q8_0");
     for (uint32_t i = 0; i < 3; i++) {
         if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
         free(saved_env[i]);
@@ -5624,10 +5646,11 @@ static void bench_gdn_prefill(arena_t *ar) {
 }
 
 /* DS4_TEST_QWEN4_EXPERT_BENCH=1: one prefill chunk's routed experts (8192
- * rows, 10 of 512 Q4_K gate/up and MXFP4 down experts each), per kernel
- * (DS4_QWEN4_EXPERT_WS=0 for matrix_half_tile).  The arena is copied to
- * the device first, so the weights are read from VRAM as in the model. */
-typedef struct { arena_t *a; ds4_gpu_tensor *x, *lists, *counts, *mid, *part; uint64_t off[3]; uint32_t T; } expert_bench;
+ * rows, 10 of 512 Q4_K gate/up and MXFP4 down experts each; QWEN4_BENCH_DOWN=2
+ * for Q4_0 down), per kernel (DS4_QWEN4_EXPERT_WS=0 for matrix_half_tile).
+ * The arena is copied to the device first, so the weights are read from
+ * VRAM as in the model. */
+typedef struct { arena_t *a; ds4_gpu_tensor *x, *lists, *counts, *mid, *part; uint64_t off[3]; uint32_t T, dtype; } expert_bench;
 static int bench_expert_mid(void *ud) {
     expert_bench *c = ud;
     return ds4_gpu_qwen4_moe_mm_mid_tensor(c->mid, c->x, c->lists, c->counts, c->a->base, c->a->size, c->off[0], c->off[1],
@@ -5636,7 +5659,7 @@ static int bench_expert_mid(void *ud) {
 static int bench_expert_down(void *ud) {
     expert_bench *c = ud;
     return ds4_gpu_qwen4_moe_mm_down_tensor(c->part, c->mid, c->lists, c->counts, c->a->base, c->a->size, c->off[2],
-                                            39u, 512, c->T, 10, 10, 640, 2560, c->T);
+                                            c->dtype, 512, c->T, 10, 10, 640, 2560, c->T);
 }
 
 /* DS4_TEST_QWEN4_F16_BENCH=1: one prefill chunk's HC up projection (8192
@@ -5744,8 +5767,10 @@ static void bench_q8_prefill(arena_t *a) {
 
 static void bench_expert_prefill(arena_t *a) {
     const uint32_t T = getenv("QWEN4_BENCH_T") ? (uint32_t)atoi(getenv("QWEN4_BENCH_T")) : 8192, NE = 512, NS = 10, E = 2560, F = 640;
-    const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * 17;
-    expert_bench c = { a, NULL, NULL, NULL, NULL, NULL, { arena_alloc(a, gb), arena_alloc(a, gb), arena_alloc(a, db) }, T };
+    const uint32_t dtype = getenv("QWEN4_BENCH_DOWN") ? (uint32_t)atoi(getenv("QWEN4_BENCH_DOWN")) : 39u;
+    const uint32_t bb = dtype == 2u ? 18u : 17u;
+    const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * bb;
+    expert_bench c = { a, NULL, NULL, NULL, NULL, NULL, { arena_alloc(a, gb), arena_alloc(a, gb), arena_alloc(a, db) }, T, dtype };
     for (int m = 0; m < 2; m++) {
         uint8_t *w = a->base + c.off[m];
         for (uint64_t b = 0; b < gb / 144; b++, w += 144) {
@@ -5755,9 +5780,10 @@ static void bench_expert_prefill(arena_t *a) {
         }
     }
     uint8_t *w = a->base + c.off[2];
-    for (uint64_t b = 0; b < db / 17; b++, w += 17) {
-        for (int i = 1; i < 17; i++) w[i] = (uint8_t)(frand() * 128 + 128);
-        w[0] = (uint8_t)(116 + b % 8);
+    for (uint64_t b = 0; b < db / bb; b++, w += bb) {
+        for (uint32_t i = bb - 16; i < bb; i++) w[i] = (uint8_t)(frand() * 128 + 128);
+        if (dtype == 2u) { const uint16_t hd = f32_to_f16(0.002f * (1.5f + frand())); memcpy(w, &hd, 2); }
+        else w[0] = (uint8_t)(116 + b % 8);
     }
     setenv("DS4_CUDA_COPY_MODEL", "1", 1);
     require_ok(ds4_gpu_set_model_map(a->base, (a->used + 4095) & ~(uint64_t)4095), "expert bench device copy");
@@ -5966,11 +5992,13 @@ int main(void) {
         test_half_expert_tiles(&arena,33,12,39,64);
         test_half_expert_tiles(&arena,2049,16,10,192);
         test_half_expert_tiles(&arena,2049,12,39,192);
+        test_half_expert_tiles(&arena,33,12,2,64);
+        test_half_expert_tiles(&arena,2049,12,2,192);
         return 0;
     }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
-    if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena, 39u); test_moe_grouped(&arena, 2u); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
@@ -6039,7 +6067,8 @@ int main(void) {
     test_hc_mix3_split(&arena);
 #endif
     test_mv_ext_groups(&arena);
-    test_moe_grouped(&arena);
+    test_moe_grouped(&arena, 39u);
+    test_moe_grouped(&arena, 2u);
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
@@ -6109,6 +6138,11 @@ int main(void) {
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 37, 12u, 2u);
+    test_moe_types(&arena, 8, 6, 256, 256, 9, 12u, 2u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
@@ -6125,6 +6159,7 @@ int main(void) {
     test_q4k_ordered_exact(&arena, 2, 641, true);
     test_moe_mm_tiles_exact(&arena, 8u);
     test_moe_mm_tiles_exact(&arena, 39u);
+    test_moe_mm_tiles_exact(&arena, 2u);
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
@@ -6145,6 +6180,10 @@ int main(void) {
     test_half_expert_tiles(&arena,8193,12,39,64);
     test_half_expert_tiles(&arena,2049,16,10,192);
     test_half_expert_tiles(&arena,2049,12,39,192);
+    test_half_expert_tiles(&arena,33,12,2,64);
+    test_half_expert_tiles(&arena,2049,12,2,64);
+    test_half_expert_tiles(&arena,8193,12,2,64);
+    test_half_expert_tiles(&arena,2049,12,2,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
     /* 4..32-row tensor-core projections: F16 from K = 1024 with K split over
