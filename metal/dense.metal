@@ -1996,6 +1996,37 @@ void dequantize_dense_q4_K(device const ds4_dense_block_q4_K *xb, short il, thre
     reg = (type4x4)reg_f;
 }
 
+/* DS4 MXFP8 (type 100, NVIDIA's NVFP4 checkpoint): per 128 values four UE8M0
+ * scales, one per 32, then the 128 E4M3 codes.  Blocks are 132 bytes, so
+ * every block's codes stay 4-byte aligned. */
+struct ds4_dense_block_mxfp8 {
+    uchar e[4];
+    uchar qs[128];
+};
+
+/* Four E4M3 codes (a word, byte order) as halves: sign << 15 | magnitude << 7
+ * is the code's value times 2^-8 for every code, subnormals included, so the
+ * caller scales by 256. */
+static inline half4 ds4_metal_e4m3x4_s8(uint w) {
+    const uint lo = ((w & 0x7fu) << 7) | ((w & 0x80u) << 8) | ((w & 0x7f00u) << 15) | ((w & 0x8000u) << 16);
+    const uint hi = ((w & 0x7f0000u) >> 9) | ((w & 0x800000u) >> 8) | ((w & 0x7f000000u) >> 1) | (w & 0x80000000u);
+    return half4(as_type<half2>(lo), as_type<half2>(hi));
+}
+
+/* a UE8M0 scale times the 256 of the E4M3 halves above */
+static inline float ds4_metal_mxfp8_scale(uchar e) {
+    return as_type<float>(e == 0 ? 0x00400000u : (uint)e << 23) * 256.0f;
+}
+
+template <typename type4x4>
+void dequantize_dense_mxfp8(device const ds4_dense_block_mxfp8 *xb, short il, thread type4x4 &reg) {
+    const float d = ds4_metal_mxfp8_scale(xb->e[il / 2]);
+    device const uint *q = (device const uint *)(xb->qs + 16 * il);
+    float4x4 reg_f;
+    for (int i = 0; i < 4; i++) reg_f[i] = d * float4(ds4_metal_e4m3x4_s8(q[i]));
+    reg = (type4x4)reg_f;
+}
+
 /*
  * Bit-identical twin of dequantize_q8_0 for the MPP staging loop: same
  * half(float(qs[i]) * d) per element, but the 16 consecutive int8 lanes are
@@ -2033,6 +2064,21 @@ kernel void kernel_q8_prefill_unpack(
     dst[gid] = half4(values);
 }
 
+/* MXFP8 rows as the halves dequantize_dense_mxfp8 gives the tiled matmul,
+ * materialized once per projection: 32 threads per 128-value block, four
+ * values each. */
+kernel void kernel_mxfp8_prefill_unpack(
+        constant uint &n_blocks,
+        device const ds4_dense_block_mxfp8 *src,
+        device half4 *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint block = gid / 32u;
+    if (block >= n_blocks) return;
+    const uint i = gid % 32u;
+    const float d = ds4_metal_mxfp8_scale(src[block].e[i / 8]);
+    dst[gid] = half4(d * float4(ds4_metal_e4m3x4_s8(*(device const uint *)(src[block].qs + 4 * i))));
+}
+
 template <typename type4>
 void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & reg) {
     device const int8_t * qs = ((device const int8_t *)xb->qs);
@@ -2054,6 +2100,12 @@ void dequantize_dense_q4_0_t4(device const ds4_dense_block_q4_0 *xb, short il, t
         const uchar q = (k < 16) ? (packed & 0x0f) : (packed >> 4);
         reg[i] = d * ((float)q - 8.0f);
     }
+}
+
+template <typename type4>
+void dequantize_dense_mxfp8_t4(device const ds4_dense_block_mxfp8 *xb, short il, thread type4 &reg) {
+    const float d = ds4_metal_mxfp8_scale(xb->e[il / 8]);
+    reg = (type4)(d * float4(ds4_metal_e4m3x4_s8(*(device const uint *)(xb->qs + 4 * il))));
 }
 
 template <typename type4>
@@ -2359,6 +2411,12 @@ template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]] kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 
+template [[host_name("kernel_mul_mv_ext_mxfp8_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_mxfp8, 128, dequantize_dense_mxfp8_t4>;
+template [[host_name("kernel_mul_mv_ext_mxfp8_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_mxfp8, 128, dequantize_dense_mxfp8_t4>;
+template [[host_name("kernel_mul_mv_ext_mxfp8_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_mxfp8, 128, dequantize_dense_mxfp8_t4>;
+template [[host_name("kernel_mul_mv_ext_mxfp8_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_mxfp8, 128, dequantize_dense_mxfp8_t4>;
+template [[host_name("kernel_mul_mv_ext_mxfp8_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_mxfp8, 128, dequantize_dense_mxfp8_t4>;
+
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
@@ -2499,6 +2557,9 @@ template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n128")]]  kernel mul_
 template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_mxfp8_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, ds4_dense_block_mxfp8, 8, dequantize_dense_mxfp8, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_mxfp8_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, ds4_dense_block_mxfp8, 8, dequantize_dense_mxfp8, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_mxfp8_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, ds4_dense_block_mxfp8, 8, dequantize_dense_mxfp8, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
@@ -2930,4 +2991,5 @@ template [[host_name("kernel_mul_mm_f32_f32_full")]] kernel mul_mm_t kernel_mul_
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_mxfp8_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_mxfp8, 8, dequantize_dense_mxfp8, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
