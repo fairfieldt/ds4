@@ -2353,6 +2353,8 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [40] = {"nvfp4",   64,  36},
+    [100] = {"mxfp8", 128, 132},
 };
 
 enum {
@@ -2371,6 +2373,13 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    /* GGML NVFP4: per 64 values four UE4M3 scales, then 32 bytes of E2M1
+     * codes (byte j of a 16-value group holds values j and j + 8). Routed
+     * experts carry each expert's F32 global scale in a .scale tensor. */
+    DS4_TENSOR_NVFP4    = 40,
+    /* DS4 MXFP8: per 128 values four UE8M0 scales (one per 32), then 128
+     * E4M3 values. */
+    DS4_TENSOR_MXFP8    = 100,
 };
 
 typedef struct {
@@ -2391,8 +2400,10 @@ typedef struct {
 } ds4_tensor;
 
 /* Qwen n-gram rows: original BF16, or 8-bit rows of an F32 scale followed by
- * 160 E4M3 or int8 codes, stored as a GGUF I8 tensor. */
-enum { DS4_NGRAM_BF16, DS4_NGRAM_E4M3_ROW, DS4_NGRAM_I8_ROW };
+ * 160 E4M3 or int8 codes, or NVFP4 rows of ten E4M3 scales followed by 80
+ * bytes of E2M1 codes (low nibble first) with one F32 global scale for the
+ * table, stored as a GGUF I8 tensor. */
+enum { DS4_NGRAM_BF16, DS4_NGRAM_E4M3_ROW, DS4_NGRAM_I8_ROW, DS4_NGRAM_NVFP4_ROW };
 
 typedef struct ds4_model {
     int fd;
@@ -2414,6 +2425,7 @@ typedef struct ds4_model {
     const ds4_tensor *ngram_tensor;
     uint32_t ngram_width, ngram_row_bytes;
     uint8_t ngram_encoding;
+    float ngram_global_scale;
 #ifndef __APPLE__
     struct qwen4_ngram_pool *ngram_pool;
 #endif
@@ -2826,18 +2838,24 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     if (model_get_string(m, "qwen4exp.ple.ngram_encoding", &encoding)) {
         if (ds4_streq(encoding, "e4m3_f32row")) format = DS4_NGRAM_E4M3_ROW;
         else if (ds4_streq(encoding, "i8_f32row")) format = DS4_NGRAM_I8_ROW;
+        else if (ds4_streq(encoding, "nvfp4_e4m3x16")) format = DS4_NGRAM_NVFP4_ROW;
         else ds4_die("unsupported Qwen n-gram encoding");
     }
+    float global_scale = 1.0f;
+    if (format == DS4_NGRAM_NVFP4_ROW &&
+        (!model_get_f32_compat(m, "qwen4exp.ple.ngram_global_scale", &global_scale) ||
+         !(global_scale > 0.0f) || !isfinite(global_scale)))
+        ds4_die("Qwen NVFP4 n-grams need a positive qwen4exp.ple.ngram_global_scale");
     uint64_t resident_end = m->tensor_data_pos;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
-            const bool bf16 = format == DS4_NGRAM_BF16;
+            const bool bf16 = format == DS4_NGRAM_BF16, fp4 = format == DS4_NGRAM_NVFP4_ROW;
             if (table || t->type != (bf16 ? DS4_TENSOR_BF16 : DS4_TENSOR_I8) || t->ndim != 2 ||
-                t->dim[0] < (bf16 ? 1u : 5u) || t->dim[0] > (bf16 ? 160u : 164u) ||
+                (fp4 ? t->dim[0] != 90u : t->dim[0] < (bf16 ? 1u : 5u) || t->dim[0] > (bf16 ? 160u : 164u)) ||
                 !t->dim[1] || t->dim[1] > UINT32_MAX)
-                ds4_die("Qwen requires BF16 or 8-bit row n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+                ds4_die("Qwen requires BF16, 8-bit or NVFP4 row n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
             table = t;
         } else {
             if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
@@ -2878,8 +2896,10 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     m->ngram_fd = fd;
     m->ngram_tensor = table;
     m->ngram_encoding = format;
+    m->ngram_global_scale = global_scale;
     m->ngram_row_bytes = (uint32_t)(format == DS4_NGRAM_BF16 ? table->dim[0] * 2u : table->dim[0]);
-    m->ngram_width = (uint32_t)(format == DS4_NGRAM_BF16 ? table->dim[0] : table->dim[0] - 4u);
+    m->ngram_width = (uint32_t)(format == DS4_NGRAM_BF16 ? table->dim[0] :
+                                format == DS4_NGRAM_NVFP4_ROW ? 160u : table->dim[0] - 4u);
 #ifndef __APPLE__
     m->ngram_pool = qwen4_ngram_pool_new();
 #endif
@@ -4702,6 +4722,10 @@ typedef struct {
     ds4_tensor *ffn_gate_exps;
     ds4_tensor *ffn_up_exps;
     ds4_tensor *ffn_down_exps;
+    /* Qwen NVFP4 experts: each expert's F32 global scale ([n_expert]). */
+    ds4_tensor *ffn_gate_exps_s;
+    ds4_tensor *ffn_up_exps_s;
+    ds4_tensor *ffn_down_exps_s;
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
@@ -5047,6 +5071,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    case DS4_TENSOR_NVFP4:   return 36;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -5516,17 +5541,18 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
+/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF
+ * and MXFP8 from NVIDIA's NVFP4 checkpoint. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_MXFP8;
 }
 
 static void tensor_expect_qwen4_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen4_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, MXFP8, F16, BF16 or F32\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -5538,7 +5564,7 @@ static void tensor_expect_qwen4_expert_layout(
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
         t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0) {
+        t->type != DS4_TENSOR_Q4_0 && t->type != DS4_TENSOR_NVFP4) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -5575,11 +5601,13 @@ static void weights_validate_qwen4_layout(
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
         if (t != DS4_TENSOR_BF16 && t != DS4_TENSOR_I8) {
-            fprintf(stderr, "ds4: n-gram embeddings must use BF16 or 8-bit rows, got type %u\n", t);
+            fprintf(stderr, "ds4: n-gram embeddings must use BF16, 8-bit or NVFP4 rows, got type %u\n", t);
             exit(1);
         }
-        /* The loader already matched an I8 table to its encoding: F32 scale, then codes. */
-        const uint64_t width = w->ple_embd->dim[0] - (t == DS4_TENSOR_I8 ? 4u : 0u);
+        /* The loader already matched an I8 table to its encoding: F32 scale, then
+         * codes, or the 90-byte NVFP4 rows of 160 values. */
+        const uint64_t width = t != DS4_TENSOR_I8 ? w->ple_embd->dim[0] :
+                               w->ple_embd->dim[0] == 90u ? 160u : w->ple_embd->dim[0] - 4u;
         if (w->ple_embd->ndim != 2 || width != DS4_N_PLE_HEAD_DIM ||
             w->ple_embd->dim[1] < g_ds4_qwen4_ple.n_rows) {
             fprintf(stderr, "ds4: per_layer_token_embd layout [%" PRIu64 ", %" PRIu64 "] does not "
@@ -5657,6 +5685,19 @@ static void weights_validate_qwen4_layout(
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
+        }
+        {
+            const ds4_tensor *exps[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+            const ds4_tensor *scales[3] = { l->ffn_gate_exps_s, l->ffn_up_exps_s, l->ffn_down_exps_s };
+            for (int i = 0; i < 3; i++) {
+                if (exps[i]->type != DS4_TENSOR_NVFP4) continue;
+                if (!scales[i]) {
+                    fprintf(stderr, "ds4: NVFP4 tensor %.*s lacks its per-expert .scale tensor\n",
+                            (int)exps[i]->name.len, exps[i]->name.ptr);
+                    exit(1);
+                }
+                tensor_expect_layout(scales[i], DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            }
         }
         /* llama.cpp writes the shared-expert gate as a 1-D [n_embd] tensor */
         if (l->ffn_gate_inp_shexp->ndim == 1) {
@@ -7856,6 +7897,9 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     l->ffn_gate_exps      = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps        = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps      = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_exps_s    = tensor_by_namef(m, "blk.%u.ffn_gate_exps.scale", il);
+    l->ffn_up_exps_s      = tensor_by_namef(m, "blk.%u.ffn_up_exps.scale", il);
+    l->ffn_down_exps_s    = tensor_by_namef(m, "blk.%u.ffn_down_exps.scale", il);
     l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
     l->ffn_gate_shexp     = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp       = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
@@ -8187,6 +8231,9 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
     DS4_INCLUDE_TENSOR(l->ple_norm_conv);
     DS4_INCLUDE_TENSOR(l->ple_conv);
     DS4_INCLUDE_TENSOR(l->ffn_gate_inp_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_exps_s);
+    DS4_INCLUDE_TENSOR(l->ffn_up_exps_s);
+    DS4_INCLUDE_TENSOR(l->ffn_down_exps_s);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_norm);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_down);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_up);
@@ -8292,6 +8339,9 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->ple_norm_conv);
     DS4_INCLUDE_TENSOR(l->ple_conv);
     DS4_INCLUDE_TENSOR(l->ffn_gate_inp_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_exps_s);
+    DS4_INCLUDE_TENSOR(l->ffn_up_exps_s);
+    DS4_INCLUDE_TENSOR(l->ffn_down_exps_s);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_norm);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_down);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_up);
@@ -58372,6 +58422,22 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
         }
         done += (uint32_t)n;
     }
+    if (m->ngram_encoding == DS4_NGRAM_NVFP4_ROW) {
+        static const float e2m1[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+        const uint8_t *code = raw + 10;
+        for (uint32_t g = 0; g < 10; g++) {
+            if (raw[g] & 128u || raw[g] == 127u) {
+                errno = EDOM;
+                return false;
+            }
+            const float scale = qwen4_e4m3(raw[g]) * m->ngram_global_scale;
+            for (uint32_t j = 0; j < 16; j++) {
+                const uint8_t c = code[g * 8 + j / 2];
+                out[g * 16 + j] = e2m1[j & 1 ? c >> 4 : c & 15] * scale;
+            }
+        }
+        return true;
+    }
     if (m->ngram_encoding != DS4_NGRAM_BF16) {
         float scale;
         uint32_t bits = (uint32_t)raw[0] | (uint32_t)raw[1] << 8 |
@@ -58817,7 +58883,11 @@ typedef struct ds4_qwen4_gpu_graph {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0
+#ifndef DS4_HAS_QWEN4_METAL
+                 || (t->type == DS4_TENSOR_MXFP8 && (t->dim[0] % 128u) == 0)
+#endif
+                 );
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -58830,7 +58900,11 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0));
+                  (t->dim[0] % 256u) == 0)
+#ifndef DS4_HAS_QWEN4_METAL
+                 || (t->type == DS4_TENSOR_NVFP4 && (t->dim[0] % 128u) == 0)
+#endif
+                 );
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
@@ -58841,7 +58915,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         return false;
     }
     if (!w->ple_embd || (w->ple_embd->type != DS4_TENSOR_BF16 && w->ple_embd->type != DS4_TENSOR_I8)) {
-        fprintf(stderr, "ds4: Qwen3.8 requires BF16 or 8-bit row n-grams in the model GGUF\n");
+        fprintf(stderr, "ds4: Qwen3.8 requires BF16, 8-bit or NVFP4 row n-grams in the model GGUF\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -58890,7 +58964,13 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
+                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32; nvfp4 on CUDA)\n", il);
+            return false;
+        }
+        const bool nvfp4 = l->ffn_gate_exps->type == DS4_TENSOR_NVFP4;
+        if (nvfp4 != (l->ffn_up_exps->type == DS4_TENSOR_NVFP4) ||
+            nvfp4 != (l->ffn_down_exps->type == DS4_TENSOR_NVFP4)) {
+            fprintf(stderr, "ds4: Qwen3.8 GPU graph needs NVFP4 for all or none of the routed experts (layer %u)\n", il);
             return false;
         }
     }
@@ -59610,7 +59690,8 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
      * launch the same kernel with or without MTP, and the fused kernel rounds
      * every row as the separate ones do at any T, so verify rows stay exact. */
     if (T <= 3u && qwen4_graph_fused(g, T) && ds4_gpu_qwen4_decode_fusions_enabled() &&
-        l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0 &&
+        (l->lin_qkv->type == DS4_TENSOR_Q8_0 || l->lin_qkv->type == DS4_TENSOR_MXFP8) &&
+        l->lin_gate->type == l->lin_qkv->type &&
         l->lin_qkv->dim[0] == DS4_N_EMBD && l->lin_gate->dim[0] == DS4_N_EMBD &&
         l->lin_qkv->dim[1] == conv_dim && l->lin_gate->dim[1] == (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM &&
         l->lin_alpha->type == l->lin_beta->type) {
@@ -59619,7 +59700,7 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
             l->lin_alpha->abs_offset, l->lin_beta->abs_offset, l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
             l->lin_alpha->type, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV,
             DS4_N_EMBD, g->snap_after_first ? g->snap_lin_hist[il] : NULL, 0u,
-            g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u);
+            g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u, l->lin_qkv->type);
         if (front < 0) return false;
     }
 #endif
@@ -59867,6 +59948,11 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+#ifndef DS4_HAS_QWEN4_METAL
+static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                  uint32_t T);
+#endif
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
@@ -59876,6 +59962,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+#ifndef DS4_HAS_QWEN4_METAL
+    if (l->ffn_gate_exps->type == DS4_TENSOR_NVFP4) return ok && qwen4_graph_moe_nvfp4(g, m, l, T);
+#endif
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -60011,6 +60100,57 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     }
     return ok;
 }
+
+#ifndef DS4_HAS_QWEN4_METAL
+/* NVFP4 routed experts (NVIDIA's QAD checkpoint) on CUDA: kernels that
+ * apply each expert's global scale, with qwen4_graph_moe's schedule (tiled
+ * prefill GEMMs past 32 rows, the shared expert dense from 8 rows, as a
+ * slot of the per-row kernels below). */
+static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                  uint32_t T) {
+    const uint64_t gs = l->ffn_gate_exps_s->abs_offset, us = l->ffn_up_exps_s->abs_offset;
+    const uint64_t ds = l->ffn_down_exps_s->abs_offset;
+    if (qwen4_select_rows(T) > 32u) {
+        return ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
+                                                    DS4_N_EXPERT, g->cap_tokens) &&
+               ds4_gpu_qwen4_moe_nvfp4_mm_mid_tensor(g->mid, g->mixed, g->selected, g->moe_lists, g->moe_counts,
+                                                     m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                                     l->ffn_up_exps->abs_offset, gs, us, DS4_N_EXPERT, T,
+                                                     DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
+               qwen4_gemv_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp, g->mixed, T) &&
+               ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+               ds4_gpu_qwen4_moe_nvfp4_mm_down_tensor(g->part, g->mid, g->selected, g->moe_lists, g->moe_counts,
+                                                      m->map, m->size, l->ffn_down_exps->abs_offset, ds,
+                                                      DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
+                                                      g->cap_tokens) &&
+               qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
+               ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out, g->R,
+                                               g->inj, T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_EMBD,
+                                               DS4_N_HC) != 0;
+    }
+    const bool shared_dense = qwen4_select_rows(T) >= 8u;
+    if (shared_dense &&
+        (!qwen4_gemv_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp, g->mixed, T) ||
+         !ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) ||
+         !qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T))) return false;
+    return ds4_gpu_qwen4_moe_nvfp4_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size,
+                                              l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, gs, us,
+                                              DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                              shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                              shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                              shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
+                                              shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                              shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0 &&
+           ds4_gpu_qwen4_moe_nvfp4_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
+                                               l->ffn_down_exps->abs_offset, ds, DS4_N_EXPERT, T,
+                                               DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
+                                               shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                               shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0 &&
+           ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
+                                           shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
+                                           DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
+}
+#endif
 
 /* CUDA decode forwards read the PLE n-grams while layer 0 runs and stage
  * them in mapped memory for a kernel queued behind it, without the
@@ -68880,6 +69020,31 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
+    case DS4_TENSOR_NVFP4: {
+        /* Without the expert's global scale: qwen4_ref_expert_scale applies it. */
+        const uint64_t blocks = n / 64u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 36u;
+        for (uint64_t b = 0; b < blocks; b++, p += 36u) {
+            for (uint32_t s = 0; s < 4u; s++) {
+                const float d = qwen4_e4m3(p[s]);
+                const uint8_t *qs = p + 4 + s * 8u;
+                for (uint32_t j = 0; j < 8u; j++) {
+                    out[b * 64u + s * 16u + j] = d * ds4_mxfp4_values[qs[j] & 0x0fu];
+                    out[b * 64u + s * 16u + 8u + j] = d * ds4_mxfp4_values[qs[j] >> 4];
+                }
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_MXFP8: {
+        const uint64_t blocks = n / 128u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 132u;
+        for (uint64_t b = 0; b < blocks; b++, p += 132u) {
+            for (uint32_t j = 0; j < 128u; j++)
+                out[b * 128u + j] = ds4_e8m0_to_f32(p[j / 32u]) * qwen4_e4m3(p[4 + j]);
+        }
+        break;
+    }
     case DS4_TENSOR_Q2_K: {
         const uint64_t blocks = n / 256u;
         const block_q2_K *p = (const block_q2_K *)((const uint8_t *)tensor_data(m, t) + row * blocks * 84u);
@@ -69321,6 +69486,11 @@ static void qwen4_ref_attention(const ds4_model *m, const ds4_layer_weights *l, 
     free(p); free(sel); free(o); free(gate); free(q); free(qg);
 }
 
+/* An NVFP4 expert's global scale (1 for the other expert types). */
+static float qwen4_ref_expert_scale(const ds4_model *m, const ds4_tensor *scales, uint32_t e) {
+    return scales ? qwen4_ref_f32(m, scales)[e] : 1.0f;
+}
+
 static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const float *x, float *out) {
     const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
     float *logits = xmalloc(NE * sizeof(float));
@@ -69351,11 +69521,14 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     for (uint32_t i = 0; i < K; i++) {
         const uint32_t e = (uint32_t)sel[i];
         const float wgt = (float)(prob[e] / wsum);
+        const float sg = qwen4_ref_expert_scale(m, l->ffn_gate_exps_s, e);
+        const float su = qwen4_ref_expert_scale(m, l->ffn_up_exps_s, e);
+        const float sd = qwen4_ref_expert_scale(m, l->ffn_down_exps_s, e);
         qwen4_ref_matvec_rows(m, l->ffn_gate_exps, (uint64_t)e * F, F, x, g);
         qwen4_ref_matvec_rows(m, l->ffn_up_exps, (uint64_t)e * F, F, x, u);
-        for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+        for (uint32_t f = 0; f < F; f++) g[f] = silu(sg * g[f]) * (su * u[f]);
         qwen4_ref_matvec_rows(m, l->ffn_down_exps, (uint64_t)e * E, E, g, y);
-        for (uint32_t d = 0; d < E; d++) out[d] += wgt * y[d];
+        for (uint32_t d = 0; d < E; d++) out[d] += wgt * (sd * y[d]);
     }
     qwen4_ref_matvec(m, l->ffn_gate_shexp, x, g);
     qwen4_ref_matvec(m, l->ffn_up_shexp, x, u);
@@ -72761,7 +72934,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (e->model.ngram_tensor) {
         const uint8_t format = e->model.ngram_encoding;
         fprintf(stderr, "ds4: Qwen %s n-grams: %.2f GiB, %s\n",
-                format == DS4_NGRAM_E4M3_ROW ? "E4M3" : format == DS4_NGRAM_I8_ROW ? "int8" : "BF16",
+                format == DS4_NGRAM_E4M3_ROW ? "E4M3" : format == DS4_NGRAM_I8_ROW ? "int8" :
+                format == DS4_NGRAM_NVFP4_ROW ? "NVFP4" : "BF16",
                 (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0),
                 format == DS4_NGRAM_BF16 ? "disk reads only" : "read through the page cache");
     }
