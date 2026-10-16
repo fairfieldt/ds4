@@ -2374,6 +2374,138 @@ __device__ __forceinline__ void moe_q8_row(float &a, float &b, const char *r0, c
     }
 }
 
+/* The decode MoE kernels' shared-expert slot: two rows (gate and up, or two
+ * down rows) in a few load rounds.  A shared row is about twice a routed
+ * row's bytes, and in these one-wave kernels the slot's warps, one load
+ * round per unrolled step of moe_q8_row or mxfp8_rows, queued behind the
+ * routed warps' loads and finished last: NVIDIA's NVFP4 gate/up took 831
+ * instead of 678 us per decode token (RTX PRO 6000).  pair_rows<F, NIT, NB>
+ * reads NIT steps of 128 values (NIT = K / 128 when known at compile time,
+ * else 0) in rounds of NB, each lane loading its words of NB steps and both
+ * rows together.  F::steps<N>(a, b, r0, r1, xt, s) takes steps s..s+N-1. */
+template<class F, unsigned NIT, unsigned NB>
+__device__ __forceinline__ void pair_rows(float &a, float &b, const char *r0, const char *r1,
+        const float *xt, unsigned K) {
+    if (NIT) {
+        #pragma unroll
+        for (unsigned s = 0; s + NB <= NIT; s += NB) F::template steps<NB>(a, b, r0, r1, xt, s);
+        if (NIT % NB) F::template steps<NIT % NB ? NIT % NB : 1>(a, b, r0, r1, xt, NIT / NB * NB);
+    } else {
+        unsigned s = 0;
+        for (; s + NB <= K / 128; s += NB) F::template steps<NB>(a, b, r0, r1, xt, s);
+        for (; s < K / 128; s++) F::template steps<1>(a, b, r0, r1, xt, s);
+    }
+}
+
+/* moe_q8_row's products in its order: a step is four Q8_0 blocks, lane j <
+ * 4N loads block 4s + j's f16 scale and a shuffle hands it out (N <= 8). */
+struct q8_pair {
+    template<unsigned N>
+    static __device__ __forceinline__ void steps(float &a, float &b, const char *r0, const char *r1,
+            const float *xt, unsigned s0) {
+        const unsigned lane = threadIdx.x & 31;
+        uint16_t c0[N][2], c1[N][2];
+        unsigned d0 = 0, d1 = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            const unsigned v = (s0 + i) * 128 + 4 * lane;
+            const uint16_t *p0 = (const uint16_t *)(r0 + v / 32 * 34 + 2 + v % 32);
+            const uint16_t *p1 = (const uint16_t *)(r1 + v / 32 * 34 + 2 + v % 32);
+            c0[i][0] = p0[0]; c0[i][1] = p0[1];
+            c1[i][0] = p1[0]; c1[i][1] = p1[1];
+        }
+        if (lane < 4 * N) {
+            d0 = *(const uint16_t *)(r0 + (4 * s0 + lane) * 34);
+            d1 = *(const uint16_t *)(r1 + (4 * s0 + lane) * 34);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            const float4 v = *(const float4 *)(xt + (s0 + i) * 128 + 4 * lane);
+            const unsigned h0 = __shfl_sync(0xffffffffu, d0, 4 * i + lane / 8);
+            const unsigned h1 = __shfl_sync(0xffffffffu, d1, 4 * i + lane / 8);
+            float p = (float)(int8_t)c0[i][0] * v.x;
+            p += (float)(int8_t)(c0[i][0] >> 8) * v.y;
+            p += (float)(int8_t)c0[i][1] * v.z;
+            p += (float)(int8_t)(c0[i][1] >> 8) * v.w;
+            a += p * __half2float(__ushort_as_half((unsigned short)h0));
+            p = (float)(int8_t)c1[i][0] * v.x;
+            p += (float)(int8_t)(c1[i][0] >> 8) * v.y;
+            p += (float)(int8_t)c1[i][1] * v.z;
+            p += (float)(int8_t)(c1[i][1] >> 8) * v.w;
+            b += p * __half2float(__ushort_as_half((unsigned short)h1));
+        }
+    }
+};
+
+/* mxfp8_rows' products in its order: a step is one 132-byte block, lane i <
+ * N loads block s + i's scale word and a shuffle hands its bytes out. */
+struct mxfp8_pair {
+    template<unsigned N>
+    static __device__ __forceinline__ void steps(float &a, float &b, const char *r0, const char *r1,
+            const float *xt, unsigned s0) {
+        const unsigned lane = threadIdx.x & 31;
+        unsigned c0[N], c1[N], e0 = 0, e1 = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            c0[i] = *(const unsigned *)(r0 + (s0 + i) * 132 + 4 + 4 * lane);
+            c1[i] = *(const unsigned *)(r1 + (s0 + i) * 132 + 4 + 4 * lane);
+        }
+        if (lane < N) {
+            e0 = *(const unsigned *)(r0 + (s0 + lane) * 132);
+            e1 = *(const unsigned *)(r1 + (s0 + lane) * 132);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            const float4 v = *(const float4 *)(xt + (s0 + i) * 128 + 4 * lane);
+            const unsigned s0w = __shfl_sync(0xffffffffu, e0, i), s1w = __shfl_sync(0xffffffffu, e1, i);
+            const float4 w0 = e4m3x4(c0[i]);
+            float p = w0.x * v.x;
+            p += w0.y * v.y;
+            p += w0.z * v.z;
+            p += w0.w * v.w;
+            a += p * e8m0f((s0w >> 8 * (lane / 8)) & 255);
+            const float4 w1 = e4m3x4(c1[i]);
+            p = w1.x * v.x;
+            p += w1.y * v.y;
+            p += w1.z * v.z;
+            p += w1.w * v.w;
+            b += p * e8m0f((s1w >> 8 * (lane / 8)) & 255);
+        }
+    }
+};
+
+/* BF16 rows (8-byte aligned), four values a lane per step in one 8-byte
+ * load.  shared_rows reads them through scalar(), one value a lane per 32
+ * (the MTP layer's gate/up took 67 instead of 16 us), and sums them in
+ * another order. */
+struct bf16_pair {
+    template<unsigned N>
+    static __device__ __forceinline__ void steps(float &a, float &b, const char *r0, const char *r1,
+            const float *xt, unsigned s0) {
+        const unsigned lane = threadIdx.x & 31;
+        uint2 c0[N], c1[N];
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            c0[i] = *(const uint2 *)(r0 + (s0 + i) * 256 + 8 * lane);
+            c1[i] = *(const uint2 *)(r1 + (s0 + i) * 256 + 8 * lane);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < N; i++) {
+            const float4 v = *(const float4 *)(xt + (s0 + i) * 128 + 4 * lane);
+            float p = __uint_as_float(c0[i].x << 16) * v.x;
+            p += __uint_as_float(c0[i].x & 0xffff0000u) * v.y;
+            p += __uint_as_float(c0[i].y << 16) * v.z;
+            p += __uint_as_float(c0[i].y & 0xffff0000u) * v.w;
+            a += p;
+            p = __uint_as_float(c1[i].x << 16) * v.x;
+            p += __uint_as_float(c1[i].x & 0xffff0000u) * v.y;
+            p += __uint_as_float(c1[i].y << 16) * v.z;
+            p += __uint_as_float(c1[i].y & 0xffff0000u) * v.w;
+            b += p;
+        }
+    }
+};
+
 /* Scales and mins of Q4_K groups 2c and 2c + 1 from the 16-byte header
  * (d, dmin, scales[12]); the same values value<12> derives. */
 __device__ __forceinline__ void q4k_group_pair(const uint4 h, unsigned c,
@@ -2435,7 +2567,8 @@ __global__ void moe_gate_up_q4k(float *out, const float *x, const int *selected,
     const float *xt = x + (uint64_t)t * K;
     float a = 0, b = 0;
     if (slot == NS) {
-        moe_q8_row(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, true);
+        if (K == 2560) pair_rows<q8_pair, 20, 7>(a, b, sh0 + row * srb, sh1 + row * srb, xt, K);
+        else moe_q8_row(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, true);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
@@ -2581,7 +2714,8 @@ __global__ void __launch_bounds__(128, 10) moe_down_q4_lat(float *out, const flo
     const float *xt = x + pair * K;
     float acc[2] = {};
     if (slot == NS) {
-        moe_q8_row(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + 1) * srb, xt, K, rows > 1);
+        if (K == 640) pair_rows<q8_pair, 5, 7>(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + rows - 1) * srb, xt, K);
+        else moe_q8_row(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + 1) * srb, xt, K, rows > 1);
     } else {
         const unsigned sub = lane % 4, nb = K / 32;
         float4 xv[3][2];
@@ -2727,65 +2861,15 @@ __device__ __forceinline__ void shared_rows(float &a, float &b, const char *r0, 
     }
 }
 
-/* mxfp8_rows over blocks b0..b0+NB-1 of two rows: each lane's NB code
- * words of both rows are loaded together, and lane i < NB loads block i's
- * scale word, which a shuffle hands to the lanes reading its bytes.  The
- * products and their order are mxfp8_rows', so are the sums. */
-template<unsigned NB>
-__device__ __forceinline__ void mxfp8_pair_blocks(float &a, float &b, const char *r0, const char *r1,
-        const float *xt, unsigned b0) {
-    const unsigned lane = threadIdx.x & 31;
-    unsigned c0[NB], c1[NB], s0 = 0, s1 = 0;
-    #pragma unroll
-    for (unsigned i = 0; i < NB; i++) {
-        c0[i] = *(const unsigned *)(r0 + (b0 + i) * 132 + 4 + 4 * lane);
-        c1[i] = *(const unsigned *)(r1 + (b0 + i) * 132 + 4 + 4 * lane);
-    }
-    if (lane < NB) {
-        s0 = *(const unsigned *)(r0 + (b0 + lane) * 132);
-        s1 = *(const unsigned *)(r1 + (b0 + lane) * 132);
-    }
-    #pragma unroll
-    for (unsigned i = 0; i < NB; i++) {
-        const float4 v = *(const float4 *)(xt + (b0 + i) * 128 + 4 * lane);
-        const unsigned e0 = __shfl_sync(0xffffffffu, s0, i), e1 = __shfl_sync(0xffffffffu, s1, i);
-        const float4 w0 = e4m3x4(c0[i]);
-        float p = w0.x * v.x;
-        p += w0.y * v.y;
-        p += w0.z * v.z;
-        p += w0.w * v.w;
-        a += p * e8m0f((e0 >> 8 * (lane / 8)) & 255);
-        const float4 w1 = e4m3x4(c1[i]);
-        p = w1.x * v.x;
-        p += w1.y * v.y;
-        p += w1.z * v.z;
-        p += w1.w * v.w;
-        b += p * e8m0f((e1 >> 8 * (lane / 8)) & 255);
-    }
-}
-
-/* The shared expert's MXFP8 gate and up rows in loads of ten blocks (two
- * at K = 2560, NBLK = K / 128 when known at compile time).  mxfp8_rows
- * loads four blocks a round; five rounds queued behind the routed warps'
- * loads made these warps the gate/up kernel's tail, 831 instead of 678 us
- * per decode token for the whole kernel (RTX PRO 6000). */
-template<unsigned NBLK>
-__device__ __forceinline__ void mxfp8_pair_rows(float &a, float &b, const char *r0, const char *r1,
-        const float *xt, unsigned K) {
-    const unsigned nb = NBLK ? NBLK : K / 128;
-    unsigned b0 = 0;
-    #pragma unroll
-    for (; b0 + 10 <= nb; b0 += 10) mxfp8_pair_blocks<10>(a, b, r0, r1, xt, b0);
-    for (; b0 < nb; b0++) mxfp8_pair_blocks<1>(a, b, r0, r1, xt, b0);
-}
-
 /* ITER: K / 256 steps when known at compile time (the release shape), a
  * lane's code and scale words all loaded before the arithmetic (9% faster
  * per token than a loop over K); 0 loops over K.  With pd set, the
  * shared-expert blocks
  * first ask L2 for their own gate and up rows and for a 1/gridDim.x slice
- * of the shared down matrix pd (pdb bytes), as moe_gate_up_q4k does. */
-template<unsigned ITER>
+ * of the shared down matrix pd (pdb bytes), as moe_gate_up_q4k does.  BF:
+ * a BF16 shared expert (st == 30, the MTP layer of NVIDIA's checkpoint), in
+ * its own build: in the MXFP8 one its code made the kernel 3% slower. */
+template<unsigned ITER, bool BF>
 __global__ void moe_gate_up_nvfp4(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const float *gs, const float *us,
         const char *sh0, const char *sh1, unsigned st,
@@ -2805,7 +2889,9 @@ __global__ void moe_gate_up_nvfp4(float *out, const float *x, const int *selecte
     const float *xt = x + (uint64_t)t * K;
     float a = 0, b = 0, sa = 1, sb = 1;
     if (slot == NS) {
-        if (st == 100) mxfp8_pair_rows<2 * ITER>(a, b, sh0 + row * srb, sh1 + row * srb, xt, K);
+        if (st == 100) pair_rows<mxfp8_pair, 2 * ITER, 10>(a, b, sh0 + row * srb, sh1 + row * srb, xt, K);
+        else if (BF && !(((uintptr_t)sh0 | (uintptr_t)sh1 | srb) & 7))
+            pair_rows<bf16_pair, 2 * ITER, 8>(a, b, sh0 + row * srb, sh1 + row * srb, xt, K);
         else shared_rows(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, st, true);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
@@ -2867,7 +2953,12 @@ __global__ void __launch_bounds__(128) moe_down_nvfp4(float *out, const float *x
     const float *xt = x + pair * K;
     float acc[2] = {}, scale = 1;
     if (slot == NS) {
-        shared_rows(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + rows - 1) * srb, xt, K, st, rows > 1);
+        /* ITER is 5 only for K = 640: five 128-value steps, one round */
+        const char *r0 = sh0 + row0 * srb, *r1 = sh0 + (row0 + rows - 1) * srb;
+        if (st == 100) pair_rows<mxfp8_pair, ITER ? 640 / 128 : 0, 10>(acc[0], acc[1], r0, r1, xt, K);
+        else if (st == 30 && !(((uintptr_t)r0 | (uintptr_t)r1) & 7))
+            pair_rows<bf16_pair, ITER ? 640 / 128 : 0, 8>(acc[0], acc[1], r0, r1, xt, K);
+        else shared_rows(acc[0], acc[1], r0, r1, xt, K, st, rows > 1);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
@@ -2930,10 +3021,12 @@ static int moe_nvfp4_dispatch(float *out, const float *x, const int *sel, const 
                         !((uintptr_t)pd & 15) && !(pdb & 15) && 4 * srb < (1u << 20);
         if (!pf) { pd = NULL; pdb = 0; }
         const dim3 grid((M + 3) / 4, stride, T);
-        if (K == 2560) launch(moe_gate_up_nvfp4<10>, grid, 128, 0,
-                              out, x, sel, w0, w1, s0, s1, sh0, sh1, st, NE, NS, stride, K, M, rb, srb, pd, pdb);
-        else launch(moe_gate_up_nvfp4<0>, grid, 128, 0,
-                    out, x, sel, w0, w1, s0, s1, sh0, sh1, st, NE, NS, stride, K, M, rb, srb, pd, pdb);
+#define NVFP4_GATE_UP(ITER, BF) launch(moe_gate_up_nvfp4<ITER, BF>, grid, 128, 0, \
+        out, x, sel, w0, w1, s0, s1, sh0, sh1, st, NE, NS, stride, K, M, rb, srb, pd, pdb)
+        if (K == 2560) { if (st == 30) NVFP4_GATE_UP(10, true); else NVFP4_GATE_UP(10, false); }
+        else if (st == 30) NVFP4_GATE_UP(0, true);
+        else NVFP4_GATE_UP(0, false);
+#undef NVFP4_GATE_UP
     }
     return launched();
 }
