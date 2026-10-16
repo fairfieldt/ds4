@@ -3187,6 +3187,10 @@ static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         sg_off = arena_mxfp8(a, F, E, &sg_w);
         su_off = arena_mxfp8(a, F, E, &su_w);
         sd_off = arena_mxfp8(a, E, F, &sd_w);
+    } else if (shared_type == 30u) {
+        sg_off = arena_bf16(a, (uint64_t)F * E, &sg_w, 0.05f);
+        su_off = arena_bf16(a, (uint64_t)F * E, &su_w, 0.05f);
+        sd_off = arena_bf16(a, (uint64_t)E * F, &sd_w, 0.05f);
     }
     const uint32_t n_out = slots + (has_shared ? 1u : 0u);
     float *x = rand_vec((uint64_t)T * E, 1.0f);
@@ -3224,7 +3228,7 @@ static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
     ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
     char name[128];
-    const char *sname = shared_type == 8u ? "q8_0" : shared_type == 100u ? "mxfp8" : "none";
+    const char *sname = shared_type == 8u ? "q8_0" : shared_type == 100u ? "mxfp8" : shared_type == 30u ? "bf16" : "none";
     require_ok(ds4_gpu_qwen4_moe_nvfp4_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, gs_off, us_off,
                                                   NE, T, slots, E, F, sg_off, su_off, shared_type,
                                                   sd_off, has_shared ? shared_type : UINT32_MAX), "nvfp4 mid");
@@ -3359,6 +3363,9 @@ static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     test_moe_nvfp4(a, 8, 6, 2560, 640, 3, 8u, false);
     /* 11 MXFP8 blocks a shared row: a ten-block load, then a one-block tail */
     test_moe_nvfp4(a, 8, 6, 1408, 640, 2, 100u, false);
+    /* BF16 shared expert (the MTP layer of NVIDIA's checkpoint) */
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 1, 30u, false);
+    test_moe_nvfp4(a, 8, 6, 1408, 640, 3, 30u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 9, UINT32_MAX, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 96, UINT32_MAX, true);
     /* past 2047 rows: the wide tiles (matrix_half_wb), then matrix_half_ws */
