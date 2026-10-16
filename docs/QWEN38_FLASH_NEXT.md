@@ -51,6 +51,9 @@ default. The 1024-token example above saves memory on smaller Macs.
 
 Use the same model options with `ds4-agent` or `ds4-server`.
 Add `--mtp` for speculative decoding using the built-in MTP weights.
+On CUDA, when the output head is BF16, F16 or F32, the MTP drafts read a
+Q8_0 copy of it (about 0.6 GiB of VRAM); verified and returned logits still
+use the stored head. `DS4_QWEN4_MTP_DRAFT_Q8=0` turns the copy off.
 `ds4-bench` benchmarks ordinary decoding; it does not accept `--mtp`.
 `--nothink` disables thinking. The server exposes
 `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`, and
