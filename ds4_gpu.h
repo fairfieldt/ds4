@@ -3720,6 +3720,22 @@ int ds4_gpu_qwen4_moe_nvfp4_mm_down_tensor(
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
         const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
         uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* CUDA only: rows [0, rows) of a K-wide F32/F16/BF16 matrix in the model map
+ * as GGML Q8_0 blocks with ggml's reference rounding (quantize_row_q8_0_ref)
+ * into dst. */
+int ds4_gpu_qwen4_quantize_q8_0_tensor(
+        ds4_gpu_tensor *dst, const void *model_map, uint64_t model_size, uint64_t offset,
+        uint32_t type, uint32_t in_dim, uint32_t rows);
+/* CUDA only: out[n_tokens][out_dim] = rows [0, out_dim) of that Q8_0 form
+ * of a rows x in_dim matrix times x, the copy made on first use and kept
+ * with the model's derived weights.  1 when it ran, 0 when there is no copy
+ * (none can be made while a decode graph is captured, or the allocation
+ * failed: the caller uses the stored matrix), -1 on error.  For MTP drafts,
+ * which only need their argmax. */
+int ds4_gpu_qwen4_q8_copy_rows_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t offset,
+        uint32_t type, uint32_t in_dim, uint32_t rows, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tokens);
 /* weight_type covers both the alpha and the beta projection */
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,

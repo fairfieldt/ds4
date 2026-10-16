@@ -4729,9 +4729,15 @@ __global__ void f32_to_bf16_exact(unsigned *out, const uint2 *in, uint64_t pairs
     }
 }
 
+/* Q8_0 copies of BF16/F16/F32 output heads for the MTP drafts (see
+ * ds4_gpu_qwen4_q8_copy_rows_tensor), keyed and released like the BF16 copies */
+static std::unordered_map<const char *, char *> g_qwen_q8_copy;
+
 static void qwen4_bf16_cache_release(void) {
     for (auto &c : g_qwen_bf16) if (c.second.dst) (void)cudaFree(c.second.dst);
     g_qwen_bf16.clear();
+    for (auto &c : g_qwen_q8_copy) if (c.second) (void)cudaFree(c.second);
+    g_qwen_q8_copy.clear();
 }
 
 static const char *bf16_copy(const char *w, uint64_t n) {
@@ -7618,6 +7624,75 @@ extern "C" int ds4_gpu_qwen4_moe_nvfp4_mm_down_tensor(ds4_gpu_tensor *out, const
         const void *map, uint64_t size, uint64_t off, uint64_t dso,
         uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M, uint32_t cap) {
     return qwen4_moe_nvfp4_mm(out,x,sel,lists,counts,map,size,off,0,dso,0,NE,T,NS,K,M,cap,true);
+}
+
+/* Rows of a K-wide F32/F16/BF16 matrix as GGML Q8_0 blocks with ggml's
+ * reference rounding (quantize_row_q8_0_ref: d = amax / 127 stored as F16,
+ * q = roundf(x / d) with the unrounded d), a warp per block.  The rounded
+ * intrinsics keep --use_fast_math from changing a byte. */
+template<unsigned TYPE>
+__global__ void quantize_q8_0(char *dst, const char *src, unsigned K, unsigned rows, uint64_t rb) {
+    const uint64_t blk = (uint64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x & 31, nb = K / 32;
+    if (blk >= (uint64_t)rows * nb) return;
+    const float v = qwen4_cuda::value<TYPE>(src + blk / nb * rb, (unsigned)(blk % nb) * 32 + lane);
+    float amax = fabsf(v);
+    for (unsigned o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = __fdiv_rn(amax, 127.0f), id = d != 0.0f ? __frcp_rn(d) : 0.0f;
+    char *b = dst + blk * 34;
+    if (!lane) *(__half *)b = __float2half_rn(d);
+    b[2 + lane] = (char)(int)roundf(__fmul_rn(v, id));
+}
+
+extern "C" int ds4_gpu_qwen4_quantize_q8_0_tensor(ds4_gpu_tensor *dst, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, uint32_t rows) {
+    using namespace qwen4_cuda;
+    const uint64_t rb = row_bytes(type, K), blocks = (uint64_t)rows * (K / 32);
+    if (!rows || !K || K % 32 || !rb || !tensor(dst, row_bytes(8, K) * rows) || blocks > (uint64_t)INT_MAX * 8) return 0;
+    const char *src = weight(map, size, off, rb * rows);
+    if (!src) return 0;
+    const unsigned grid = (unsigned)((blocks + 7) / 8);
+    switch (type) {
+    case 0: launch(quantize_q8_0<0>, grid, 256, 0, (char *)dst->ptr, src, K, rows, rb); break;
+    case 1: launch(quantize_q8_0<1>, grid, 256, 0, (char *)dst->ptr, src, K, rows, rb); break;
+    case 30: launch(quantize_q8_0<30>, grid, 256, 0, (char *)dst->ptr, src, K, rows, rb); break;
+    default: return 0;
+    }
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_q8_copy_rows_tensor(ds4_gpu_tensor *out, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, uint32_t rows, uint32_t M, const ds4_gpu_tensor *x, uint32_t T) {
+    using namespace qwen4_cuda;
+    const uint64_t rb = row_bytes(type, K), qb = row_bytes(8, K);
+    if ((type != 0 && type != 1 && type != 30) || !T || !K || !rb || !qb || !M || M > rows ||
+        !tensor(x, (uint64_t)T * K * 4) || !tensor(out, (uint64_t)T * M * 4)) return -1;
+    const char *src = weight(map, size, off, rb * rows);
+    if (!src) return -1;
+    auto it = g_qwen_q8_copy.find(src);
+    if (it == g_qwen_q8_copy.end()) {
+        if (g_decode_graph_capturing) return 0;
+        char *dst = NULL;
+        ds4_gpu_tensor t = {};
+        if (cudaMalloc(&dst, qb * rows) != cudaSuccess) {
+            (void)cudaGetLastError();
+            dst = NULL;
+        } else {
+            t.ptr = dst;
+            t.bytes = qb * rows;
+            if (ds4_gpu_qwen4_quantize_q8_0_tensor(&t, map, size, off, type, K, rows) != 1) {
+                (void)cudaFree(dst);
+                dst = NULL;
+            }
+        }
+        it = g_qwen_q8_copy.emplace(src, dst).first;
+    }
+    if (!it->second) return 0;
+    for (uint32_t t0 = 0; t0 < T; t0 += 8) {
+        if (!matvec_dispatch((float *)out->ptr + (uint64_t)t0 * M, it->second,
+                             (const float *)x->ptr + (uint64_t)t0 * K, 8, std::min(8u, T - t0), K, M)) return -1;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor *state,
