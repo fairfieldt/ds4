@@ -2638,10 +2638,33 @@ __global__ void __launch_bounds__(128, 10) moe_down_q4_lat(float *out, const flo
  * reads Q8_0, MXFP8 or any type scalar() reads.
  *
  * nvfp4_dot8: the codes of word q against x0 (low nibbles) and x1 (high
- * nibbles).  A code s e1 e0 m placed as the half bits s 0 0 0 e1 e0 m 0...
- * is its E2M1 level times 2^-14 (e1 e0 the exponent, subnormal at 0), so
- * each product is exact up to that power of two and the caller folds 2^14
- * into the block scale. */
+ * nibbles), times NVFP4_DOT8_UNIT; nvfp4_scale is a block scale divided by
+ * it.  sm_120a converts a byte's two codes to a half2 in one instruction.
+ * Elsewhere a code s e1 e0 m placed as the half bits s 0 0 0 e1 e0 m 0...
+ * is its E2M1 level times 2^-14 (e1 e0 the exponent, subnormal at 0).
+ * Either way each product is exact up to a power of two. */
+#ifdef DS4_CUDA_HAVE_MXF4
+#define NVFP4_DOT8_UNIT 1.0f
+__device__ __forceinline__ float nvfp4_dot8(unsigned q, float4 x0, float4 x1) {
+    unsigned h0, h1, h2, h3;
+    asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}"
+        : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3) : "r"(q));
+    const float2 a = __half22float2(*(const __half2 *)&h0), b = __half22float2(*(const __half2 *)&h1);
+    const float2 c = __half22float2(*(const __half2 *)&h2), d = __half22float2(*(const __half2 *)&h3);
+    float p = a.x * x0.x;
+    p += b.x * x0.y;
+    p += c.x * x0.z;
+    p += d.x * x0.w;
+    p += a.y * x1.x;
+    p += b.y * x1.y;
+    p += c.y * x1.z;
+    p += d.y * x1.w;
+    return p;
+}
+#else
+#define NVFP4_DOT8_UNIT 0x1p-14f
 __device__ __forceinline__ float nvfp4_dot8(unsigned q, float4 x0, float4 x1) {
     const unsigned t01 = __byte_perm(q, 0, 0x4140), t23 = __byte_perm(q, 0, 0x4342);
     const unsigned l01 = ((t01 & 0x00080008u) << 12) | ((t01 & 0x00070007u) << 9);
@@ -2660,10 +2683,12 @@ __device__ __forceinline__ float nvfp4_dot8(unsigned q, float4 x0, float4 x1) {
     p += d.y * x1.w;
     return p;
 }
+#endif
 
-/* the block scale of group g in scale word c, times the 2^14 of nvfp4_dot8 */
+/* the block scale of group g in scale word c, over NVFP4_DOT8_UNIT */
 __device__ __forceinline__ float nvfp4_scale(unsigned c, unsigned g) {
-    return e4m3f((c >> 8 * g) & 255) * 0x1p14f;
+    const unsigned h = e4m3x2_h2(c >> 8 * g);
+    return __low2float(*(const __half2 *)&h) * (1.0f / NVFP4_DOT8_UNIT);
 }
 
 /* A warp's lane partials of one or two MXFP8 rows: four values a lane per
@@ -2674,19 +2699,19 @@ __device__ __forceinline__ void mxfp8_rows(float &a, float &b, const char *r0, c
     for (unsigned i = (threadIdx.x & 31) * 4; i < K; i += 128) {
         const float4 v = *(const float4 *)(xt + i);
         const uint8_t *b0 = (const uint8_t *)r0 + (i / 128) * 132;
-        const unsigned q0 = *(const unsigned *)(b0 + 4 + i % 128);
-        float p = e4m3f(q0 & 255) * v.x;
-        p += e4m3f((q0 >> 8) & 255) * v.y;
-        p += e4m3f((q0 >> 16) & 255) * v.z;
-        p += e4m3f(q0 >> 24) * v.w;
+        const float4 w0 = e4m3x4(*(const unsigned *)(b0 + 4 + i % 128));
+        float p = w0.x * v.x;
+        p += w0.y * v.y;
+        p += w0.z * v.z;
+        p += w0.w * v.w;
         a += p * e8m0f(b0[i % 128 / 32]);
         if (two) {
             const uint8_t *b1 = (const uint8_t *)r1 + (i / 128) * 132;
-            const unsigned q1 = *(const unsigned *)(b1 + 4 + i % 128);
-            p = e4m3f(q1 & 255) * v.x;
-            p += e4m3f((q1 >> 8) & 255) * v.y;
-            p += e4m3f((q1 >> 16) & 255) * v.z;
-            p += e4m3f(q1 >> 24) * v.w;
+            const float4 w1 = e4m3x4(*(const unsigned *)(b1 + 4 + i % 128));
+            p = w1.x * v.x;
+            p += w1.y * v.y;
+            p += w1.z * v.z;
+            p += w1.w * v.w;
             b += p * e8m0f(b1[i % 128 / 32]);
         }
     }
