@@ -2987,8 +2987,6 @@ static void check_exact_f32(const char *what, const float *got, const float *ref
 
 /* ---- NVIDIA's NVFP4 checkpoint: NVFP4 experts and MXFP8 projections ---- */
 
-#ifndef __APPLE__
-
 static uint32_t urand(void) {
     (void)frand();
     return g_rng;
@@ -3061,15 +3059,32 @@ static void test_dense_mxfp8(arena_t *a, uint32_t K, uint32_t M, const uint32_t 
                 ref[(uint64_t)t * M + r] = acc;
             }
         ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *out = upload(NULL, (uint64_t)T * M);
-        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size, off, 100u, T, K, M), "MXFP8 dense_mm");
         char what[96];
+#ifdef __APPLE__
+        /* Metal projects through the quantized matmuls; past 8 rows the
+         * tiles round x and the weights to halves */
+        require_ok(ds4_gpu_matmul_quant_tensor(out, a->base, a->size, off, 100u, K, M, gx, T), "MXFP8 matmul");
+        const double tol = T > 8 ? 3e-3 : 2e-5;
+#else
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size, off, 100u, T, K, M), "MXFP8 dense_mm");
+        const double tol = T > 32 ? 1e-4 : 2e-5;
+#endif
         snprintf(what, sizeof(what), "MXFP8 dense K=%u M=%u T=%u", K, M, T);
-        check_tensor(what, out, ref, (uint64_t)T * M, T > 32 ? 1e-4 : 2e-5);
+        check_tensor(what, out, ref, (uint64_t)T * M, tol);
+        if (T <= 3) {
+            const uint64_t offs[1] = { off };
+            const uint32_t types[1] = { 100u }, rows[1] = { M };
+            require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, K, 1, &out, a->base, a->size, offs, types, rows),
+                       "MXFP8 multi gemv");
+            snprintf(what, sizeof(what), "MXFP8 multi gemv K=%u M=%u T=%u", K, M, T);
+            check_tensor(what, out, ref, (uint64_t)T * M, 2e-5);
+        }
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx); free(ref); free(x);
     }
     free(sh);
 }
 
+#ifndef __APPLE__
 /* MXFP8 projections sharing an input take the multi-GEMV kernels: the
  * single-warp rows match dense_mm byte for byte; the decode GDN front with
  * MXFP8 qkv/gate matches the separate kernels byte for byte. */
@@ -3144,6 +3159,7 @@ static void test_mxfp8_multi_gdn(arena_t *a) {
     free(state0); free(hist0);
     puts("  MXFP8 GDN decode front: fused projections and conv byte-exact at T=1/2/3");
 }
+#endif
 
 /* NVFP4 experts with per-expert global scales: the decode kernels (shared
  * expert as a Q8_0 or MXFP8 slot, or none), the prefill tiles and the FP32
@@ -3226,7 +3242,12 @@ static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
         ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
         require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, T), "nvfp4 lists");
-        for (int quality = 0; quality < 2; quality++) {
+#ifdef __APPLE__
+        const int n_quality = 1;   /* Metal's tiles have no FP32 fallback */
+#else
+        const int n_quality = 2;
+#endif
+        for (int quality = 0; quality < n_quality; quality++) {
             ds4_gpu_set_quality(quality != 0);
             require_ok(ds4_gpu_tensor_fill_f32(gmid, 0.0f, (uint64_t)T * n_out * F) &&
                        ds4_gpu_tensor_fill_f32(gpart, 0.0f, (uint64_t)T * n_out * E), "nvfp4 mm clear");
@@ -3249,6 +3270,7 @@ static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
 }
 
+#ifndef __APPLE__
 /* ggml's FP32 -> FP16 (round to nearest even, subnormals included) */
 static uint16_t f32_to_f16_rne(float f) {
     uint32_t u;
@@ -3321,6 +3343,7 @@ static void test_q8_head_copy(arena_t *a) {
     free(got); free(ref); free(sh);
     puts("  Q8_0 head copy: ggml reference bytes, GEMV byte-exact against dense_mm at T=1/2/3");
 }
+#endif
 
 static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     printf("NVFP4 experts and MXFP8 projections\n");
@@ -3331,8 +3354,10 @@ static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     test_dense_mxfp8(a, 640, 2560, dec, 4);
     test_dense_mxfp8(a, 2560, 640, pre, 2);
     test_dense_mxfp8(a, 640, 2560, pre, 1);
+#ifndef __APPLE__
     test_mxfp8_multi_gdn(a);
     test_q8_head_copy(a);
+#endif
     test_moe_nvfp4(a, 8, 6, 2560, 640, 1, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 2, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 3, 8u, false);
@@ -3349,7 +3374,6 @@ static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     test_moe_nvfp4(a, 64, 4, 512, 128, 2100, UINT32_MAX, true);
     unsetenv("DS4_QWEN4_EXPERT_WB");
 }
-#endif
 
 /* The vector scorer must reproduce the scalar scorer bit for bit and emit
  * the selector's tile keys; the prefiltered decode select must reproduce
@@ -6340,7 +6364,6 @@ int main(void) {
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_GDN_FRONT")) { test_gdn_front_exact(&arena); return 0; }
-    if (getenv("DS4_TEST_QWEN4_NVFP4")) { test_nvfp4_checkpoint_kernels(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ROUTER")) { test_router_paths(&arena); return 0; }
@@ -6364,6 +6387,7 @@ int main(void) {
         return 0;
     }
 #endif
+    if (getenv("DS4_TEST_QWEN4_NVFP4")) { test_nvfp4_checkpoint_kernels(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena, 39u); test_moe_grouped(&arena, 2u); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
@@ -6419,9 +6443,7 @@ int main(void) {
         bench_dispatch(&arena);
         return 0;
     }
-#ifndef __APPLE__
     test_nvfp4_checkpoint_kernels(&arena);
-#endif
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();

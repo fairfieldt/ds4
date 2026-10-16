@@ -3691,7 +3691,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
-/* CUDA only: NVFP4 routed experts (GGML type 40) with each expert's F32
+/* NVFP4 routed experts (GGML type 40) with each expert's F32
  * global scale, read from the [n_total_expert] tensors at the *_scale
  * offsets; otherwise as ds4_gpu_qwen4_moe_mid_prefetch_tensor (gate/up),
  * ds4_gpu_qwen4_moe_down_tensor and, for prefill,
