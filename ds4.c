@@ -58699,11 +58699,8 @@ typedef struct ds4_qwen4_gpu_graph {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0
-#ifndef DS4_HAS_QWEN4_METAL
-                 || (t->type == DS4_TENSOR_MXFP8 && (t->dim[0] % 128u) == 0)
-#endif
-                 );
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 ||
+                 (t->type == DS4_TENSOR_MXFP8 && (t->dim[0] % 128u) == 0));
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -58716,11 +58713,8 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0)
-#ifndef DS4_HAS_QWEN4_METAL
-                 || (t->type == DS4_TENSOR_NVFP4 && (t->dim[0] % 128u) == 0)
-#endif
-                 );
+                  (t->dim[0] % 256u) == 0) ||
+                 (t->type == DS4_TENSOR_NVFP4 && (t->dim[0] % 128u) == 0));
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
@@ -58780,7 +58774,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32; nvfp4 on CUDA)\n", il);
+                    "(q8_0, mxfp4, nvfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
             return false;
         }
         const bool nvfp4 = l->ffn_gate_exps->type == DS4_TENSOR_NVFP4;
@@ -59295,8 +59289,16 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_Q8_0: rc = ds4_gpu_qwen4_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
-    case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q4_0:
+    case DS4_TENSOR_MXFP8: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_BF16: {
+        /* Past decode widths, the half tiles (one weight read per 32 rows),
+         * which round weights and x to halves as the Q8_0 prefill does. */
+        if (n_tok > 8u) {
+            rc = ds4_gpu_glm53_matmul_bf16(out, m->map, m->size, w->abs_offset, (uint32_t)in_dim, (uint32_t)out_dim,
+                                           x, n_tok);
+            break;
+        }
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
         const uint32_t types[1] = { w->type };
@@ -59764,10 +59766,8 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
-#ifndef DS4_HAS_QWEN4_METAL
 static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                   uint32_t T);
-#endif
 
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
@@ -59778,9 +59778,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
-#ifndef DS4_HAS_QWEN4_METAL
     if (l->ffn_gate_exps->type == DS4_TENSOR_NVFP4) return ok && qwen4_graph_moe_nvfp4(g, m, l, T);
-#endif
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -59917,16 +59915,20 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
-#ifndef DS4_HAS_QWEN4_METAL
-/* NVFP4 routed experts (NVIDIA's QAD checkpoint) on CUDA: kernels that
- * apply each expert's global scale, with qwen4_graph_moe's schedule (tiled
- * prefill GEMMs past 32 rows, the shared expert dense from 8 rows, as a
- * slot of the per-row kernels below). */
+/* NVFP4 routed experts (NVIDIA's QAD checkpoint): kernels that apply each
+ * expert's global scale, with qwen4_graph_moe's schedule (tiled prefill GEMMs
+ * past 32 rows, 64 on Metal; the shared expert dense from 8 rows, past 8 on
+ * Metal, as a slot of the per-row kernels below). */
 static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                   uint32_t T) {
     const uint64_t gs = l->ffn_gate_exps_s->abs_offset, us = l->ffn_up_exps_s->abs_offset;
     const uint64_t ds = l->ffn_down_exps_s->abs_offset;
-    if (qwen4_select_rows(T) > 32u) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const uint32_t mm_min = 64u, shared_min = 9u;
+#else
+    const uint32_t mm_min = 32u, shared_min = 8u;
+#endif
+    if (qwen4_select_rows(T) > mm_min) {
         return ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
                                                     DS4_N_EXPERT, g->cap_tokens) &&
                ds4_gpu_qwen4_moe_nvfp4_mm_mid_tensor(g->mid, g->mixed, g->selected, g->moe_lists, g->moe_counts,
@@ -59944,7 +59946,7 @@ static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
                                                g->inj, T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_EMBD,
                                                DS4_N_HC) != 0;
     }
-    const bool shared_dense = qwen4_select_rows(T) >= 8u;
+    const bool shared_dense = qwen4_select_rows(T) >= shared_min;
     if (shared_dense &&
         (!qwen4_gemv_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp, g->mixed, T) ||
          !ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) ||
@@ -59966,7 +59968,6 @@ static bool qwen4_graph_moe_nvfp4(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
                                            shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
                                            DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
 }
-#endif
 
 /* CUDA decode forwards read the PLE n-grams while layer 0 runs and stage
  * them in mapped memory for a kernel queued behind it, without the
