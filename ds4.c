@@ -59405,6 +59405,26 @@ static bool qwen4_graph_fused(const ds4_qwen4_gpu_graph *g, uint32_t T) {
     return T == 3u && g->verify_rows_exact;
 }
 
+/* MTP drafts only need their argmax: with a BF16, F16 or F32 output head
+ * they read a Q8_0 copy of it (ggml's Q8_0 rounding, made once per model on
+ * CUDA), half a BF16 head's bytes.  Verify rows and every logit the session
+ * commits or returns keep the stored head, so outputs do not change, only
+ * which drafts are proposed.  DS4_QWEN4_MTP_DRAFT_Q8=0 keeps the stored head
+ * for the drafts too. */
+static bool qwen4_draft_head_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                                  const ds4_gpu_tensor *x, uint32_t T, uint32_t rows) {
+#ifndef DS4_HAS_QWEN4_METAL
+    const char *env = getenv("DS4_QWEN4_MTP_DRAFT_Q8");
+    if ((!env || strcmp(env, "0") != 0) && w->ndim >= 2 && w->dim[0] <= UINT32_MAX && w->dim[1] <= UINT32_MAX &&
+        (w->type == DS4_TENSOR_BF16 || w->type == DS4_TENSOR_F16 || w->type == DS4_TENSOR_F32)) {
+        const int rc = ds4_gpu_qwen4_q8_copy_rows_tensor(out, m->map, m->size, w->abs_offset, w->type,
+                                                         (uint32_t)w->dim[0], (uint32_t)w->dim[1], rows, x, T);
+        if (rc != 0) return rc > 0;
+    }
+#endif
+    return qwen4_gemv_rows(out, m, w, x, T, rows);
+}
+
 static uint32_t qwen4_mtp_draft_rows(void) {
     /* read per cycle so the A/B harnesses can switch it per step */
     const char *env = getenv("DS4_QWEN4_MTP_DRAFT_ROWS");
@@ -60595,6 +60615,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
              (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head, (uint32_t)w->output->dim[0],
                                                                   head_rows, g->mixed) != 0
+              : gpu_argmax ? qwen4_draft_head_gemv(g->logits, m, w->output, g->mixed, 1, head_rows)
                        : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows));
     }
     g->R = R_save;
@@ -60688,7 +60709,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
         last = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
         g->R = last;
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
-             qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, chain_head_rows);
+             qwen4_draft_head_gemv(g->logits, m, w->output, g->mixed, 1, chain_head_rows);
     }
     g->R = R_save;
     if (ok) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, chain_head_rows) != 0;
@@ -81319,7 +81340,8 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                                     (uint32_t)count);
     g->R = R_save;
     g->mixed = mixed_save;
-    if (ok) ok = qwen4_gemv(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count);
+    if (ok) ok = qwen4_draft_head_gemv(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count,
+                                       (uint32_t)w->output->dim[1]);
 #ifdef DS4_HAS_QWEN4_METAL
     for (int i = 0; ok && i < count; i++) {
         ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
