@@ -395,8 +395,8 @@ python3 gguf-tools/qwen4_nvfp4_convert.py --src /path/to/Qwen3.8-Flash-Next-FP4-
 ```
 
 `--check LAYER...` compares every converted tensor with the template's values
-instead of writing (the experts of the listed layers). The output needs the
-CUDA backend: 76.75 GB of resident weights and 28.80 GB of disk-only n-grams.
+instead of writing (the experts of the listed layers). The output runs on
+CUDA and Metal: 76.75 GB of resident weights and 28.80 GB of disk-only n-grams.
 
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
