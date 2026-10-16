@@ -2727,6 +2727,58 @@ __device__ __forceinline__ void shared_rows(float &a, float &b, const char *r0, 
     }
 }
 
+/* mxfp8_rows over blocks b0..b0+NB-1 of two rows: each lane's NB code
+ * words of both rows are loaded together, and lane i < NB loads block i's
+ * scale word, which a shuffle hands to the lanes reading its bytes.  The
+ * products and their order are mxfp8_rows', so are the sums. */
+template<unsigned NB>
+__device__ __forceinline__ void mxfp8_pair_blocks(float &a, float &b, const char *r0, const char *r1,
+        const float *xt, unsigned b0) {
+    const unsigned lane = threadIdx.x & 31;
+    unsigned c0[NB], c1[NB], s0 = 0, s1 = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < NB; i++) {
+        c0[i] = *(const unsigned *)(r0 + (b0 + i) * 132 + 4 + 4 * lane);
+        c1[i] = *(const unsigned *)(r1 + (b0 + i) * 132 + 4 + 4 * lane);
+    }
+    if (lane < NB) {
+        s0 = *(const unsigned *)(r0 + (b0 + lane) * 132);
+        s1 = *(const unsigned *)(r1 + (b0 + lane) * 132);
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < NB; i++) {
+        const float4 v = *(const float4 *)(xt + (b0 + i) * 128 + 4 * lane);
+        const unsigned e0 = __shfl_sync(0xffffffffu, s0, i), e1 = __shfl_sync(0xffffffffu, s1, i);
+        const float4 w0 = e4m3x4(c0[i]);
+        float p = w0.x * v.x;
+        p += w0.y * v.y;
+        p += w0.z * v.z;
+        p += w0.w * v.w;
+        a += p * e8m0f((e0 >> 8 * (lane / 8)) & 255);
+        const float4 w1 = e4m3x4(c1[i]);
+        p = w1.x * v.x;
+        p += w1.y * v.y;
+        p += w1.z * v.z;
+        p += w1.w * v.w;
+        b += p * e8m0f((e1 >> 8 * (lane / 8)) & 255);
+    }
+}
+
+/* The shared expert's MXFP8 gate and up rows in loads of ten blocks (two
+ * at K = 2560, NBLK = K / 128 when known at compile time).  mxfp8_rows
+ * loads four blocks a round; five rounds queued behind the routed warps'
+ * loads made these warps the gate/up kernel's tail, 831 instead of 678 us
+ * per decode token for the whole kernel (RTX PRO 6000). */
+template<unsigned NBLK>
+__device__ __forceinline__ void mxfp8_pair_rows(float &a, float &b, const char *r0, const char *r1,
+        const float *xt, unsigned K) {
+    const unsigned nb = NBLK ? NBLK : K / 128;
+    unsigned b0 = 0;
+    #pragma unroll
+    for (; b0 + 10 <= nb; b0 += 10) mxfp8_pair_blocks<10>(a, b, r0, r1, xt, b0);
+    for (; b0 < nb; b0++) mxfp8_pair_blocks<1>(a, b, r0, r1, xt, b0);
+}
+
 /* ITER: K / 256 steps when known at compile time (the release shape), a
  * lane's code and scale words all loaded before the arithmetic (9% faster
  * per token than a loop over K); 0 loops over K.  With pd set, the
@@ -2753,7 +2805,8 @@ __global__ void moe_gate_up_nvfp4(float *out, const float *x, const int *selecte
     const float *xt = x + (uint64_t)t * K;
     float a = 0, b = 0, sa = 1, sb = 1;
     if (slot == NS) {
-        shared_rows(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, st, true);
+        if (st == 100) mxfp8_pair_rows<2 * ITER>(a, b, sh0 + row * srb, sh1 + row * srb, xt, K);
+        else shared_rows(a, b, sh0 + row * srb, sh1 + row * srb, xt, K, st, true);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
