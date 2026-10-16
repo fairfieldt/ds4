@@ -170,6 +170,7 @@ make tests/test_qwen4_ngram_state
 make -B -C gguf-tools quants-shared
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
+python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_nvfp4_convert.py
 ```
 
 On CUDA, use `make test-qwen4-cuda` for the kernel tests. They compare the
