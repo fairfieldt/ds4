@@ -2849,7 +2849,7 @@ static void test_gdn_front_exact(arena_t *a) {
         gdn_front_buffers(got, n, guard, hist0, state0);
         const int front = ds4_gpu_qwen4_gdn_proj_tensor(got[0], got[1], got[4], x, got[2], got[3], a->base, a->size,
             wqkv, wz, wconv[ci], wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E,
-            T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u);
+            T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u, 8u);
         require_ok(front == (abt == 0 || CK == 4 ? 1 : 0), "GDN front dispatch");
         if (!front)
             require_ok(ds4_gpu_qwen4_q8_pair_tensor(got[0], got[1], a->base, a->size, wqkv, wz, E, C, Mz, x, T) &&
@@ -2984,6 +2984,286 @@ static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t c
 }
 
 static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n);
+
+/* ---- NVIDIA's NVFP4 checkpoint: NVFP4 experts and MXFP8 projections ---- */
+
+static uint32_t urand(void) {
+    (void)frand();
+    return g_rng;
+}
+
+static double e4m3_host(uint8_t b) {
+    const int e = (b >> 3) & 15, m = b & 7;
+    const double v = e ? ldexp(8 + m, e - 10) : ldexp(m, -9);
+    return b & 128 ? -v : v;
+}
+
+/* GGML NVFP4 rows: blocks of 64 values, four E4M3 scales then 32 code
+ * bytes (byte j of a 16-value group holds values j and j + 8).  The shadow
+ * leaves out the expert's global scale.  A few scales are subnormal. */
+static uint64_t arena_nvfp4(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+    static const double values[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0.0, -.5, -1, -1.5, -2, -3, -4, -6};
+    const uint64_t blocks = cols / 64;
+    const uint64_t off = arena_alloc(a, rows * blocks * 36u);
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = a->base + off + (r * blocks + b) * 36u;
+            for (uint32_t g = 0; g < 4; g++) {
+                const uint32_t u = urand();
+                blk[g] = u % 23u == 0 ? (uint8_t)(1u + u % 7u) : (uint8_t)(0x20u + u % 0x30u);
+                const double sc = e4m3_host(blk[g]);
+                for (uint32_t j = 0; j < 8; j++) {
+                    const uint32_t q = urand(), lo = q & 15u, hi = (q >> 8) & 15u;
+                    blk[4 + g * 8 + j] = (uint8_t)(lo | (hi << 4));
+                    (*shadow)[r * cols + b * 64 + g * 16 + j] = sc * values[lo];
+                    (*shadow)[r * cols + b * 64 + g * 16 + j + 8] = sc * values[hi];
+                }
+            }
+        }
+    }
+    return off;
+}
+
+/* DS4 MXFP8 rows: blocks of 128 values, four UE8M0 scales then 128 E4M3 values. */
+static uint64_t arena_mxfp8(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+    const uint64_t blocks = cols / 128;
+    const uint64_t off = arena_alloc(a, rows * blocks * 132u);
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = a->base + off + (r * blocks + b) * 132u;
+            for (uint32_t s = 0; s < 4; s++) blk[s] = (uint8_t)(110u + urand() % 6u);
+            for (uint32_t j = 0; j < 128; j++) {
+                uint8_t v = (uint8_t)urand();
+                if ((v & 127u) == 127u) v ^= 1u;
+                blk[4 + j] = v;
+                (*shadow)[r * cols + b * 128 + j] = ldexp(e4m3_host(v), (int)blk[j / 32] - 127);
+            }
+        }
+    }
+    return off;
+}
+
+static void test_dense_mxfp8(arena_t *a, uint32_t K, uint32_t M, const uint32_t *Ts, uint32_t nT) {
+    double *sh;
+    const uint64_t off = arena_mxfp8(a, M, K, &sh);
+    for (uint32_t ti = 0; ti < nT; ti++) {
+        const uint32_t T = Ts[ti];
+        float *x = rand_vec((uint64_t)T * K, 1.0f);
+        double *ref = malloc((uint64_t)T * M * sizeof(double));
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t r = 0; r < M; r++) {
+                double acc = 0.0;
+                for (uint32_t k = 0; k < K; k++) acc += sh[(uint64_t)r * K + k] * x[(uint64_t)t * K + k];
+                ref[(uint64_t)t * M + r] = acc;
+            }
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *out = upload(NULL, (uint64_t)T * M);
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size, off, 100u, T, K, M), "MXFP8 dense_mm");
+        char what[96];
+        snprintf(what, sizeof(what), "MXFP8 dense K=%u M=%u T=%u", K, M, T);
+        check_tensor(what, out, ref, (uint64_t)T * M, T > 32 ? 1e-4 : 2e-5);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx); free(ref); free(x);
+    }
+    free(sh);
+}
+
+/* MXFP8 projections sharing an input take the multi-GEMV kernels: the
+ * single-warp rows match dense_mm byte for byte; the decode GDN front with
+ * MXFP8 qkv/gate matches the separate kernels byte for byte. */
+static void test_mxfp8_multi_gdn(arena_t *a) {
+    const unsigned K = 2560, M[] = {512, 1537, 6144, 64}, type[] = {100, 100, 100, 100};
+    uint64_t offsets[4];
+    for (unsigned i = 0; i < 4; i++) { double *sh; offsets[i] = arena_mxfp8(a, M[i], K, &sh); free(sh); }
+    for (unsigned T = 1; T <= 3; T++) {
+        float *input = rand_vec(T * K, .1f);
+        ds4_gpu_tensor *x = upload(input, T * K), *ref[4], *out[4];
+        for (unsigned i = 0; i < 4; i++) {
+            ref[i] = upload(NULL, T * M[i] + 16); out[i] = upload(NULL, T * M[i] + 16);
+            require_ok(ds4_gpu_tensor_fill_f32(ref[i], 17.25f, T * M[i] + 16) &&
+                ds4_gpu_tensor_fill_f32(out[i], 17.25f, T * M[i] + 16) &&
+                ds4_gpu_qwen4_dense_mm_tensor(ref[i], x, a->base, a->size, offsets[i], 100, T, K, M[i]),
+                "multi MXFP8 reference");
+        }
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x, T, K, 4, out, a->base, a->size, offsets, type, M),
+                   "multi MXFP8 fused");
+        for (unsigned i = 0; i < 4; i++) {
+            same_bytes("multi MXFP8 exact", i, ref[i], 0, out[i], 0, (T * M[i] + 16) * 4);
+            ds4_gpu_tensor_free(ref[i]); ds4_gpu_tensor_free(out[i]);
+        }
+        ds4_gpu_tensor_free(x); free(input);
+    }
+    puts("  multi MXFP8: narrow/wide projections at T=1/2/3 byte-exact with guards");
+
+    const uint32_t Hk = 16, Hv = 48, D = 128, E = 2560, C = (2 * Hk + Hv) * D, Mz = Hv * D, guard = 16;
+    const uint64_t ns = (uint64_t)Hv * D * D;
+    double *sh;
+    const uint64_t wqkv = arena_mxfp8(a, C, E, &sh); free(sh);
+    const uint64_t wz = arena_mxfp8(a, Mz, E, &sh); free(sh);
+    const uint64_t wal = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
+    const uint64_t wbe = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
+    const uint64_t wconv = arena_f32(a, (uint64_t)C * 4, &sh, -.5f, .5f); free(sh);
+    const uint64_t wA = arena_f32(a, Hv, &sh, -8.f, -.1f); free(sh);
+    const uint64_t wdt = arena_f32(a, Hv, &sh, .2f, 1.5f); free(sh);
+    float *state0 = rand_vec(ns, .1f), *hist0 = rand_vec((uint64_t)3 * C, 1.f);
+    const uint64_t woffs[2] = {wqkv, wz};
+    const uint32_t wtypes[2] = {100, 100}, wrows[2] = {C, Mz};
+    for (uint32_t T = 1; T <= 3; T++) {
+        const uint64_t nh = (uint64_t)3 * C;
+        float *mixed = rand_vec((uint64_t)T * E, .1f);
+        ds4_gpu_tensor *x = upload(mixed, (uint64_t)T * E);
+        const uint64_t n[11] = {(uint64_t)T * C, (uint64_t)T * Mz, (uint64_t)T * Hv, (uint64_t)T * Hv,
+                                nh, nh, nh, ns, ns, ns, (uint64_t)T * Mz};
+        ds4_gpu_tensor *ref[11], *got[11];
+        gdn_front_buffers(ref, n, guard, hist0, state0);
+        ds4_gpu_tensor *pair[2] = {ref[0], ref[1]};
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x, T, E, 2, pair, a->base, a->size, woffs, wtypes, wrows) &&
+            ds4_gpu_qwen4_gdn_front_tensor(ref[0], ref[4], x, ref[2], ref[3], a->base, a->size, wconv,
+                wal, wbe, wA, wdt, 0u, T, Hk, Hv, D, 4, E, T > 1 ? ref[5] : NULL, 0u,
+                T > 2 ? ref[6] : NULL, 1u) &&
+            ds4_gpu_qwen4_gdn_scan_tensor(ref[10], ref[7], ref[0], ref[2], ref[3], T, Hk, Hv, D,
+                T > 1 ? ref[8] : NULL, 0u, T > 2 ? ref[9] : NULL, 1u), "MXFP8 GDN front reference");
+        gdn_front_buffers(got, n, guard, hist0, state0);
+        require_ok(ds4_gpu_qwen4_gdn_proj_tensor(got[0], got[1], got[4], x, got[2], got[3], a->base, a->size,
+            wqkv, wz, wconv, wal, wbe, wA, wdt, 0u, T, Hk, Hv, D, 4, E,
+            T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u, 100u) == 1, "MXFP8 GDN front fused");
+        require_ok(ds4_gpu_qwen4_gdn_scan_tensor(got[10], got[7], got[0], got[2], got[3], T, Hk, Hv, D,
+            T > 1 ? got[8] : NULL, 0u, T > 2 ? got[9] : NULL, 1u), "MXFP8 GDN front scan");
+        char what[96];
+        for (unsigned i = 0; i < 11; i++) {
+            snprintf(what, sizeof(what), "MXFP8 GDN front T=%u buffer %u", T, i);
+            same_bytes(what, 0, ref[i], 0, got[i], 0, (n[i] + guard) * 4);
+            ds4_gpu_tensor_free(got[i]);
+            ds4_gpu_tensor_free(ref[i]);
+        }
+        ds4_gpu_tensor_free(x);
+        free(mixed);
+    }
+    free(state0); free(hist0);
+    puts("  MXFP8 GDN decode front: fused projections and conv byte-exact at T=1/2/3");
+}
+
+/* NVFP4 experts with per-expert global scales: the decode kernels (shared
+ * expert as a Q8_0 or MXFP8 slot, or none), the prefill tiles and the FP32
+ * fallback against a double reference of silu(sg g) (su u) and sd down. */
+static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
+                           uint32_t T, uint32_t shared_type, bool prefill) {
+    double *gate_w, *up_w, *down_w, *sg_w = NULL, *su_w = NULL, *sd_w = NULL;
+    const uint64_t gate_off = arena_nvfp4(a, (uint64_t)NE * F, E, &gate_w);
+    const uint64_t up_off = arena_nvfp4(a, (uint64_t)NE * F, E, &up_w);
+    const uint64_t down_off = arena_nvfp4(a, (uint64_t)NE * E, F, &down_w);
+    const uint64_t gs_off = arena_alloc(a, NE * 4u), us_off = arena_alloc(a, NE * 4u), ds_off = arena_alloc(a, NE * 4u);
+    float *gs = (float *)(a->base + gs_off), *us = (float *)(a->base + us_off), *ds = (float *)(a->base + ds_off);
+    for (uint32_t e = 0; e < NE; e++) {
+        gs[e] = 0.004f + 0.003f * (0.5f * frand() + 0.5f);
+        us[e] = e % 3u ? gs[e] : 0.004f + 0.003f * (0.5f * frand() + 0.5f);
+        ds[e] = 0.004f + 0.003f * (0.5f * frand() + 0.5f);
+    }
+    const bool has_shared = shared_type != UINT32_MAX;
+    uint64_t sg_off = 0, su_off = 0, sd_off = 0;
+    if (shared_type == 8u) {
+        sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
+        su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
+        sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
+    } else if (shared_type == 100u) {
+        sg_off = arena_mxfp8(a, F, E, &sg_w);
+        su_off = arena_mxfp8(a, F, E, &su_w);
+        sd_off = arena_mxfp8(a, E, F, &sd_w);
+    }
+    const uint32_t n_out = slots + (has_shared ? 1u : 0u);
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 7u + s * 3u + t / 5u) % NE);
+    double *mid = malloc((uint64_t)T * n_out * F * sizeof(double));
+    double *part = malloc((uint64_t)T * n_out * E * sizeof(double));
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t s = 0; s < n_out; s++) {
+            const bool shared = s == slots;
+            const uint32_t e = shared ? 0 : (uint32_t)sel[t * slots + s];
+            const double *gw = shared ? sg_w : gate_w + (uint64_t)e * F * E;
+            const double *uw = shared ? su_w : up_w + (uint64_t)e * F * E;
+            const double *dw = shared ? sd_w : down_w + (uint64_t)e * E * F;
+            const double ga = shared ? 1.0 : gs[e], gb = shared ? 1.0 : us[e], gd = shared ? 1.0 : ds[e];
+            for (uint32_t f = 0; f < F; f++) {
+                double g = 0.0, u = 0.0;
+                for (uint32_t i = 0; i < E; i++) {
+                    g += gw[(uint64_t)f * E + i] * x[t * E + i];
+                    u += uw[(uint64_t)f * E + i] * x[t * E + i];
+                }
+                mid[((uint64_t)t * n_out + s) * F + f] = silu_d(ga * g) * (gb * u);
+            }
+            for (uint32_t d = 0; d < E; d++) {
+                double acc = 0.0;
+                for (uint32_t f = 0; f < F; f++) acc += dw[(uint64_t)d * F + f] * mid[((uint64_t)t * n_out + s) * F + f];
+                part[((uint64_t)t * n_out + s) * E + d] = gd * acc;
+            }
+        }
+    }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "nvfp4 sel write");
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
+    ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
+    char name[128];
+    const char *sname = shared_type == 8u ? "q8_0" : shared_type == 100u ? "mxfp8" : "none";
+    require_ok(ds4_gpu_qwen4_moe_nvfp4_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, gs_off, us_off,
+                                                  NE, T, slots, E, F, sg_off, su_off, shared_type,
+                                                  sd_off, has_shared ? shared_type : UINT32_MAX), "nvfp4 mid");
+    require_ok(ds4_gpu_qwen4_moe_nvfp4_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, ds_off,
+                                                   NE, T, slots, F, E, sd_off, shared_type), "nvfp4 down");
+    snprintf(name, sizeof(name), "moe nvfp4 shared=%s T=%u: mid", sname, T);
+    check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);
+    snprintf(name, sizeof(name), "moe nvfp4 shared=%s T=%u: down", sname, T);
+    check_tensor(name, gpart, part, (uint64_t)T * n_out * E, 2e-5);
+    if (prefill && !has_shared) {
+        ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
+        ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
+        require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, T), "nvfp4 lists");
+        for (int quality = 0; quality < 2; quality++) {
+            ds4_gpu_set_quality(quality != 0);
+            require_ok(ds4_gpu_tensor_fill_f32(gmid, 0.0f, (uint64_t)T * n_out * F) &&
+                       ds4_gpu_tensor_fill_f32(gpart, 0.0f, (uint64_t)T * n_out * E), "nvfp4 mm clear");
+            require_ok(ds4_gpu_qwen4_moe_nvfp4_mm_mid_tensor(gmid, gx, gsel, glists, gcounts, a->base, a->size,
+                                                             gate_off, up_off, gs_off, us_off, NE, T, slots, E, F, T),
+                       "nvfp4 mm mid");
+            require_ok(ds4_gpu_qwen4_moe_nvfp4_mm_down_tensor(gpart, gmid, gsel, glists, gcounts, a->base, a->size,
+                                                              down_off, ds_off, NE, T, slots, F, E, T),
+                       "nvfp4 mm down");
+            snprintf(name, sizeof(name), "moe nvfp4 mm%s T=%u: mid", quality ? " fp32" : "", T);
+            check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, quality ? 2e-5 : 3e-3);
+            snprintf(name, sizeof(name), "moe nvfp4 mm%s T=%u: down", quality ? " fp32" : "", T);
+            check_tensor(name, gpart, part, (uint64_t)T * n_out * E, quality ? 2e-5 : 3e-3);
+        }
+        ds4_gpu_set_quality(false);
+        ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists);
+    }
+    ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
+    free(part); free(mid); free(sel); free(x);
+    free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
+}
+
+static void test_nvfp4_checkpoint_kernels(arena_t *a) {
+    printf("NVFP4 experts and MXFP8 projections\n");
+    const uint32_t dec[] = {1, 2, 3, 5, 8, 16, 31}, pre[] = {64, 300};
+    test_dense_mxfp8(a, 2560, 512, dec, 7);
+    test_dense_mxfp8(a, 2560, 6144, dec, 4);
+    test_dense_mxfp8(a, 6144, 2560, dec, 3);
+    test_dense_mxfp8(a, 640, 2560, dec, 4);
+    test_dense_mxfp8(a, 2560, 640, pre, 2);
+    test_dense_mxfp8(a, 640, 2560, pre, 1);
+    test_mxfp8_multi_gdn(a);
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 1, 100u, false);
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 2, 100u, false);
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 3, 8u, false);
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 9, UINT32_MAX, false);
+    test_moe_nvfp4(a, 8, 6, 2560, 640, 96, UINT32_MAX, true);
+    /* past 2047 rows: the wide tiles (matrix_half_wb), then matrix_half_ws */
+    test_moe_nvfp4(a, 64, 4, 512, 128, 2100, UINT32_MAX, true);
+    setenv("DS4_QWEN4_EXPERT_WB", "0", 1);
+    test_moe_nvfp4(a, 64, 4, 512, 128, 2100, UINT32_MAX, true);
+    unsetenv("DS4_QWEN4_EXPERT_WB");
+}
 
 /* The vector scorer must reproduce the scalar scorer bit for bit and emit
  * the selector's tile keys; the prefiltered decode select must reproduce
@@ -5963,7 +6243,7 @@ static void test_select_rows(arena_t *a) {
 
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)2048 << 20;
+    arena.size = (uint64_t)3072 << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -5974,6 +6254,7 @@ int main(void) {
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_GDN_FRONT")) { test_gdn_front_exact(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_NVFP4")) { test_nvfp4_checkpoint_kernels(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ROUTER")) { test_router_paths(&arena); return 0; }
@@ -6052,6 +6333,9 @@ int main(void) {
         bench_dispatch(&arena);
         return 0;
     }
+#ifndef __APPLE__
+    test_nvfp4_checkpoint_kernels(&arena);
+#endif
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();
