@@ -3332,6 +3332,8 @@ static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     test_moe_nvfp4(a, 8, 6, 2560, 640, 1, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 2, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 3, 8u, false);
+    /* 11 MXFP8 blocks a shared row: a ten-block load, then a one-block tail */
+    test_moe_nvfp4(a, 8, 6, 1408, 640, 2, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 9, UINT32_MAX, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 96, UINT32_MAX, true);
     /* past 2047 rows: the wide tiles (matrix_half_wb), then matrix_half_ws */
