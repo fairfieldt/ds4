@@ -3266,6 +3266,81 @@ static void test_moe_nvfp4(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
 }
 
+#ifndef __APPLE__
+/* ggml's FP32 -> FP16 (round to nearest even, subnormals included) */
+static uint16_t f32_to_f16_rne(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    u &= 0x7fffffffu;
+    if (u >= 0x47800000u) return (uint16_t)(sign | 0x7c00u);
+    if (u < 0x38800000u) {
+        float m;
+        memcpy(&m, &u, 4);
+        return (uint16_t)(sign | (uint32_t)rint((double)m * 16777216.0));
+    }
+    return (uint16_t)(sign | ((u + 0x0fffu + ((u >> 13) & 1u) - 0x38000000u) >> 13));
+}
+
+/* The Q8_0 copy of a BF16 output head for the MTP drafts: bytes equal to
+ * ggml's quantize_row_q8_0_ref (subnormal F16 scales included), and its
+ * GEMV equal to dense_mm on those bytes at T = 1..3. */
+static void test_q8_head_copy(arena_t *a) {
+    const uint32_t K = 2560, rows = 300, nb = K / 32;
+    double *sh;
+    const uint64_t off = arena_bf16(a, (uint64_t)rows * K, &sh, 0.05f);
+    uint16_t *w = (uint16_t *)(a->base + off);
+    for (uint64_t i = 0; i < (uint64_t)10 * K; i++) {          /* tiny rows: subnormal scales */
+        uint32_t u = (uint32_t)w[i] << 16;
+        float v;
+        memcpy(&v, &u, 4);
+        v = ldexpf(v, -12);
+        memcpy(&u, &v, 4);
+        w[i] = (uint16_t)(u >> 16);
+        sh[i] = v;
+    }
+    const uint64_t bytes = (uint64_t)rows * nb * 34;
+    uint8_t *ref = malloc(bytes), *got = malloc(bytes);
+    for (uint64_t blk = 0; blk < (uint64_t)rows * nb; blk++) {
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < 32; j++) amax = fmaxf(amax, fabsf((float)sh[blk * 32 + j]));
+        const float d = (float)((double)amax / 127.0);
+        const float id = d != 0.0f ? (float)(1.0 / (double)d) : 0.0f;
+        const uint16_t dh = f32_to_f16_rne(d);
+        memcpy(ref + blk * 34, &dh, 2);
+        for (uint32_t j = 0; j < 32; j++)
+            ref[blk * 34 + 2 + j] = (uint8_t)(int8_t)roundf((float)((double)(float)sh[blk * 32 + j] * (double)id));
+    }
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
+    require_ok(t && ds4_gpu_qwen4_quantize_q8_0_tensor(t, a->base, a->size, off, 30u, K, rows) == 1 &&
+               ds4_gpu_tensor_read(t, 0, got, bytes), "Q8_0 head quantize");
+    for (uint64_t i = 0; i < bytes; i++) {
+        if (got[i] != ref[i]) {
+            fprintf(stderr, "Q8_0 head copy: byte %llu (block %llu) got 0x%02x want 0x%02x\n",
+                    (unsigned long long)i, (unsigned long long)(i / 34), got[i], ref[i]);
+            exit(1);
+        }
+    }
+    const uint64_t qoff = arena_alloc(a, bytes);
+    memcpy(a->base + qoff, ref, bytes);
+    for (uint32_t T = 1; T <= 3; T++) {
+        for (uint32_t M = 200; M <= rows; M += rows - 200) {
+            float *x = rand_vec((uint64_t)T * K, 1.0f);
+            ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *o1 = upload(NULL, (uint64_t)T * M), *o2 = upload(NULL, (uint64_t)T * M);
+            require_ok(ds4_gpu_qwen4_q8_copy_rows_tensor(o1, a->base, a->size, off, 30u, K, rows, M, gx, T) == 1,
+                       "Q8_0 head copy rows");
+            require_ok(ds4_gpu_qwen4_dense_mm_tensor(o2, gx, a->base, a->size, qoff, 8u, T, K, M), "Q8_0 head reference");
+            same_bytes("Q8_0 head copy rows", T, o1, 0, o2, 0, (uint64_t)T * M * 4);
+            ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(o1); ds4_gpu_tensor_free(gx);
+            free(x);
+        }
+    }
+    ds4_gpu_tensor_free(t);
+    free(got); free(ref); free(sh);
+    puts("  Q8_0 head copy: ggml reference bytes, GEMV byte-exact against dense_mm at T=1/2/3");
+}
+#endif
+
 static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     printf("NVFP4 experts and MXFP8 projections\n");
     const uint32_t dec[] = {1, 2, 3, 5, 8, 16, 31}, pre[] = {64, 300};
@@ -3277,6 +3352,7 @@ static void test_nvfp4_checkpoint_kernels(arena_t *a) {
     test_dense_mxfp8(a, 640, 2560, pre, 1);
 #ifndef __APPLE__
     test_mxfp8_multi_gdn(a);
+    test_q8_head_copy(a);
 #endif
     test_moe_nvfp4(a, 8, 6, 2560, 640, 1, 100u, false);
     test_moe_nvfp4(a, 8, 6, 2560, 640, 2, 100u, false);

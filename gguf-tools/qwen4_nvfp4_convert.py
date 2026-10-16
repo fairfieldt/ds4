@@ -572,16 +572,19 @@ class Converter:
 
 
 def q8_0(v):
+    """GGML Q8_0 with ggml's reference rounding (quantize_row_q8_0_ref): d = amax / 127
+    stored as F16, q = roundf(x * (1 / d)) in float32, the same bytes as DS4's CUDA copy
+    of a BF16 head for the MTP drafts."""
     rows, k = v.shape
-    b = v.reshape(rows, k // 32, 32)
-    amax = np.abs(b).max(2)
-    d = (amax / 127).astype(np.float16)
-    df = d.astype(np.float32)
-    q = np.where(df[:, :, None] > 0, np.rint(b / np.where(df > 0, df, 1)[:, :, None]), 0)
-    q = np.clip(q, -127, 127).astype(np.int8)
+    b = v.reshape(rows, k // 32, 32).astype(np.float32)
+    d = (np.abs(b).max(2) / np.float32(127)).astype(np.float32)
+    inv = np.where(d > 0, np.float32(1) / np.where(d > 0, d, np.float32(1)), np.float32(0)).astype(np.float32)
+    x = b * inv[:, :, None]
+    q = np.trunc(x)
+    q += np.where(np.abs(x - q) >= np.float32(0.5), np.sign(x), np.float32(0))
     out = np.empty((rows, k // 32, 34), dtype=np.uint8)
-    out[:, :, :2] = d.view(np.uint8).reshape(rows, k // 32, 2)
-    out[:, :, 2:] = q.view(np.uint8)
+    out[:, :, :2] = d.astype(np.float16).view(np.uint8).reshape(rows, k // 32, 2)
+    out[:, :, 2:] = q.astype(np.int8).view(np.uint8)
     return out.tobytes()
 
 
