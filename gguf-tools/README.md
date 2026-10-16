@@ -372,6 +372,32 @@ projections, kept at the released BF16 by default), `--no-mtp` and
 `--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
 N-grams always retain the original BF16 bytes. The converter finishes through
 the native packer above; its temporary main-weight file is removed on success.
+### NVIDIA's NVFP4 checkpoint
+
+`qwen4_nvfp4_convert.py` converts NVIDIA's quantization-aware-distilled
+`nvidia/Qwen3.8-Flash-Next-FP4-Local` (ModelOpt mixed precision) without
+requantizing any weight. The routed experts keep their NVFP4 values as GGML
+NVFP4 blocks (type 40), with each expert's FP32 global scale in a
+`blk.N.ffn_{gate,up,down}_exps.scale` tensor; their compressed block scales
+are decoded exactly. The MXFP8 projections become DS4's MXFP8 type (type 100:
+per 128 values four UE8M0 scales, then the E4M3 values); `--dense bf16`
+widens them to exact BF16 instead. The n-gram table keeps its NVFP4 rows
+(90 bytes per 160 values, `qwen4exp.ple.ngram_encoding` `nvfp4_e4m3x16`).
+The output head stays BF16 (`--output q8_0` quantizes it). An existing
+qwen4exp GGUF with MTP supplies the metadata, tokenizer and tensor order; none
+of its weights are used. Only NumPy is needed:
+
+```sh
+python3 gguf-tools/qwen4_nvfp4_convert.py --src /path/to/Qwen3.8-Flash-Next-FP4-Local \
+  --template gguf/Qwen3.8-Flash-Next-Q4.gguf \
+  --source-revision b9ce18a6887e18c089fdea8509a33e63429a3300 \
+  --out gguf/Qwen3.8-Flash-Next-NVFP4-QAD.gguf
+```
+
+`--check LAYER...` compares every converted tensor with the template's values
+instead of writing (the experts of the listed layers). The output holds
+76.75 GB of resident weights and 28.80 GB of disk-only n-grams.
+
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
 
