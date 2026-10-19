@@ -66,3 +66,46 @@ With 0.24 ms misses, the extra VRAM slots that would fit are worth about 1 ms pe
 V4.1 general-100 fixture, 4K context, host tier ([`general-100.tsv`](general-100.tsv)): NLL 0.392, first-token match 80/100, API top-1 2,689/2,994. The fixture's continuations came from the API on 2026-09-10, before DeepSeek released the 1017 checkpoint, so this is a cross-checkpoint score. The earlier Q2's band on a Spark is NLL 0.363 and 2,696/2,994.
 
 The V4.1 CUDA tests pass on sm_120: `test_deepseek41_cuda` (and `--attention-output-large`), `test_cuda_q8_rows`, `test_cuda_ssd_cache` (also under Compute Sanitizer and with `--prefetch-exit`), `test_cuda_ssd_batch`.
+
+## Roofline
+
+Measured ceilings on this machine: GPU DRAM 1,646 GB/s, host-to-device copies 44 GB/s (the speed of the DDR5-3600 host memory, four 48 GB DIMMs), INT8 tensor cores 1,020 TOPS, FP16 523 TFLOPS, NVMe 7.1 GB/s.
+
+| | Q2 (this file) | 1017 MXFP4 (native precision) |
+|---|---:|---:|
+| Decode reads per token | 11.1 GB | 13.2 GB |
+| Routed experts | 142.4 GiB | 268.9 GiB |
+| Decode floor, every expert in VRAM | 6.8 ms (148 t/s) | 8.1 ms (124 t/s) |
+| Prefill matmul work per token | 30.9 GFLOP | 30.9 GFLOP |
+
+With the 60 GiB VRAM expert cache, decode also pays 2 to 7 ms per token in cache misses (0.24 ms each over PCIe), so its practical floor is about 9 to 10 ms. A prefill sweep copies every routed expert not in VRAM once, about 2 to 3.5 s.
+
+## October 19 series
+
+Eight changes, each measured ABBA against its predecessor and kept only if the frontier logits stayed byte-identical:
+
+| Change | Effect |
+|---|---|
+| Read-ahead copies from the host tier in 8 MiB pieces | prefill +1.6..3.6% |
+| Queue decode layers instead of draining the GPU per layer | decode +0.7% |
+| IQ2_XXS decode gate/up, one warp per row (3.20 -> 1.33 ms/token) | decode +8..9% |
+| Prefill sweeps keep what was cached before them | turns: prefill +24%, decode +11% |
+| F16 projection rows in one cuBLASLt batch | prefill +6.5% (8K), +14.7% (32K) |
+| RMS norm inputs held in registers | decode +4.6..5.6% |
+| Indexer scores, one thread per score for large grids | prefill +7.5% (32K) |
+| Exact Q8 MMA prefill kernel, two token groups per warp | prefill +4.2% (32K) |
+
+Main against the series, ABBA in one session ([`series-abba.csv`](series-abba.csv)); "turns" is five 2K appends with 64 decode tokens after each:
+
+| Workload | Prefill, main | Series | Decode, main | Series |
+|---|---:|---:|---:|---:|
+| 2K prompt, 128 tokens | 523 t/s | 531 t/s | 45.5 t/s | 52.2 t/s (+14.6%) |
+| 8K prompt, 128 tokens | 1,396 t/s | 1,625 t/s (+16.4%) | 45.9 t/s | 52.8 t/s (+14.9%) |
+| Turns | 577 t/s | 771 t/s (+33.7%) | 42.3 t/s | 52.8 t/s (+24.8%) |
+| 32K prompt, 32 tokens | 2,296 t/s | 2,922 t/s (+27.3%) | 38.1 t/s | 42.5 t/s (+11.8%) |
+
+The general-100 scores are byte-identical to main's. Bit-for-bit tests: `test_cuda_moe_decode_gate`, `test_cuda_v41_projection_rows`, `test_cuda_norm_reg`, `test_cuda_v41_index_scores`, `test_cuda_q8_mma_groups`.
+
+Measured and dropped: a warp-per-row Q2_K down-sum kernel (-0.6%); prefetching the next layer's experts from its router applied to the current layer's input (43% of misses predicted, 65% of guesses already cached); CUDA graphs for the position-independent parts of each streaming decode layer (-1.2..1.4%); four token groups per warp in the exact Q8 kernel (162 registers, slower). Plain cuBLAS strided or pointer batching does not reproduce one-row results, nor can cuBLASLt batch the 5120 -> 32 indexer projection, which stays one call per row.
+
+Left at 32K, from nsys: the exact attention-output kernel (about 2 s, bound by per-block float work rather than its tensor-core products), the routed MoE GEMMs and their per-sweep repacks (about 3 s), per-row indexer projections and cuBLASLt's per-row split-K reductions (about 1 s plus host overhead), and read-ahead copies not hidden by compute (about 2 s). Decode spends about 5.8 ms per token in small kernels and 3 to 7 ms in cache misses.
