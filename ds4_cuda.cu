@@ -29578,11 +29578,17 @@ static void *cuda_stream_prefetch_read(void *) {
     const uint64_t chunk = UINT64_C(8) << 20;
     for (const auto &copy : p.copies) {
         if (const char *host = cuda_ssd_host_lookup(p.table.model_map, copy.offset, copy.bytes)) {
-            if (p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
-            p.ok = cudaMemcpyAsync(copy.destination, host, copy.bytes,
-                cudaMemcpyHostToDevice, p.stream) == cudaSuccess;
+            /* Chunked like the file path: a small synchronous copy on another
+             * stream waits for the copy in flight, not a whole merged tensor. */
+            for (uint64_t offset = 0; offset < copy.bytes; offset += chunk) {
+                if (p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
+                const uint64_t bytes = std::min(chunk, copy.bytes - offset);
+                p.ok = cudaMemcpyAsync(copy.destination + offset, host + offset, bytes,
+                    cudaMemcpyHostToDevice, p.stream) == cudaSuccess;
+                if (!p.ok) break;
+                p.bytes += bytes;
+            }
             if (!p.ok) break;
-            p.bytes += copy.bytes;
             continue;
         }
         for (uint64_t offset = 0; p.ok && offset < copy.bytes; offset += chunk) {
