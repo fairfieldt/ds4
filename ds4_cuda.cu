@@ -7333,6 +7333,143 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
     }
 }
 
+/* matmul_q8_0_mma_exact_kernel<32> with G 16-token groups per warp instead
+ * of one. Every output keeps that kernel's arithmetic: per slot the same
+ * strided block walk and term expression, the same bit-reversed adjacent
+ * stack and the final add, so the bits match. One weight fragment and its
+ * scales now feed G tensor-core products instead of one. */
+template <uint32_t G>
+__global__ static void __launch_bounds__(256) matmul_q8_0_mma_exact32_g_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks,
+        uint64_t w_stride_blocks,
+        uint64_t a_stride_blocks,
+        uint64_t out_stride) {
+    constexpr uint32_t TOK = 16u * G;
+    w += (uint64_t)blockIdx.z * out_dim * w_stride_blocks * 34u;
+    xq += (uint64_t)blockIdx.z * blocks * 32u;
+    xscale += (uint64_t)blockIdx.z * blocks;
+    out += (uint64_t)blockIdx.z * out_dim;
+    extern __shared__ unsigned char q8mma_sh[];
+    const uint32_t ws_pitch = (uint32_t)blocks + 2u;
+    const uint32_t xs_pitch = (uint32_t)blocks + 1u;
+    __half *sh_ws = (__half *)q8mma_sh;
+    float *sh_xs = (float *)(q8mma_sh + 64u * ws_pitch * sizeof(__half));
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const bool grouped = in_dim >= 4096u && out_dim >= 4096u && n_tok >= 128u;
+    const uint64_t row_base = (grouped ? (uint64_t)blockIdx.y * 8u + blockIdx.x % 8u : blockIdx.x) * 64u;
+    const uint64_t tok_base = (grouped ? blockIdx.x / 8u : blockIdx.y) * TOK;
+    if (row_base >= out_dim) return;
+    for (uint32_t idx = threadIdx.x; idx < 64u * (uint32_t)blocks; idx += blockDim.x) {
+        const uint32_t rl = idx / (uint32_t)blocks;
+        const uint32_t b = idx - rl * (uint32_t)blocks;
+        uint64_t row = row_base + rl;
+        if (row >= out_dim) row = out_dim - 1u;
+        sh_ws[rl * ws_pitch + b] = *(const __half *)(w + row * w_stride_blocks * 34u + (uint64_t)b * 34u);
+    }
+    for (uint32_t idx = threadIdx.x; idx < TOK * (uint32_t)blocks; idx += blockDim.x) {
+        const uint32_t tl = idx / (uint32_t)blocks;
+        const uint32_t b = idx - tl * (uint32_t)blocks;
+        const uint64_t tok = tok_base + tl;
+        sh_xs[tl * xs_pitch + b] = tok < n_tok ? xscale[tok * a_stride_blocks + b] : 0.0f;
+    }
+    __syncthreads();
+    const uint64_t row0 = row_base + (uint64_t)warp * 8u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const uint32_t mt0 = lane >> 2u;
+    const int8_t *aq_lo[G], *aq_hi[G];
+    bool a_lo_ok[G], a_hi_ok[G];
+#pragma unroll
+    for (uint32_t g = 0; g < G; g++) {
+        const uint64_t lo = tok_base + 16u * g + (lane >> 2u), hi = lo + 8u;
+        a_lo_ok[g] = lo < n_tok;
+        a_hi_ok[g] = hi < n_tok;
+        aq_lo[g] = xq + (a_lo_ok[g] ? lo : 0u) * a_stride_blocks * 32u;
+        aq_hi[g] = xq + (a_hi_ok[g] ? hi : 0u) * a_stride_blocks * 32u;
+    }
+    uint64_t b_row = row0 + (lane >> 2u);
+    if (b_row >= out_dim) b_row = out_dim - 1u;
+    const unsigned char *b_wr = w + b_row * w_stride_blocks * 34u;
+    const uint32_t rl_ws0 = warp * 8u + n0;
+    float acc[G][4], s0[G][4], s1[G][4], s2[G][4], s3[G][4], s4[G][4];
+#pragma unroll
+    for (uint32_t g = 0; g < G; g++)
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) acc[g][e] = s0[g][e] = s1[g][e] = s2[g][e] = s3[g][e] = s4[g][e] = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < 32u; i++) {
+        const uint32_t slot = bitrev5(i);
+        float t[G][4];
+#pragma unroll
+        for (uint32_t g = 0; g < G; g++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) t[g][e] = 0.0f;
+        for (uint32_t b = slot; b < blocks; b += 32u) {
+            const uint32_t koff = (lane & 3u) * 4u;
+            const uint8_t *bq = (const uint8_t *)(b_wr + (uint64_t)b * 34u + 2u);
+            const uint32_t b0 = ldu32_unaligned(bq + koff);
+            const uint32_t b1 = ldu32_unaligned(bq + 16u + koff);
+            const float ws0 = __half2float(sh_ws[rl_ws0 * ws_pitch + b]);
+            const float ws1 = __half2float(sh_ws[(rl_ws0 + 1u) * ws_pitch + b]);
+#pragma unroll
+            for (uint32_t g = 0; g < G; g++) {
+                const int8_t *ablk_lo = aq_lo[g] + b * 32u;
+                const int8_t *ablk_hi = aq_hi[g] + b * 32u;
+                const uint32_t a0 = a_lo_ok[g] ? *(const uint32_t *)(ablk_lo + koff) : 0u;
+                const uint32_t a1 = a_hi_ok[g] ? *(const uint32_t *)(ablk_hi + koff) : 0u;
+                const uint32_t a2 = a_lo_ok[g] ? *(const uint32_t *)(ablk_lo + 16u + koff) : 0u;
+                const uint32_t a3 = a_hi_ok[g] ? *(const uint32_t *)(ablk_hi + 16u + koff) : 0u;
+                int32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+                const float xsA = sh_xs[(16u * g + mt0) * xs_pitch + b];
+                const float xsB = sh_xs[(16u * g + mt0 + 8u) * xs_pitch + b];
+                t[g][0] += ws0 * xsA * (float)c0;
+                t[g][1] += ws1 * xsA * (float)c1;
+                t[g][2] += ws0 * xsB * (float)c2;
+                t[g][3] += ws1 * xsB * (float)c3;
+            }
+        }
+#pragma unroll
+        for (uint32_t g = 0; g < G; g++) {
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) {
+                float v = t[g][e];
+                if ((i & 1u) == 0u) { s0[g][e] = v; continue; }
+                v = s0[g][e] + v;
+                if ((i & 2u) == 0u) { s1[g][e] = v; continue; }
+                v = s1[g][e] + v;
+                if ((i & 4u) == 0u) { s2[g][e] = v; continue; }
+                v = s2[g][e] + v;
+                if ((i & 8u) == 0u) { s3[g][e] = v; continue; }
+                v = s3[g][e] + v;
+                if ((i & 16u) == 0u) { s4[g][e] = v; continue; }
+                v = s4[g][e] + v;
+                acc[g][e] += v;
+            }
+        }
+    }
+    const uint64_t rowa = row0 + n0, rowb = rowa + 1u;
+#pragma unroll
+    for (uint32_t g = 0; g < G; g++) {
+        const uint64_t tokA = tok_base + 16u * g + mt0, tokB = tokA + 8u;
+        if (tokA < n_tok) {
+            if (rowa < out_dim) out[tokA * out_stride + rowa] = acc[g][0];
+            if (rowb < out_dim) out[tokA * out_stride + rowb] = acc[g][1];
+        }
+        if (tokB < n_tok) {
+            if (rowa < out_dim) out[tokB * out_stride + rowa] = acc[g][2];
+            if (rowb < out_dim) out[tokB * out_stride + rowb] = acc[g][3];
+        }
+    }
+}
+
 static int cuda_q4_mma_ok(void) {
     /* All tiers on this host use the same cubin/PTX and GPU model. */
     static int cached = -1;
@@ -7379,6 +7516,40 @@ static int cuda_q8_mma_try_launch(
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= DS4_MAX_GPUS) return 0;
+    /* T == 32 with enough tokens: several token groups per warp. */
+    const char *g_env = getenv("DS4_CUDA_Q8_MMA_G");
+    /* Four groups need 162 registers, one block per SM, and run slower. */
+    const uint32_t g_max = getenv("DS4_CUDA_Q8_MMA_G1") ? 1u : g_env ? (uint32_t)atoi(g_env) : 2u;
+    const uint32_t g_tok = T != 32u ? 1u : g_max >= 4u && n_tok >= 64u ? 4u :
+        g_max >= 2u && n_tok >= 32u ? 2u : 1u;
+    if (g_tok > 1u) {
+        static int g_attr_ready[DS4_MAX_GPUS][2];
+        const int gi = g_tok == 4u ? 1 : 0;
+        const uint32_t tok_tile = 16u * g_tok;
+        const size_t gshmem = (size_t)(64u * (blocks + 2u) * 2u + tok_tile * (blocks + 1u) * 4u);
+        dim3 ggrid(((unsigned)out_dim + 63u) / 64u, ((unsigned)n_tok + tok_tile - 1u) / tok_tile, 1);
+        if (in_dim >= 4096u && out_dim >= 4096u && n_tok >= 128u)
+            ggrid = dim3(((unsigned)n_tok + tok_tile - 1u) / tok_tile * 8u,
+                         (((unsigned)out_dim + 63u) / 64u + 7u) / 8u, 1);
+        ggrid.z = groups;
+        if (!g_attr_ready[dev][gi]) {
+            const int max_shmem = (int)(64u * 258u * 2u + 64u * 257u * 4u);
+            const cudaError_t aerr = g_tok == 4u ?
+                cudaFuncSetAttribute(matmul_q8_0_mma_exact32_g_kernel<4>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem) :
+                cudaFuncSetAttribute(matmul_q8_0_mma_exact32_g_kernel<2>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem);
+            if (aerr != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+            g_attr_ready[dev][gi] = 1;
+        }
+        if (g_tok == 4u)
+            matmul_q8_0_mma_exact32_g_kernel<4><<<ggrid, 256, gshmem>>>(
+                out, w, xq, xscale, in_dim, out_dim, n_tok, blocks, w_stride_blocks, a_stride_blocks, out_stride);
+        else
+            matmul_q8_0_mma_exact32_g_kernel<2><<<ggrid, 256, gshmem>>>(
+                out, w, xq, xscale, in_dim, out_dim, n_tok, blocks, w_stride_blocks, a_stride_blocks, out_stride);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 mma group launch") ? 1 : -1;
+    }
     const int ti = T == 32u ? 0 : (T == 64u ? 1 : (T == 128u ? 2 : 3));
     dim3 grid(((unsigned)out_dim + 63u) / 64u, ((unsigned)n_tok + 15u) / 16u, 1);
     /* Keep eight adjacent weight tiles hot while visiting the token tiles.
