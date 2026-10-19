@@ -183,6 +183,10 @@ static uint32_t g_stream_expert_budget;
 static uint64_t g_stream_expert_bytes;
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
+    /* Loaded or hit by a decode step since it was loaded. */
+    bool decode = false;
+    /* Clock when the expert was loaded. */
+    uint64_t loaded = 0;
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
 static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
@@ -29483,6 +29487,33 @@ static bool cuda_ssd_stats_enabled(void) {
     return g_ssd_stats_on || g_ssd_trace;
 }
 
+/* Prefill sweeps read every expert of every layer, which a cache smaller
+ * than the model cannot hold, so under plain LRU each sweep evicts all that
+ * the previous sweep and decode left. Prefill loads and read-ahead evict only
+ * empty slots, the last two layers' worth of slots, and slots this sweep
+ * loaded that no decode step used. A first sweep is plain LRU; later sweeps
+ * keep everything cached before them, which both decode and prefill hit. */
+static uint64_t g_stream_sweep_start = 0;
+static uint32_t g_stream_sweep_layer = UINT32_MAX;
+
+static void cuda_stream_note_prefill_layer(uint32_t layer) {
+    if (g_stream_sweep_layer == UINT32_MAX || layer < g_stream_sweep_layer)
+        g_stream_sweep_start = g_stream_expert_clock + 1u;
+    g_stream_sweep_layer = layer;
+}
+
+static bool cuda_stream_prefill_may_evict(uint32_t slot, uint32_t n_total_expert) {
+    static const bool all = getenv("DS4_CUDA_SSD_PREFILL_EVICTS_ALL") != NULL;
+    const auto &x = g_stream_expert_slots[slot];
+    const size_t n = g_stream_expert_slots.size(), staging = 2u * (size_t)n_total_expert;
+    return all || n < 2u * staging || !x.used || slot >= n - staging ||
+        (!x.decode && x.loaded >= g_stream_sweep_start);
+}
+
+static bool cuda_stream_older(uint32_t a, uint32_t b) {
+    return g_stream_expert_slots[a].used < g_stream_expert_slots[b].used;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -29580,6 +29611,7 @@ static int cuda_stream_selected_cache_begin_load(
             for (auto &slot : g_stream_expert_slots) slot.used = 0;
             g_stream_expert_clock = 1;
         }
+        if (slot_count > 64u) cuda_stream_note_prefill_layer(table->layer);
         const uint64_t stamp = ++g_stream_expert_clock;
         std::vector<int32_t> slots(unique.size(), -1);
         /* Protect every hit first: a miss must not evict a later request's hit. */
@@ -29597,6 +29629,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
+            if (slot_count <= 64u) slot.decode = true;
         }
         if (stats) {
             uint64_t hits = 0;
@@ -29612,16 +29645,36 @@ static int cuda_stream_selected_cache_begin_load(
             }
         }
         cuda_stream_upload_batch uploads;
+        /* Prefill victims, oldest first, from the slots it may evict. */
+        const bool prefill_load = slot_count > 64u;
+        std::vector<uint32_t> prefill_victims;
+        size_t next_prefill_victim = 0;
+        if (prefill_load) {
+            for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                const auto &slot = g_stream_expert_slots[j];
+                if (slot.used < stamp && !cuda_stream_prefetch_protects(slot) &&
+                    cuda_stream_prefill_may_evict(j, table->n_total_expert))
+                    prefill_victims.push_back(j);
+            }
+            std::stable_sort(prefill_victims.begin(), prefill_victims.end(), cuda_stream_older);
+        }
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
-            uint64_t oldest = stamp;
-            for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
-                if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
-                    g_stream_expert_slots[j].used < oldest) {
-                    oldest = g_stream_expert_slots[j].used;
-                    victim = j;
-                    if (!oldest) break;
+            while (prefill_load && next_prefill_victim < prefill_victims.size()) {
+                const uint32_t j = prefill_victims[next_prefill_victim++];
+                if (g_stream_expert_slots[j].used < stamp) { victim = j; break; }
+            }
+            if (victim == UINT32_MAX) {
+                /* Decode, or a prefill whose slots are all in use. */
+                uint64_t oldest = stamp;
+                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                    if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
+                        g_stream_expert_slots[j].used < oldest) {
+                        oldest = g_stream_expert_slots[j].used;
+                        victim = j;
+                        if (!oldest) break;
+                    }
                 }
             }
             if (victim == UINT32_MAX) return 0;
@@ -29643,7 +29696,7 @@ static int cuda_stream_selected_cache_begin_load(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
                     table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
                 return 0;
-            slot = {gate, up, down, stamp};
+            slot = {gate, up, down, stamp, slot_count <= 64u, stamp};
             g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
@@ -29797,6 +29850,7 @@ extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel) {
                  * hit promotes these slots, so unused reads cannot displace
                  * the experts that should stay hot for following decode. */
                 slot.used = 1;
+                slot.loaded = std::max(g_stream_expert_clock, g_stream_sweep_start);
             } catch (...) {
                 /* A failed optional index insertion remains an ordinary miss. */
             }
@@ -29857,6 +29911,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
             if (atexit(cuda_stream_prefetch_exit) != 0) return 0;
             exit_registered = true;
         }
+        cuda_stream_note_prefill_layer(current->layer);
         p.table = *next;
         p.cancel.store(false, std::memory_order_relaxed);
         p.bytes = 0;
@@ -29881,12 +29936,11 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
         std::vector<uint32_t> victims;
         for (uint32_t i = 0; i < g_stream_expert_slots.size(); i++) {
             const auto &slot = g_stream_expert_slots[i];
-            if (!cuda_stream_slot_in_table(slot, *current) && !cuda_stream_slot_in_table(slot, *next))
+            if (!cuda_stream_slot_in_table(slot, *current) && !cuda_stream_slot_in_table(slot, *next) &&
+                cuda_stream_prefill_may_evict(i, next->n_total_expert))
                 victims.push_back(i);
         }
-        std::stable_sort(victims.begin(), victims.end(), [](uint32_t a, uint32_t b) {
-            return g_stream_expert_slots[a].used < g_stream_expert_slots[b].used;
-        });
+        std::stable_sort(victims.begin(), victims.end(), cuda_stream_older);
         p.slots.reserve(next->n_total_expert);
         p.copies.reserve(3u * next->n_total_expert);
         for (uint32_t expert = 0; expert < next->n_total_expert; expert++) {
