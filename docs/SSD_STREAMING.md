@@ -73,6 +73,26 @@ Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
 
+## Discrete CUDA GPUs
+
+With DeepSeek V4.1 on a discrete NVIDIA GPU, the expert cache is in VRAM.
+A host with more free RAM than the routed experts can keep them pinned, so a
+cache miss copies from RAM instead of reading the SSD:
+
+```sh
+DS4_CUDA_SSD_HOST_GB=auto ./ds4 --cuda --ssd-streaming \
+  -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf
+```
+
+`auto` pins whole layers while 16 GiB of RAM stay available. A number caps
+the pinned GiB instead. Q2's routed experts take 142.4 GiB. Other programs
+cannot use that memory while DwarfStar runs. Startup reads the experts first:
+about 30 seconds cold, 11 to 16 seconds when the files are already cached.
+
+On an RTX PRO 6000 (96 GB) with 192 GB of RAM, a 2K-token prefill went from
+75 to 510 t/s and decode from 21 to 48 t/s. See the
+[measurements](../speed-bench/ds41-cuda-6000/README.md).
+
 ## M5 Max measurements
 
 On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:
