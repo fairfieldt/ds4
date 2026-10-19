@@ -2385,6 +2385,138 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     return 1;
 }
 
+/* Routed expert tensors pinned in host RAM for CUDA SSD streaming on a
+ * discrete GPU. The pinned pages are the model map's own page-cache pages,
+ * so an expert cache miss inside them is one DMA copy instead of a file read. */
+struct cuda_ssd_host_span {
+    uint64_t off, bytes;
+    bool owned;
+};
+static std::vector<cuda_ssd_host_span> g_ssd_host_spans;
+static const void *g_ssd_host_map;
+
+static const char *cuda_ssd_host_lookup(const void *model_map, uint64_t off, uint64_t bytes) {
+    if (!g_ssd_host_map || model_map != g_ssd_host_map) return NULL;
+    const auto it = std::upper_bound(g_ssd_host_spans.begin(), g_ssd_host_spans.end(), off,
+        [](uint64_t o, const cuda_ssd_host_span &s) { return o < s.off; });
+    if (it == g_ssd_host_spans.begin()) return NULL;
+    const cuda_ssd_host_span &s = *(it - 1);
+    const uint64_t delta = off - s.off;
+    if (delta > s.bytes || bytes > s.bytes - delta) return NULL;
+    return (const char *)model_map + off;
+}
+
+struct cuda_ssd_host_reader {
+    int fd;
+    const std::vector<cuda_ssd_host_span> *chunks;
+    std::atomic<size_t> *next;
+    std::atomic<bool> *failed;
+    std::atomic<int> *error;
+};
+
+static void *cuda_ssd_host_read_chunks(void *arg) {
+    const cuda_ssd_host_reader *r = (const cuda_ssd_host_reader *)arg;
+    const uint64_t buf_bytes = UINT64_C(16) << 20;
+    void *buf = malloc((size_t)buf_bytes);
+    if (!buf) { r->error->store(ENOMEM); r->failed->store(true); return NULL; }
+    for (;;) {
+        const size_t i = r->next->fetch_add(1);
+        if (i >= r->chunks->size() || r->failed->load()) break;
+        const cuda_ssd_host_span &c = (*r->chunks)[i];
+        for (uint64_t done = 0; done < c.bytes; done += buf_bytes) {
+            const uint64_t n = std::min(buf_bytes, c.bytes - done);
+            if (!cuda_pread_full(r->fd, buf, n, c.off + done)) {
+                r->error->store(errno);
+                r->failed->store(true);
+                break;
+            }
+        }
+    }
+    free(buf);
+    return NULL;
+}
+
+/* Unpin before the model map goes away. Copies from it must have finished. */
+extern "C" void ds4_gpu_stream_expert_host_release(void) {
+    if (!g_ssd_host_map) return;
+    ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    if (g_stream_selected_upload_stream)
+        (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    for (const cuda_ssd_host_span &s : g_ssd_host_spans)
+        if (s.owned) (void)cudaHostUnregister((char *)g_ssd_host_map + s.off);
+    (void)cudaGetLastError();
+    g_ssd_host_spans.clear();
+    g_ssd_host_map = NULL;
+}
+
+/* Read the spans into the page cache with parallel readers, then pin them.
+ * Spans must be page aligned and must not overlap. Returns pinned bytes. */
+extern "C" uint64_t ds4_gpu_stream_expert_host_pin(const void *model_map, uint64_t model_size,
+                                                   const uint64_t *offsets, const uint64_t *sizes,
+                                                   uint32_t n_spans) {
+    if (!model_map || !offsets || !sizes || !n_spans || g_model_fd < 0 || g_ssd_host_map) return 0;
+    const double t0 = cuda_wall_sec();
+    std::vector<cuda_ssd_host_span> spans, chunks;
+    for (uint32_t i = 0; i < n_spans; i++) {
+        if (!sizes[i] || offsets[i] > model_size || sizes[i] > model_size - offsets[i]) return 0;
+        spans.push_back({offsets[i], sizes[i], true});
+        const uint64_t chunk = UINT64_C(64) << 20;
+        for (uint64_t done = 0; done < sizes[i]; done += chunk)
+            chunks.push_back({offsets[i] + done, std::min(chunk, sizes[i] - done), false});
+    }
+    std::sort(spans.begin(), spans.end(),
+              [](const cuda_ssd_host_span &a, const cuda_ssd_host_span &b) { return a.off < b.off; });
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::atomic<int> error{0};
+    const unsigned n_threads = 8;
+    pthread_t threads[n_threads];
+    cuda_ssd_host_reader reader = {g_model_fd, &chunks, &next, &failed, &error};
+    unsigned started = 0;
+    for (; started < n_threads; started++)
+        if (pthread_create(&threads[started], NULL, cuda_ssd_host_read_chunks, &reader) != 0) break;
+    if (!started) (void)cuda_ssd_host_read_chunks(&reader);
+    for (unsigned i = 0; i < started; i++) pthread_join(threads[i], NULL);
+    if (failed.load()) {
+        fprintf(stderr, "ds4: CUDA SSD host tier read failed: %s\n", strerror(error.load()));
+        return 0;
+    }
+    const double t1 = cuda_wall_sec();
+    uint64_t pinned = 0;
+    std::vector<cuda_ssd_host_span> registered;
+    for (cuda_ssd_host_span s : spans) {
+        char *p = (char *)model_map + s.off;
+        cudaError_t err = cudaHostRegister(p, (size_t)s.bytes,
+                                           cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+        if (err == cudaErrorHostMemoryAlreadyRegistered) {
+            /* A whole-model registration already pins the range; its owner unpins it. */
+            (void)cudaGetLastError();
+            cudaPointerAttributes a = {}, b = {};
+            if (cudaPointerGetAttributes(&a, p) == cudaSuccess &&
+                cudaPointerGetAttributes(&b, p + s.bytes - 1) == cudaSuccess &&
+                a.type == cudaMemoryTypeHost && b.type == cudaMemoryTypeHost) {
+                s.owned = false;
+                err = cudaSuccess;
+            }
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA SSD host tier stopped at %.2f GiB: %s\n",
+                    (double)pinned / 1073741824.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            break;
+        }
+        registered.push_back(s);
+        pinned += s.bytes;
+    }
+    if (registered.empty()) return 0;
+    g_ssd_host_spans = registered;
+    g_ssd_host_map = model_map;
+    fprintf(stderr, "ds4: CUDA SSD host tier: %.2f GiB of routed experts pinned "
+            "(read %.1f s, pin %.1f s)\n", (double)pinned / 1073741824.0,
+            t1 - t0, cuda_wall_sec() - t1);
+    return pinned;
+}
+
 static int cuda_model_copy_to_device_streamed(
         char *dst,
         const void *model_map,
@@ -2398,6 +2530,14 @@ static int cuda_model_copy_to_device_streamed(
         return 0;
     }
     if (bytes == 0) return 1;
+    if (const char *host = cuda_ssd_host_lookup(model_map, offset, bytes)) {
+        /* The pool owns the upload stream that the request's batch drains. */
+        if (!cuda_stream_selected_stage_pool_alloc(cuda_model_copy_chunk_bytes() +
+                (g_model_direct_align > 1 ? g_model_direct_align : 1))) return 0;
+        return cuda_ok(cudaMemcpyAsync(dst, host, (size_t)bytes, cudaMemcpyHostToDevice,
+                                       g_stream_selected_upload_stream),
+                       what ? what : "host tier expert copy");
+    }
     if (g_model_fd < 0 ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
@@ -2990,6 +3130,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    ds4_gpu_stream_expert_host_release();
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
@@ -29436,6 +29577,14 @@ static void *cuda_stream_prefetch_read(void *) {
     uint64_t chunk_index = 0;
     const uint64_t chunk = UINT64_C(8) << 20;
     for (const auto &copy : p.copies) {
+        if (const char *host = cuda_ssd_host_lookup(p.table.model_map, copy.offset, copy.bytes)) {
+            if (p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
+            p.ok = cudaMemcpyAsync(copy.destination, host, copy.bytes,
+                cudaMemcpyHostToDevice, p.stream) == cudaSuccess;
+            if (!p.ok) break;
+            p.bytes += copy.bytes;
+            continue;
+        }
         for (uint64_t offset = 0; p.ok && offset < copy.bytes; offset += chunk) {
             if (p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
             const unsigned ring = chunk_index % 2u;
