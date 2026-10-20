@@ -32,7 +32,7 @@ The series head measured 24.9 and 24.7 t/s in the final validation session. Main
 | 2K prompt, 128 tokens | 83.4 t/s | 84.8 t/s | 12.8 t/s | 19.7 t/s (+54%) |
 | 8K prompt, 128 tokens | 305 t/s | 311 t/s | 15.3 t/s | 23.8 t/s (+55%) |
 
-The short runs decode slower than the 512-token one: they start with fewer cached experts. A 32K prompt at 64K context prefilled at 853 t/s and decoded 64 tokens at 21.9 t/s; peak VRAM was 96.1 of 97.9 GB. Prefill is bound by expert sweeps: each 8K-token chunk reads most of the 269 GiB of experts, about 9 to 25 s per chunk.
+The short runs decode slower than the 512-token one: they start with fewer cached experts. A 32K prompt at 64K context decoded 64 tokens at 21.9 t/s; peak VRAM was 96.1 of 97.9 GB. See [Prefill](#prefill) for prompt speed.
 
 The frontier logits are byte-identical to main's on both workloads. Q2 gains from the larger cache; its logits and general-100 scores are byte-identical to main's:
 
@@ -44,6 +44,21 @@ The frontier logits are byte-identical to main's on both workloads. Q2 gains fro
 | 32K prompt, 32 tokens | 2,597 t/s | 2,721 t/s | 42.3 t/s | 44.0 t/s (+4.1%) |
 
 `ds4-server --cuda --ssd-streaming --ctx 65536` with the MXFP4 GGUF was ready 151 s after start, from a page cache that held part of the file, and decoded a short chat at about 35 t/s.
+
+## Prefill
+
+Main's SSD read-ahead copied every expert of the next layer while the current one computed. Here that loses: a 2K prompt routes to about 272 of each layer's 384 experts, and a layer computes in about 25 ms while its pinned experts take 165 ms to copy and its SSD ones a second. Loading only the routed experts when each layer asks for them, which discrete GPUs now do by default, is faster at every size. Main against it, ABBA in one session, 450 W ([`prefill-abba.csv`](prefill-abba.csv)):
+
+| Workload | MXFP4, main | Routed only | Q2, main | Routed only |
+|---|---:|---:|---:|---:|
+| 2K prompt | 84 t/s | 130 t/s | 522 t/s | 527 t/s |
+| 8K prompt | 311 t/s | 520 t/s | 1,564 t/s | 1,532 t/s |
+| Five 2K turns | 114 t/s | 169 t/s | 785 t/s | 820 t/s |
+| 32K prompt | 902 t/s | 1,272 t/s | 2,598 t/s | 2,672 t/s |
+
+Decode stays within 2%, and the frontier logits are byte-identical to main's on every workload. A cold 2K MXFP4 prefill now spends about 12 of its 16 s reading about 82 GB of experts from the SSD at 7 GB/s.
+
+Tried first and dropped: reading the SSD layers' experts far ahead while the pinned layers copy, with three readers per layer (cold 2K 113 t/s, warm 2K appends 153). Copies from pinned RAM at 44 GB/s starved the concurrent SSD reads to about 0.5 GB/s until paced to 25 GB/s, and taking an earlier sweep's cached experts for the far reads raised a warm sweep's SSD reads from 67 to 102 GB.
 
 ## Decode kernels
 
