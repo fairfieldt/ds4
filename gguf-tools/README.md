@@ -14,6 +14,18 @@ The important pieces are:
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
+## Merging split GGUFs
+
+`merge_split_gguf.py` downloads a llama.cpp split GGUF from Hugging Face one
+part at a time and writes a single GGUF that DwarfStar can map: part 1's
+metadata without the `split.*` keys, 16 KiB tensor alignment, Engram tables
+last. Each part is checked against the Hub's SHA-256 and deleted once merged,
+and every tensor of the result is re-read against its source at the end.
+`--donor` takes tensors from a local GGUF when they rebuild a part with the
+Hub's hash. It needs the `hf` command from `huggingface_hub`. See
+[DeepSeek V4.1 Flash](../docs/MODELS.md#deepseek-v41-flash) for the 1017 MXFP4
+command. Test: `python3 gguf-tools/tests/test_merge_split_gguf.py`.
+
 ## Qwen3.8 IQ2_XXS experiment
 
 `qwen4_iq2.py` builds mixed IQ2_XXS/MXFP4 main weights with
