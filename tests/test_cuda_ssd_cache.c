@@ -325,6 +325,8 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
 }
 
 int main(int argc, char **argv) {
+    /* Discrete GPUs skip the read-ahead unless asked; test it everywhere. */
+    setenv("DS4_CUDA_SSD_PREFETCH", "1", 1);
     if (argc == 2 && !strcmp(argv[1], "--prefetch-exit")) test_prefetch_exit = 1;
     else CHECK(argc == 1);
     run(16, 10, 512, 2);

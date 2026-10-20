@@ -30514,10 +30514,25 @@ static void cuda_stream_prefetch_exit(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
 }
 
+extern "C" bool ds4_gpu_discrete_memory(void);
+
+/* On a discrete GPU the read-ahead loses: it reads every expert of the next
+ * layer while a prompt routes to fewer (about 272 of 384 per layer at 2K),
+ * and copies from RAM or the SSD take far longer than the layer computes, so
+ * there is little to hide them behind. Loading only the routed experts was
+ * faster at every prompt size measured (RTX PRO 6000, 450 W; MXFP4 2K 113 ->
+ * 131 t/s, 32K 1056 -> 1265; Q2 2K 479 -> 543, 32K 2326 -> 2703).
+ * DS4_CUDA_SSD_PREFETCH=1 reads ahead anyway. */
+static bool cuda_stream_prefetch_wanted(void) {
+    static const int discrete = ds4_gpu_discrete_memory() ? 1 : 0;
+    return !discrete || getenv("DS4_CUDA_SSD_PREFETCH") != NULL;
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_prefetch(
         const ds4_gpu_stream_expert_table *current,
         const ds4_gpu_stream_expert_table *next) {
     ds4_gpu_stream_expert_cache_prefetch_finish(false);
+    if (!cuda_stream_prefetch_wanted()) return 0;
     auto &p = g_stream_prefetch;
     auto &cache = g_stream_selected_cache;
     if (!g_ssd_streaming_mode || g_n_gpus != 1 || !g_stream_expert_budget ||
