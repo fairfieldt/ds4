@@ -70146,6 +70146,14 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
 #else
     (void)ctx_size;
 #endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The 80% share protects the OS on unified memory. A discrete GPU's
+     * memory holds only this process's buffers, and the CUDA expert cache
+     * sizes itself from free memory, holding back prefill's largest staging
+     * copy (cuda_stream_selected_cache_begin_load). */
+    const bool discrete_cuda = e->backend == DS4_BACKEND_CUDA && ds4_gpu_discrete_memory();
+    if (discrete_cuda) cache_percent = 95;
+#endif
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  cache_percent,
                                  model_limit,
@@ -70442,7 +70450,12 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     uint64_t total_cache_bytes = e->ssd_streaming_cache_bytes;
     uint64_t prefill_headroom_bytes = 0;
     uint64_t budget_after_prefill_headroom = total_cache_bytes;
-    if (total_cache_bytes != 0) {
+    bool reserve_prefill = total_cache_bytes != 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The discrete CUDA cache holds back prefill staging when it allocates. */
+    if (e->backend == DS4_BACKEND_CUDA && ds4_gpu_discrete_memory()) reserve_prefill = false;
+#endif
+    if (reserve_prefill) {
         if (!ds4_streaming_prefill_headroom_bytes(&e->weights,
                                                   &prefill_headroom_bytes)) {
             fprintf(stderr,
