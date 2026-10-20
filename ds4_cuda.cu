@@ -188,11 +188,15 @@ struct cuda_stream_expert_slot {
     bool decode = false;
     /* Clock when the expert was loaded. */
     uint64_t loaded = 0;
+    /* Cost-aware decode eviction priority, see cuda_stream_touch. */
+    uint64_t prio = 0;
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
 static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 /* Zero is empty; one is an unread look-ahead entry, older than any demand hit. */
 static uint64_t g_stream_expert_clock = 1;
+/* GreedyDual floor for cost-aware decode eviction (cuda_stream_touch). */
+static uint64_t g_stream_gd_floor = 0;
 static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
 extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *table);
@@ -232,6 +236,7 @@ static void cuda_stream_selected_cache_release(void) {
     g_stream_expert_slots.clear();
     g_stream_expert_by_gate.clear();
     g_stream_expert_clock = 1;
+    g_stream_gd_floor = 0;
     g_stream_prefill_ids.clear();
     g_stream_prefill_slots.clear();
 }
@@ -29807,6 +29812,8 @@ struct cuda_stream_upload_batch {
  * DS4_CUDA_SSD_TRACE=FILE writes "layer slots expert..." per load request. */
 struct cuda_ssd_stats {
     uint64_t calls[2], unique[2], hits[2], misses[2], wait_ns[2], miss_ns[2];
+    /* Misses served by the pinned host tier rather than the file. */
+    uint64_t host[2];
 };
 static cuda_ssd_stats g_ssd_stats;
 static int g_ssd_stats_on = -1;
@@ -29825,10 +29832,11 @@ static void cuda_ssd_stats_print(void) {
         if (!s.calls[k]) continue;
         fprintf(stderr,
                 "ds4: CUDA SSD stats %s: %llu loads, %llu experts, %.2f%% hits, "
-                "%llu misses, wait %.1f ms, miss %.1f ms (%.3f ms/miss)\n",
+                "%llu misses (%llu from host RAM), wait %.1f ms, miss %.1f ms (%.3f ms/miss)\n",
                 names[k], (unsigned long long)s.calls[k], (unsigned long long)s.unique[k],
                 s.unique[k] ? 100.0 * (double)s.hits[k] / (double)s.unique[k] : 0.0,
-                (unsigned long long)s.misses[k], (double)s.wait_ns[k] / 1e6,
+                (unsigned long long)s.misses[k], (unsigned long long)s.host[k],
+                (double)s.wait_ns[k] / 1e6,
                 (double)s.miss_ns[k] / 1e6,
                 s.misses[k] ? (double)s.miss_ns[k] / 1e6 / (double)s.misses[k] : 0.0);
     }
@@ -29873,6 +29881,30 @@ static bool cuda_stream_prefill_may_evict(uint32_t slot, uint32_t n_total_expert
 
 static bool cuda_stream_older(uint32_t a, uint32_t b) {
     return g_stream_expert_slots[a].used < g_stream_expert_slots[b].used;
+}
+
+/* With a host tier, a VRAM miss costs one DMA from pinned RAM or, outside it,
+ * an NVMe read about eight times longer. Decode eviction is then GreedyDual:
+ * a use sets a slot's priority to the floor plus its reload cost, the decode
+ * victim is the lowest priority (oldest use on ties), and evicting raises the
+ * floor to the victim's priority. Experts that only the NVMe holds outlast
+ * pinned ones that are used as rarely. Without a host tier every cost is equal
+ * and decode eviction stays plain LRU. DS4_CUDA_SSD_VRAM_LRU keeps LRU, and
+ * DS4_CUDA_SSD_NVME_COST sets the cost ratio (default 8). */
+static bool cuda_stream_cost_aware(void) {
+    static const bool lru = getenv("DS4_CUDA_SSD_VRAM_LRU") != NULL;
+    return g_ssd_host_map && !lru;
+}
+
+static void cuda_stream_touch(cuda_stream_expert_slot &slot) {
+    if (!cuda_stream_cost_aware()) return;
+    static const uint64_t nvme = [] {
+        const char *env = getenv("DS4_CUDA_SSD_NVME_COST");
+        const double r = env ? strtod(env, NULL) : 8.0;
+        return (uint64_t)((r > 0 ? r : 8.0) * 100.0);
+    }();
+    const bool host = cuda_ssd_host_lookup(g_stream_selected_cache.model_map, slot.gate, 1) != NULL;
+    slot.prio = g_stream_gd_floor + (host ? 100u : nvme);
 }
 
 static int cuda_stream_selected_cache_begin_load(
@@ -29971,6 +30003,7 @@ static int cuda_stream_selected_cache_begin_load(
             g_stream_expert_by_gate.clear();
             for (auto &slot : g_stream_expert_slots) slot.used = 0;
             g_stream_expert_clock = 1;
+            g_stream_gd_floor = 0;
         }
         if (slot_count > 64u) cuda_stream_note_prefill_layer(table->layer);
         const uint64_t stamp = ++g_stream_expert_clock;
@@ -29990,6 +30023,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
+            cuda_stream_touch(slot);
             if (slot_count <= 64u) slot.decode = true;
         }
         if (stats) {
@@ -30026,7 +30060,21 @@ static int cuda_stream_selected_cache_begin_load(
                 const uint32_t j = prefill_victims[next_prefill_victim++];
                 if (g_stream_expert_slots[j].used < stamp) { victim = j; break; }
             }
-            if (victim == UINT32_MAX) {
+            if (victim == UINT32_MAX && cuda_stream_cost_aware()) {
+                uint64_t lowest = UINT64_MAX, oldest = stamp;
+                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                    const auto &x = g_stream_expert_slots[j];
+                    if (x.used >= stamp || cuda_stream_prefetch_protects(x)) continue;
+                    if (!x.used) { victim = j; break; }
+                    if (x.prio < lowest || (x.prio == lowest && x.used < oldest)) {
+                        lowest = x.prio;
+                        oldest = x.used;
+                        victim = j;
+                    }
+                }
+                if (victim != UINT32_MAX && g_stream_expert_slots[victim].used)
+                    g_stream_gd_floor = std::max(g_stream_gd_floor, g_stream_expert_slots[victim].prio);
+            } else if (victim == UINT32_MAX) {
                 /* Decode, or a prefill whose slots are all in use. */
                 uint64_t oldest = stamp;
                 for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
@@ -30047,6 +30095,8 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
             uploads.active = true;
+            if (stats && cuda_ssd_host_lookup(table->model_map, gate, table->gate_expert_bytes))
+                g_ssd_stats.host[stats_kind]++;
             if (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
@@ -30058,6 +30108,7 @@ static int cuda_stream_selected_cache_begin_load(
                     table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
                 return 0;
             slot = {gate, up, down, stamp, slot_count <= 64u, stamp};
+            cuda_stream_touch(slot);
             g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
@@ -30212,6 +30263,7 @@ extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel) {
                  * the experts that should stay hot for following decode. */
                 slot.used = 1;
                 slot.loaded = std::max(g_stream_expert_clock, g_stream_sweep_start);
+                slot.prio = g_stream_gd_floor;
             } catch (...) {
                 /* A failed optional index insertion remains an ordinary miss. */
             }
