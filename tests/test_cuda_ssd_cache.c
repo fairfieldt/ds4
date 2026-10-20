@@ -123,6 +123,42 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
         fprintf(stderr, "CUDA SSD cache types=%u/%u width=%u selected=%u rows=%u eviction/remap/budgets: PASS\n",
                 gate_type, down_type, dim, selected, rows);
     }
+    /* Room for three layers adds a layer's worth that also stages prefill:
+     * decode fills it first, and each prefill load drops what it holds. The
+     * last count above left ROWS rows of IDs and references in place. */
+    float one_row[LAYERS][dim];
+    ds4_gpu_set_ssd_streaming(false);
+    for (unsigned l = 0; l < LAYERS; l++) {
+        const uint64_t g = l * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
+        bool half = false;
+        CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
+            g, u, d, gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+            dim, dim, dim, si, sw, EXPERTS, selected, 10, x, l, 1, &half, true));
+        CHECK(!half && ds4_gpu_tensor_read(out, 0, one_row[l], dim * 4));
+    }
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(3u * (EXPERTS + 1u));
+    for (unsigned step = 0; step < 5; step++) {
+        const unsigned rows = step & 1 ? 1u : ROWS;
+        for (unsigned l = 0; l < LAYERS; l++) {
+            const uint64_t g = l * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
+            const float *want = rows == 1 ? one_row[l] : reference[l];
+            bool half = false;
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
+                g, u, d, gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+                dim, dim, dim, si, sw, EXPERTS, selected, 10, x, l, rows, &half, false));
+            CHECK(!half && ds4_gpu_tensor_read(out, 0, actual, rows * dim * 4));
+            for (unsigned i = 0; i < rows * dim; i++) {
+                if (!isfinite(actual[i]) || fabsf(actual[i] - want[i]) > 2e-5f * (1 + fabsf(want[i]))) {
+                    fprintf(stderr, "staging in cache: step %u layer %u rows %u [%u] %.9g != %.9g\n",
+                            step, l, rows, i, actual[i], want[i]);
+                    exit(1);
+                }
+            }
+        }
+    }
+    CHECK(ds4_gpu_stream_expert_cache_current_count() <= 3u * (EXPERTS + 1u) + EXPERTS + 1u);
+    fprintf(stderr, "CUDA SSD prefill staging inside the cache, decode between prefills: PASS\n");
     /* Pinned host copies serve every miss, the read-ahead's too, while the
      * file is unreadable. The last pass above left ROWS rows in place. */
     const uint64_t pin_offset = 0, pin_bytes = model_bytes;

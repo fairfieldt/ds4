@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
-enum { EXPERTS = 64, SELECTED = 6, IN = 5120, MID = 2304, OUT = 5120, ITERS = 64 };
+enum { EXPERTS = 64, SELECTED = 6, IN = 5120, MID = 2304, OUT = 5120, ITERS = 64, TOKENS = 8 };
 
 static uint32_t random_state = 71;
 static uint32_t random_u32(void) {
@@ -59,17 +59,17 @@ int main(void) {
     CHECK(ds4_gpu_init());
     CHECK(ds4_gpu_set_model_fd_for_map(fd, model));
     CHECK(ds4_gpu_set_model_map(model, model_bytes));
-    static float input[IN], weights[ITERS * SELECTED];
+    static float input[TOKENS * IN], weights[ITERS * SELECTED];
     static int32_t ids[ITERS * SELECTED];
-    for (unsigned i = 0; i < IN; i++) input[i] = ((int)(random_u32() >> 20) - 2048) / 1024.0f;
+    for (unsigned i = 0; i < TOKENS * IN; i++) input[i] = ((int)(random_u32() >> 20) - 2048) / 1024.0f;
     for (unsigned i = 0; i < ITERS * SELECTED; i++) {
         weights[i] = (1 + random_u32() % 7) / 16.0f;
         ids[i] = (int32_t)((i / SELECTED * 7 + i % SELECTED * 11) % EXPERTS);
     }
     ds4_gpu_tensor *x = tensor(sizeof(input), input), *sw = tensor(sizeof(weights), weights);
     ds4_gpu_tensor *si = tensor(sizeof(ids), ids);
-    ds4_gpu_tensor *out = tensor((size_t)OUT * 4, NULL);
-    const size_t scratch = (size_t)SELECTED * (MID > OUT ? MID : OUT) * 4;
+    ds4_gpu_tensor *out = tensor((size_t)TOKENS * OUT * 4, NULL);
+    const size_t scratch = (size_t)TOKENS * SELECTED * (MID > OUT ? MID : OUT) * 4;
     ds4_gpu_tensor *gate = tensor(scratch, NULL), *up = tensor(scratch, NULL);
     ds4_gpu_tensor *mid = tensor(scratch, NULL), *down = tensor(scratch, NULL);
     const uint64_t g = 0, u = EXPERTS * gate_bytes, d = 2 * EXPERTS * gate_bytes;
@@ -113,6 +113,29 @@ int main(void) {
             }
             ds4_gpu_tensor_free(sel);
             ds4_gpu_tensor_free(wts);
+        }
+    }
+    /* Several tokens read the cache slots directly, as one token does. */
+    static float batch_ref[TOKENS * OUT], batch_new[TOKENS * OUT];
+    const unsigned batch_rows[] = {2, 5, TOKENS};
+    for (unsigned bi = 0; bi < 3; bi++) {
+        const unsigned rows = batch_rows[bi];
+        for (unsigned streaming = 0; streaming < 2; streaming++) {
+            ds4_gpu_set_ssd_streaming(streaming != 0);
+            if (streaming) {
+                ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * gate_bytes + down_bytes);
+                ds4_gpu_set_streaming_expert_cache_budget(2 * TOKENS * SELECTED);
+            }
+            bool half = false;
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
+                g, u, d, 39, 39, gate_bytes, gate_row, down_bytes, down_row, IN, MID, OUT, si, sw,
+                EXPERTS, SELECTED, 10.0f, x, 0, rows, &half, !streaming));
+            CHECK(!half && ds4_gpu_tensor_read(out, 0, streaming ? batch_new : batch_ref,
+                                               (size_t)rows * OUT * 4));
+        }
+        if (memcmp(batch_ref, batch_new, (size_t)rows * OUT * 4)) {
+            same = 0;
+            fprintf(stderr, "%u-token streaming batch differs from resident\n", rows);
         }
     }
     ds4_gpu_set_ssd_streaming(false);
