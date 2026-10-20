@@ -75,9 +75,13 @@ See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEA
 
 ## Discrete CUDA GPUs
 
-With DeepSeek V4.1 on a discrete NVIDIA GPU, the expert cache is in VRAM.
-A host with more free RAM than the routed experts can keep them pinned, so a
-cache miss copies from RAM instead of reading the SSD:
+With DeepSeek V4.1 on a discrete NVIDIA GPU, the expert cache is in VRAM. It
+sizes itself from the free VRAM when prefill first runs, after the context and
+session buffers, and keeps 2.5 GiB free. One layer's worth of its slots also
+holds prefill's staging copy.
+
+A host with spare RAM can pin routed experts, so a cache miss copies from RAM
+instead of reading the SSD:
 
 ```sh
 DS4_CUDA_SSD_HOST_GB=auto ./ds4 --cuda --ssd-streaming \
@@ -85,13 +89,21 @@ DS4_CUDA_SSD_HOST_GB=auto ./ds4 --cuda --ssd-streaming \
 ```
 
 `auto` pins whole layers while 16 GiB of RAM stay available. A number caps
-the pinned GiB instead. Q2's routed experts take 142.4 GiB. Other programs
-cannot use that memory while DwarfStar runs. Startup reads the experts first:
-about 30 seconds cold, 11 to 16 seconds when the files are already cached.
+the pinned GiB instead. Q2's routed experts take 142.4 GiB and the 1017 MXFP4
+experts 268.9 GiB. Other programs cannot use that memory while DwarfStar runs.
+Startup reads and pins the experts first: for Q2, 30 seconds from a cold page
+cache and 11 to 16 seconds when the file is already cached; for MXFP4's 24
+layers (161 GiB), about 70 seconds cold.
 
-On an RTX PRO 6000 (96 GB) with 192 GB of RAM, a 2K-token prefill went from
-75 to 510 t/s and decode from 21 to 48 t/s. See the
-[measurements](../speed-bench/ds41-cuda-6000/README.md).
+When only some layers fit in RAM, a miss outside them reads the SSD, about
+eight times slower than a copy from RAM. The VRAM cache then keeps the experts
+that only the SSD holds longer.
+
+On an RTX PRO 6000 (96 GB) with 192 GB of RAM, Q2 decodes at about 52 t/s
+after a 2K-token prompt (600 W). The MXFP4 experts, with 24 of 40 layers
+pinned, decode at 25 t/s (450 W). See the
+[Q2](../speed-bench/ds41-cuda-6000/README.md) and
+[MXFP4](../speed-bench/ds41-cuda-6000/mxfp4.md) measurements.
 
 ## M5 Max measurements
 

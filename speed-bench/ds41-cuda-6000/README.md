@@ -2,6 +2,8 @@
 
 Measured 2026-10-19 on voyage: RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W), CUDA 13.4, driver 615.71.09, Ryzen 9 9950X, 192 GB DDR5, Samsung 990 PRO. Model `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf` from `antirez/deepseek-v4.1-flash-gguf` (SHA-256 `5296e85f…ce93a`, 340.6 GiB including 188.8 GiB of disk-only Engram). Build: main after the October 19 upstream rebase, plus the CUDA SSD host tier (`DS4_CUDA_SSD_HOST_GB`).
 
+The native-precision MXFP4 experts of the same checkpoint are measured in [mxfp4.md](mxfp4.md).
+
 The model needs SSD streaming here: 9.4 GiB of non-routed weights and a 59.6 GiB expert cache (6,425 of 15,360 experts, 9.49 MiB each) fit in VRAM; the 142.4 GiB of routed experts do not. Stock streaming reads every cache miss from the GGUF. The host tier pins all 40 layers' routed experts in RAM, so a miss is a PCIe copy.
 
 ```sh
