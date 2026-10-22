@@ -660,8 +660,7 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         !dsv41_has_floats(q, (uint64_t)rows * 32u * 128u) ||
         !dsv41_has_floats(weights, (uint64_t)rows * 32u) ||
         !dsv41_has_floats(keys, (uint64_t)source_rows * 128u)) return 0;
-    /* FP4 with power-of-two scales can exceed FP16's exponent range.
-     * Do not pass these already-quantized values through the GLM FP16 tile. */
+#ifndef __HIP_PLATFORM_AMD__
     /* Each thread runs all heads serially: worth it only with two blocks
      * per SM or more. Both kernels write the same bits. */
     const dim3 grid((source_rows + 127u) / 128u,
@@ -679,6 +678,9 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                 (const float *)keys->ptr, source_rows, rows, start, ratio);
         return cuda_ok(cudaGetLastError(), "V4.1 index scores");
     }
+#endif
+    /* FP4 with power-of-two scales can exceed FP16's exponent range.
+     * Do not pass these already-quantized values through the GLM FP16 tile. */
     dsv41_index_scores_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
         (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
         (const float *)keys->ptr, source_rows, start, ratio);
