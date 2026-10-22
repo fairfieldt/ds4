@@ -692,6 +692,27 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !dsv41_has_floats(in, (uint64_t)width * rows) ||
         !dsv41_has_floats(out, (uint64_t)outputs * rows)) return 0;
 #ifndef __HIP_PLATFORM_AMD__
+    /* All rows through the one-row cuBLAS problem's algorithm at once. */
+    if (rows > 1u && g_cublas_ready && !g_quality_mode &&
+        !getenv("DS4_CUDA_V41_SERIAL_PROJECTION_ROWS") &&
+        !getenv("DS4_CUDA_SERIAL_F16_MATMUL") && !getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") &&
+        !g_dsv41_shared.active && width <= INT32_MAX && outputs <= INT32_MAX &&
+        weight_offset <= model_size &&
+        outputs <= (model_size - weight_offset) / sizeof(__half) / width) {
+        const uint64_t bytes = (uint64_t)width * outputs * sizeof(__half);
+        const int tier = ds4_tensor_device_idx(out);
+        const char *w = ds4_tensor_device_idx(in) == tier ?
+            cuda_resolve_weight_ptr(model_map, weight_offset, bytes, tier, "V4.1 F16 vector batch") : NULL;
+        const uint64_t count = (uint64_t)rows * width;
+        __half *x = w ? (__half *)cuda_tmp_alloc_on(tier, count * sizeof(__half), "F16 vector batch inputs") : NULL;
+        if (x) {
+            f32_to_f16_kernel<<<(count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+                x, (const float *)in->ptr, count);
+            if (!cuda_ok(cudaGetLastError(), "F16 vector batch convert")) return 0;
+            if (cuda_lt_f16_rows((float *)out->ptr, (const __half *)w, x, (int)outputs,
+                                 (int)width, rows)) return 1;
+        }
+    }
     if (rows > 1u && outputs <= 128u && g_cublas_ready && !g_quality_mode &&
         !getenv("DS4_CUDA_SERIAL_F16_MATMUL") && !getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") &&
         !getenv("DS4_CUDA_SERIAL_ROUTER") && !getenv("DS4_CUDA_F16_SMALL_OUT")) {
