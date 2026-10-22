@@ -87,6 +87,20 @@ The download comes in two parts; the script joins and verifies them automaticall
 Allow another 37 GiB of free disk space while joining. Rerun the command to resume an
 interrupted download or join.
 
+The 1017 checkpoint's native MXFP4 routed experts come as nine llama.cpp split
+parts in `antirez/deepseek-v4.1-flash-gguf` (467 GiB). DwarfStar loads one
+GGUF, so merge them with [`merge_split_gguf.py`](../gguf-tools/merge_split_gguf.py).
+The merge needs 467 GiB plus one part (46 GiB) of free space. The Engram tables
+are the same as the 1017 Q2 file's; pass that file as `--donor` to copy them
+instead of downloading 189 GiB:
+
+```sh
+python3 gguf-tools/merge_split_gguf.py antirez/deepseek-v4.1-flash-gguf \
+  DeepSeek-V4.1-Flash-1017-MXFP4-experts 9 \
+  gguf/DeepSeek-V4.1-Flash-1017-MXFP4.gguf gguf/mxfp4-parts \
+  --donor gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf
+```
+
 Large SSD prefills process layers in wide batches. Metal overlaps computation
 with the next layer's reads; CUDA stages experts into its bounded device cache.
 Short appends keep using the expert cache.
