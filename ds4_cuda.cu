@@ -7508,6 +7508,83 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+/* rms_norm_weight_kernel and rms_norm_plain_batch8_kernel with each thread's
+ * values held in registers across both passes and every load issued before
+ * the first add. Thread mapping, summation order and reductions are theirs,
+ * so the outputs are the same bits; decode norms are latency-bound. */
+#define RMS_NORM_REG_MAX 32u
+template <bool BF16>
+__global__ static void __launch_bounds__(256) rms_norm_weight_reg_kernel(
+        float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float v[RMS_NORM_REG_MAX], wv[RMS_NORM_REG_MAX];
+#pragma unroll
+    for (uint32_t k = 0; k < RMS_NORM_REG_MAX; k++) {
+        const uint32_t i = threadIdx.x + k * 256u;
+        v[k] = i < n ? xr[i] : 0.0f;
+        wv[k] = i < n ? w[i] : 0.0f;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < RMS_NORM_REG_MAX; k++)
+        if (threadIdx.x + k * 256u < n) sum += v[k] * v[k];
+    __shared__ float partial[256];
+    sum = block_sum_f32_256(sum, partial);
+    const float scale = rsqrtf(sum / (float)n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < RMS_NORM_REG_MAX; k++) {
+        const uint32_t i = threadIdx.x + k * 256u;
+        if (i >= n) continue;
+        const float value = v[k] * scale * wv[k];
+        orow[i] = BF16 ? dsv41_bf16(value) : value;
+    }
+}
+
+#define RMS_NORM_PLAIN_REG_ITERS 10u
+__global__ static void __launch_bounds__(256) rms_norm_plain_batch8_reg_kernel(
+        float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float v[RMS_NORM_PLAIN_REG_ITERS][8];
+#pragma unroll
+    for (uint32_t it = 0; it < RMS_NORM_PLAIN_REG_ITERS; it++) {
+        const uint32_t i = threadIdx.x + it * 2048u;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) v[it][j] = i < n ? xr[i + j * 256u] : 0.0f;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t it = 0; it < RMS_NORM_PLAIN_REG_ITERS; it++) {
+        if (threadIdx.x + it * 2048u >= n) break;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) sum += v[it][j] * v[it][j];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+#pragma unroll
+    for (uint32_t it = 0; it < RMS_NORM_PLAIN_REG_ITERS; it++) {
+        const uint32_t i = threadIdx.x + it * 2048u;
+        if (i >= n) break;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) orow[i + j * 256u] = v[it][j] * scale;
+    }
+}
+
+static bool cuda_norm_reg_enabled(void) {
+    return getenv("DS4_CUDA_NORM_NO_REG") == NULL;
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -18281,6 +18358,8 @@ extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
     if (n == 4096u) {
         rms_norm_plain_fast4096_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
+    } else if ((n & 2047u) == 0u && n <= RMS_NORM_PLAIN_REG_ITERS * 2048u && cuda_norm_reg_enabled()) {
+        rms_norm_plain_batch8_reg_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     } else if ((n & 2047u) == 0u) {
         rms_norm_plain_batch8_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     } else {
@@ -18293,6 +18372,8 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     if (n == 4096u) {
         rms_norm_plain_fast4096_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
+    } else if ((n & 2047u) == 0u && n <= RMS_NORM_PLAIN_REG_ITERS * 2048u && cuda_norm_reg_enabled()) {
+        rms_norm_plain_batch8_reg_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     } else if ((n & 2047u) == 0u) {
         rms_norm_plain_batch8_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     } else {
@@ -18309,7 +18390,10 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    if (n <= RMS_NORM_REG_MAX * 256u && cuda_norm_reg_enabled())
+        rms_norm_weight_reg_kernel<false><<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    else
+        rms_norm_weight_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -18321,7 +18405,10 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    if (n <= RMS_NORM_REG_MAX * 256u && cuda_norm_reg_enabled())
+        rms_norm_weight_reg_kernel<false><<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    else
+        rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
