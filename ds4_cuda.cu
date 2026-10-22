@@ -1063,6 +1063,20 @@ static inline cudaStream_t cuda_decode_stream(void) {
     return g_decode_graph_capturing ? g_decode_graph_stream : (cudaStream_t)0;
 }
 
+static int cuda_sm_count(void) {
+    static int count = 0;
+    if (!count) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            count <= 0) {
+            (void)cudaGetLastError();
+            count = 1;
+        }
+    }
+    return count;
+}
+
 /* Many independent one-row F16 GEMVs y[r] = W x[r] (W: m outputs of k
  * halves) with the bits of one cublasGemmEx(m, 1, k) call per row. cuBLASLt's
  * first heuristic for the one-row problem is the algorithm that call uses;
