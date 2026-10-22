@@ -196,6 +196,16 @@ static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 static uint64_t g_stream_expert_clock = 1;
 /* GreedyDual floor for cost-aware decode eviction (cuda_stream_touch). */
 static uint64_t g_stream_gd_floor = 0;
+/* On a discrete GPU the last slots double as prefill's compact copy
+ * (cuda_stream_compact_prefill): decode caches experts there, and each
+ * prefill load drops them first. Zero when prefill stages separately. */
+static uint64_t g_stream_region_slots = 0;
+/* Set by a prefill load that emptied the region; any other load may have
+ * cached experts there, so its compact copy goes to a separate buffer. */
+static bool g_stream_region_free = false;
+static bool cuda_stream_in_region(uint32_t slot) {
+    return g_stream_region_slots && slot >= g_stream_expert_slots.size() - g_stream_region_slots;
+}
 static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
 extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *table);
@@ -236,6 +246,8 @@ static void cuda_stream_selected_cache_release(void) {
     g_stream_expert_by_gate.clear();
     g_stream_expert_clock = 1;
     g_stream_gd_floor = 0;
+    g_stream_region_slots = 0;
+    g_stream_region_free = false;
     g_stream_prefill_ids.clear();
     g_stream_prefill_slots.clear();
 }
@@ -26629,7 +26641,10 @@ static int routed_moe_launch(
         if (!gate_w || !up_w || !down_w || weight_experts == 0u) return 0;
 
         ds4_gpu_tensor compact_selected = *mx_selected;
-        if (use_stream_selected_cache && n_tokens > 1u) {
+        /* Only MMQ's rectangular expert grid needs a compact copy; the vector
+         * kernels below address the cache slots directly at any token count. */
+        const bool mx_vec = n_tokens <= 8u && n_expert == 6u;
+        if (use_stream_selected_cache && n_tokens > 1u && !mx_vec) {
             const int32_t *ids = NULL;
             if (!cuda_stream_compact_prefill(&gate_w, &up_w, &down_w,
                                             &ids, &weight_experts)) return 0;
@@ -26640,7 +26655,7 @@ static int routed_moe_launch(
         const cudaStream_t stream =
             n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
         int rc = -1;
-        if (n_tokens <= 8u && n_expert == 6u) {
+        if (mx_vec) {
             rc = ds4_mmq_mxfp4_moe_gate_up_mid_vec(
                 gate_w, up_w, (const float *)x->ptr,
                 (const int32_t *)mx_selected->ptr,
@@ -29166,13 +29181,24 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
     const uint64_t down_bytes = in_dim ? ds4_mmq_q2_k_aligned_bytes(out_dim, mid_dim, count) :
         count * cache.down_expert_bytes;
     if (!gate_bytes || !down_bytes) return 0;
-    const uint64_t weights_bytes = 2 * gate_bytes + down_bytes;
+    /* Every listed slot lies below the region: prefill loads drop region
+     * entries and never pick region victims. */
+    const uint64_t region = g_stream_region_slots;
+    const bool in_region = region && g_stream_region_free &&
+        gate_bytes <= region * cache.gate_expert_bytes && down_bytes <= region * cache.down_expert_bytes;
+    const uint64_t weights_bytes = in_region ? 0 : 2 * gate_bytes + down_bytes;
     const uint64_t ids_offset = (weights_bytes + 3u) & ~UINT64_C(3);
     const uint64_t slots_offset = ids_offset + (uint64_t)cache.slot_count * sizeof(int32_t);
     const uint64_t bytes = slots_offset + (in_dim ? count * sizeof(int32_t) : 0);
     if (!cuda_stream_selected_ensure_bytes(&cache.prefill_ptr,
             &cache.prefill_capacity, bytes, "compact prefill experts")) return 0;
     char *g = cache.prefill_ptr, *u = g + gate_bytes, *d = u + gate_bytes;
+    if (in_region) {
+        const uint64_t first = g_stream_expert_slots.size() - region;
+        g = cache.gate_ptr + first * cache.gate_expert_bytes;
+        u = cache.up_ptr + first * cache.gate_expert_bytes;
+        d = cache.down_ptr + first * cache.down_expert_bytes;
+    }
     int32_t *compact_ids = (int32_t *)(cache.prefill_ptr + ids_offset);
     if (!cuda_ok(cudaMemcpy(compact_ids, g_stream_prefill_ids.data(),
             (size_t)cache.slot_count * sizeof(int32_t), cudaMemcpyHostToDevice),
@@ -29449,8 +29475,10 @@ static void cuda_stream_note_prefill_layer(uint32_t layer) {
 
 static bool cuda_stream_prefill_may_evict(uint32_t slot, uint32_t n_total_expert) {
     static const bool all = getenv("DS4_CUDA_SSD_PREFILL_EVICTS_ALL") != NULL;
+    if (cuda_stream_in_region(slot)) return false;
     const auto &x = g_stream_expert_slots[slot];
-    const size_t n = g_stream_expert_slots.size(), staging = 2u * (size_t)n_total_expert;
+    const size_t n = g_stream_expert_slots.size() - g_stream_region_slots,
+        staging = 2u * (size_t)n_total_expert;
     return all || n < 2u * staging || !x.used || slot >= n - staging ||
         (!x.decode && x.loaded >= g_stream_sweep_start);
 }
@@ -29544,16 +29572,24 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            /* Prefill later stages up to one whole layer of experts in a
-             * compact copy (cuda_stream_compact_prefill). Hold that back on
-             * top of a margin for MMQ and library scratch: an 8 GiB margin
-             * alone left 0.8 GB free on a 32K prompt with MXFP4 experts. */
-            const uint64_t staged = cache.prefill_capacity;
-            const uint64_t layer_stage = (uint64_t)table->n_total_expert * expert_bytes;
+            /* A discrete GPU keeps a 2.5 GiB margin for MMQ and library
+             * scratch (8 GiB alone left 0.8 GB free on a 32K MXFP4 prompt)
+             * and one layer of experts, plus rounding for aligned repacks,
+             * for prefill's compact copy (cuda_stream_compact_prefill). That
+             * layer joins the cache when the rest still holds two prefill
+             * layers and their read-ahead, so decode caches experts in it
+             * between prefills. It is not part of a requested budget. */
+            const uint64_t region = (uint64_t)table->n_total_expert + 1u;
             const uint64_t reserve = integrated ? UINT64_C(8) << 30 :
-                (UINT64_C(5) << 29) + (layer_stage > staged ? layer_stage - staged : 0);
+                (UINT64_C(5) << 29) + region * expert_bytes;
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
+            uint64_t region_slots = 0;
+            if (!integrated && !getenv("DS4_CUDA_SSD_SEPARATE_PREFILL_STAGE") &&
+                capacity >= 3u * region) {
+                capacity += region;
+                region_slots = region;
+            }
             if (capacity < unique.size()) {
                 fprintf(stderr, "ds4: CUDA SSD cache cannot stage %zu experts with system headroom\n",
                         unique.size());
@@ -29573,13 +29609,15 @@ static int cuda_stream_selected_cache_begin_load(
                 capacity = std::max((uint64_t)unique.size(), capacity * 3u / 4u);
             }
             g_stream_expert_slots.resize(capacity);
+            g_stream_region_slots = capacity >= 3u * region_slots ? region_slots : 0;
             cache.model_map = table->model_map;
             cache.gate_expert_bytes = table->gate_expert_bytes;
             cache.down_expert_bytes = table->down_expert_bytes;
             cache.logical_tier = 0;
-            fprintf(stderr, "ds4: CUDA SSD expert cache: %llu slots, %.2f GiB\n",
+            fprintf(stderr, "ds4: CUDA SSD expert cache: %llu slots, %.2f GiB%s\n",
                     (unsigned long long)capacity,
-                    (double)(capacity * expert_bytes) / 1073741824.0);
+                    (double)(capacity * expert_bytes) / 1073741824.0,
+                    g_stream_region_slots ? " (the last layer's worth also stages prefill)" : "");
         }
         if (!cuda_stream_selected_ensure_i32(slot_count)) return 0;
         if (!g_stream_expert_budget || g_stream_expert_clock == UINT64_MAX) {
@@ -29590,6 +29628,18 @@ static int cuda_stream_selected_cache_begin_load(
             g_stream_gd_floor = 0;
         }
         if (slot_count > 64u) cuda_stream_note_prefill_layer(table->layer);
+        g_stream_region_free = false;
+        if (slot_count > 64u && g_stream_region_slots) {
+            /* This load's compact copy overwrites the region. */
+            for (size_t j = g_stream_expert_slots.size() - g_stream_region_slots;
+                 j < g_stream_expert_slots.size(); j++) {
+                auto &x = g_stream_expert_slots[j];
+                if (x.used) g_stream_expert_by_gate.erase(x.gate);
+                x.used = 0;
+                x.decode = false;
+            }
+            g_stream_region_free = true;
+        }
         const uint64_t stamp = ++g_stream_expert_clock;
         std::vector<int32_t> slots(unique.size(), -1);
         /* Protect every hit first: a miss must not evict a later request's hit. */
@@ -29672,11 +29722,17 @@ static int cuda_stream_selected_cache_begin_load(
                 const uint32_t j = prefill_victims[next_prefill_victim++];
                 if (g_stream_expert_slots[j].used < stamp) { victim = j; break; }
             }
+            /* Decode scans from the region, so it refills a layer's worth that
+             * prefill dropped before evicting anything still cached. */
+            const uint32_t n_slots = (uint32_t)g_stream_expert_slots.size();
+            const uint32_t scan_first = prefill_load ? 0u : (uint32_t)(n_slots - g_stream_region_slots);
             if (victim == UINT32_MAX && cuda_stream_cost_aware()) {
                 uint64_t lowest = UINT64_MAX, oldest = stamp;
-                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                for (uint32_t k = 0; k < n_slots; k++) {
+                    const uint32_t j = scan_first + k < n_slots ? scan_first + k : scan_first + k - n_slots;
                     const auto &x = g_stream_expert_slots[j];
-                    if (x.used >= stamp || cuda_stream_prefetch_protects(x)) continue;
+                    if (x.used >= stamp || cuda_stream_prefetch_protects(x) ||
+                        (prefill_load && cuda_stream_in_region(j))) continue;
                     if (!x.used) { victim = j; break; }
                     if (x.prio < lowest || (x.prio == lowest && x.used < oldest)) {
                         lowest = x.prio;
@@ -29689,8 +29745,10 @@ static int cuda_stream_selected_cache_begin_load(
             } else if (victim == UINT32_MAX) {
                 /* Decode, or a prefill whose slots are all in use. */
                 uint64_t oldest = stamp;
-                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                for (uint32_t k = 0; k < n_slots; k++) {
+                    const uint32_t j = scan_first + k < n_slots ? scan_first + k : scan_first + k - n_slots;
                     if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
+                        !(prefill_load && cuda_stream_in_region(j)) &&
                         g_stream_expert_slots[j].used < oldest) {
                         oldest = g_stream_expert_slots[j].used;
                         victim = j;
@@ -29996,7 +30054,8 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
         current->down_expert_bytes != next->down_expert_bytes ||
         next->gate_expert_bytes != cache.gate_expert_bytes ||
         next->down_expert_bytes != cache.down_expert_bytes ||
-        g_stream_expert_slots.size() < (uint64_t)current->n_total_expert + next->n_total_expert ||
+        g_stream_expert_slots.size() - g_stream_region_slots <
+            (uint64_t)current->n_total_expert + next->n_total_expert ||
         g_stream_expert_clock >= UINT64_MAX - 2 || g_model_direct_align > (UINT64_C(1) << 20))
         return 0;
     try {

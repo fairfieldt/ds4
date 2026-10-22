@@ -96,8 +96,8 @@ setting a switch to `0` still enables it.
 
 With DeepSeek V4.1 on a discrete NVIDIA GPU, the expert cache is in VRAM. It
 sizes itself from the free VRAM when prefill first runs, after the context and
-session buffers, and keeps 2.5 GiB free plus one layer of experts for
-prefill's staging copy.
+session buffers, and keeps 2.5 GiB free. One layer's worth of its slots also
+holds prefill's staging copy.
 
 A host with spare RAM can pin routed experts, so a cache miss copies from RAM
 instead of reading the SSD:
