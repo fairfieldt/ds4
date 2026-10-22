@@ -3492,6 +3492,16 @@ int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tenso
  * source 16-byte aligned).  It loads the host data before its dependency
  * wait, hiding the transfer. */
 int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+/* R[t][s] = embedding row ids[t] (int32, in vocabulary) for each of the hc
+ * streams, widened as the host widens it; 0 before any launch unless the
+ * table is BF16 (type 30). */
+int ds4_gpu_qwen4_embed_rows_tensor(ds4_gpu_tensor *R, const ds4_gpu_tensor *ids,
+                                    const void *map, uint64_t size, uint64_t off, uint32_t type,
+                                    uint32_t vocab, uint32_t T, uint32_t E, uint32_t hc);
+/* H2D copy from page-locked memory queued on the decode stream; the wait
+ * returns once the last such copy has read its source. */
+int ds4_gpu_qwen4_upload_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+int ds4_gpu_qwen4_upload_wait(void);
 /* D2D copy queued on the decode stream without a host wait. */
 int ds4_gpu_tensor_copy_queued(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes);
