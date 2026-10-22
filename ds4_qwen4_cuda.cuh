@@ -1974,6 +1974,15 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
             const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
             v[k] = (q&8 ? -level : level)*scale;
         }
+    } else if (TYPE == 2) {
+        /* i % 4 == 0, so the codes are 2-byte aligned; a code q becomes the
+         * float 2^23 + q by its bits, minus 2^23 + 8 (exact) */
+        const uint8_t *b = (const uint8_t *)row+(i/32)*18;
+        const float scale = __half2float(*(const __half *)b);
+        const uint16_t *q = (const uint16_t *)(b+2+i%16);
+        const unsigned packed = ((unsigned)q[0]|((unsigned)q[1]<<16))>>(i%32/16*4);
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) v[k] = scale*(__uint_as_float(0x4b000000u|((packed>>(k*8))&15))-8388616.0f);
     } else if (TYPE == 16) {
         const cuda_block_iq2_xxs *b = (const cuda_block_iq2_xxs *)row+i/256;
         const unsigned j = i%256, sub = (j%32)/8;
@@ -2247,7 +2256,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
             const uint64_t off = ((uint64_t)e * M + row) * rb;
-            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
+            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39 || TYPE == 2) && !((uintptr_t)xt&15)) {
                 #pragma unroll 4
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);
@@ -2388,18 +2397,47 @@ __global__ void moe_gate_up_q4k(float *out, const float *x, const int *selected,
     if (!lane) out[pair * M + row] = silu(a) * b;
 }
 
-/* Two rows per warp: an MXFP4 down row is only 340 bytes. */
-__global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
+/* MXFP4 (39) and Q4_0 (2) rows share a layout: blocks of 32 elements as 16
+ * bytes of 4-bit codes (low nibble element j, high nibble j + 16) behind the
+ * block scale, an E8M0 byte or an fp16.  An element is lut[code] times the
+ * scale; lut holds the signed E2M1 levels or code - 8. */
+template<unsigned TYPE> struct nib_block {
+    static constexpr unsigned bytes = TYPE == 2 ? 18 : 17, codes = TYPE == 2 ? 2 : 1;
+};
+
+template<unsigned TYPE>
+__device__ __forceinline__ float nib_lut(unsigned i) {
+    if (TYPE == 2) return (float)((int)i - 8);
+    const unsigned mag = i & 7;
+    const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+    return i & 8 ? -level : level;
+}
+
+/* the scale of block blk of a row staged as words */
+template<unsigned TYPE>
+__device__ __forceinline__ float nib_scale(const unsigned *sw, unsigned blk) {
+    if (TYPE == 2) return __half2float(((const __half *)sw)[blk * 9]);
+    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
+    return eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+}
+
+/* the codes of elements 4s..4s+3 (low nibbles) and 4s+16..4s+19 (high
+ * nibbles) of block blk of a staged row */
+template<unsigned TYPE>
+__device__ __forceinline__ unsigned nib_codes(const unsigned *sw, unsigned blk, unsigned s) {
+    const unsigned at = blk * nib_block<TYPE>::bytes + nib_block<TYPE>::codes + 4 * s;
+    return __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
+}
+
+/* Two rows per warp: a down row is only 340 (MXFP4) or 360 (Q4_0) bytes. */
+template<unsigned TYPE>
+__global__ void moe_down_q4(float *out, const float *x, const int *selected,
         const char *w0, const char *sh0, unsigned NE, unsigned NS, unsigned stride,
         unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
     pdl_enter();
     extern __shared__ __align__(16) unsigned moe_stage[];
     __shared__ float lut[16];
-    if (threadIdx.x < 16) {
-        const unsigned mag = threadIdx.x & 7;
-        const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
-        lut[threadIdx.x] = threadIdx.x & 8 ? -level : level;
-    }
+    if (threadIdx.x < 16) lut[threadIdx.x] = nib_lut<TYPE>(threadIdx.x);
     __syncthreads();
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, rw = (unsigned)(rb / 4);
     const unsigned row0 = (blockIdx.x * 4 + warp) * 2, slot = blockIdx.y, t = blockIdx.z;
@@ -2430,10 +2468,9 @@ __global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
                 const float *xs = xt + blk * 32 + 4 * sub;
                 const float4 x0 = *(const float4 *)xs, x1 = *(const float4 *)(xs + 16);
                 for (unsigned r = 0; r < rows; r++) {
-                    const unsigned *sw = stage + r * rw, at = blk * 17 + 1 + 4 * sub;
-                    const unsigned q = __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
-                    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
-                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+                    const unsigned *sw = stage + r * rw;
+                    const unsigned q = nib_codes<TYPE>(sw, blk, sub);
+                    const float scale = nib_scale<TYPE>(sw, blk);
                     float p = lut[q & 15] * x0.x;
                     p += lut[(q >> 8) & 15] * x0.y;
                     p += lut[(q >> 16) & 15] * x0.z;
@@ -2453,26 +2490,23 @@ __global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
     }
 }
 
-/* moe_down_mxfp4 for the decode shape (two rows of at most 96 words and at
- * most 24 MXFP4 blocks per row, i.e. K <= 768), with the latency taken out
- * of each warp's path. The activation loads go out first, as they do not
+/* moe_down_q4 for the decode shape (two rows of at most 96 words and at
+ * most 24 blocks per row, i.e. K <= 768), with the latency taken out of
+ * each warp's path. The activation loads go out first, as they do not
  * depend on the expert id; each lane then loads all of its weight words in
  * one batch instead of two dependent ones; and the shared expert, whose
  * Q8_0 rows are twice as long as a routed row, runs both of its rows in one
  * pass and is dispatched as blockIdx.y == 0, so it lands in the first wave
  * instead of the tail of the second. Each row's arithmetic and lane order
- * are those of moe_down_mxfp4, so the results are identical. */
-__global__ void __launch_bounds__(128, 10) moe_down_mxfp4_lat(float *out, const float *x, const int *selected,
+ * are those of moe_down_q4, so the results are identical. */
+template<unsigned TYPE>
+__global__ void __launch_bounds__(128, 10) moe_down_q4_lat(float *out, const float *x, const int *selected,
         const char *w0, const char *sh0, unsigned NE, unsigned NS, unsigned stride,
         unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
     pdl_enter();
     extern __shared__ __align__(16) unsigned moe_stage[];
     __shared__ float lut[16];
-    if (threadIdx.x < 16) {
-        const unsigned mag = threadIdx.x & 7;
-        const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
-        lut[threadIdx.x] = threadIdx.x & 8 ? -level : level;
-    }
+    if (threadIdx.x < 16) lut[threadIdx.x] = nib_lut<TYPE>(threadIdx.x);
     __syncthreads();
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, rw = (unsigned)(rb / 4);
     const unsigned row0 = (blockIdx.x * 4 + warp) * 2, t = blockIdx.z;
@@ -2509,10 +2543,9 @@ __global__ void __launch_bounds__(128, 10) moe_down_mxfp4_lat(float *out, const 
                 if (blk >= nb) break;
                 const float4 x0 = xv[j][0], x1 = xv[j][1];
                 for (unsigned rr = 0; rr < rows; rr++) {
-                    const unsigned *sw = stage + rr * rw, at = blk * 17 + 1 + 4 * sub;
-                    const unsigned q = __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
-                    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
-                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+                    const unsigned *sw = stage + rr * rw;
+                    const unsigned q = nib_codes<TYPE>(sw, blk, sub);
+                    const float scale = nib_scale<TYPE>(sw, blk);
                     float p = lut[q & 15] * x0.x;
                     p += lut[(q >> 8) & 15] * x0.y;
                     p += lut[(q >> 16) & 15] * x0.z;
@@ -2534,8 +2567,9 @@ __global__ void __launch_bounds__(128, 10) moe_down_mxfp4_lat(float *out, const 
 
 /* A block belongs to a selected (token,slot), but only the first occurrence
  * of that expert runs. Each pass reuses its unpacked weights across four
- * tokens. The per-token K and warp reduction orders match the decode path. */
-template<bool DOWN>
+ * tokens. The per-token K and warp reduction orders match the decode path.
+ * Down rows are MXFP4 or Q4_0 (DT), gate/up rows Q4_K. */
+template<bool DOWN, unsigned DT = 39>
 __global__ void moe_grouped(float *out, const float *x, const int *selected,
         const int *lists, const int *counts, const char *w0, const char *w1,
         unsigned NE, unsigned NS, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
@@ -2543,11 +2577,7 @@ __global__ void moe_grouped(float *out, const float *x, const int *selected,
     extern __shared__ __align__(16) unsigned stage_all[];
     __shared__ float lut[16];
     if (DOWN) {
-        if (threadIdx.x < 16) {
-            const unsigned mag = threadIdx.x & 7;
-            const float v = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
-            lut[threadIdx.x] = threadIdx.x & 8 ? -v : v;
-        }
+        if (threadIdx.x < 16) lut[threadIdx.x] = nib_lut<DT>(threadIdx.x);
         __syncthreads();
     }
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
@@ -2592,10 +2622,9 @@ __global__ void moe_grouped(float *out, const float *x, const int *selected,
             for (unsigned blk = lane/4; blk < K/32; blk += 8) {
                 #pragma unroll
                 for (unsigned r = 0; r < 2; r++) if (r < nr) {
-                    const unsigned *sw = stage+r*rw, at = blk*17+1+4*sub;
-                    const unsigned q = __funnelshift_r(sw[at/4],sw[at/4+1],(at&3)*8);
-                    const unsigned eb = ((const uint8_t *)sw)[blk*17];
-                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb<<23);
+                    const unsigned *sw = stage+r*rw;
+                    const unsigned q = nib_codes<DT>(sw,blk,sub);
+                    const float scale = nib_scale<DT>(sw,blk);
                     const float v[8] = {lut[q&15],lut[(q>>8)&15],lut[(q>>16)&15],lut[(q>>24)&15],
                         lut[(q>>4)&15],lut[(q>>12)&15],lut[(q>>20)&15],lut[q>>28]};
                     #pragma unroll
@@ -2640,15 +2669,17 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
                pf ? pd : (const char *)NULL, pf ? pdb : (uint64_t)0);
         return launched();
     }
-    if (xa && sha && down && type == 39 && !(K % 32) && !(rb & 3) && rb <= 4096 &&
+    if (xa && sha && down && (type == 39 || type == 2) && !(K % 32) && !(rb & 3) && rb <= 4096 &&
         !((uintptr_t)w0 & 3)) {
         const dim3 g2((M + 7) / 8, grid.y, T);
         const size_t smem = (size_t)4 * (2 * (rb / 4) + 1) * 4;
         /* ref (tests) keeps the original kernel as the byte-exact reference. */
-        if (rb <= 384 && K <= 768 && !ref)
-            launch(moe_down_mxfp4_lat, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
-        else
-            launch(moe_down_mxfp4, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        const bool lat = rb <= 384 && K <= 768 && !ref;
+#define QWEN_DOWN_Q4(TYPE) \
+        if (lat) launch(moe_down_q4_lat<TYPE>, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb); \
+        else launch(moe_down_q4<TYPE>, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb)
+        if (type == 2) { QWEN_DOWN_Q4(2); } else { QWEN_DOWN_Q4(39); }
+#undef QWEN_DOWN_Q4
         return launched();
     }
 #define QWEN_MOE_SH(TYPE, SH) \
@@ -3023,7 +3054,7 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
 #endif
 }
 
-/* Prefill expert GEMMs of the Q4 model (Q4_K gate/up, MXFP4 down): the
+/* Prefill expert GEMMs of the Q4 model (Q4_K gate/up, MXFP4 or Q4_0 down): the
  * products of matrix_half_tile, every output rounded the same way.  The
  * operands are the same halves (value4's arithmetic, rounded to nearest)
  * and every output takes the same m16n8k16 chain over k in order, so only
@@ -3049,11 +3080,15 @@ constexpr unsigned XW_SMEM = 2*256*128+3*XW_NT*128+2*XW_NT*4+16*4;
 
 /* One row's raw weights for a 64-element k step: the Q4_K superblock
  * header and the step's 32 bytes of nibbles, or the three aligned 16-byte
- * chunks holding the MXFP4 step's two 17-byte blocks (byte sb onward). */
+ * chunks holding the MXFP4 step's two 17-byte blocks or the Q4_0 step's two
+ * 18-byte blocks (byte sb onward; a multiple of 4 for Q4_0, whose rows and
+ * steps are 36-byte multiples). */
 struct xw_q4k { uint4 h, q0, q1; };
 struct xw_mxfp4 { uint4 c[3]; unsigned sb; };
+struct xw_q4_0 { uint4 c[3]; unsigned sb; };
 template<unsigned TYPE> struct xw_raw { typedef xw_q4k type; };
 template<> struct xw_raw<39> { typedef xw_mxfp4 type; };
+template<> struct xw_raw<2> { typedef xw_q4_0 type; };
 
 __device__ __forceinline__ void xw_load(xw_q4k &r, const char *row, unsigned k) {
     const char *b = row+k/256*144;
@@ -3064,6 +3099,13 @@ __device__ __forceinline__ void xw_load(xw_q4k &r, const char *row, unsigned k) 
 
 __device__ __forceinline__ void xw_load(xw_mxfp4 &r, const char *row, unsigned k) {
     const uintptr_t a = (uintptr_t)(row+k/32*17), a16 = a&~(uintptr_t)15;
+    r.sb = (unsigned)(a&15);
+    #pragma unroll
+    for (unsigned i = 0; i < 3; i++) r.c[i] = __ldg((const uint4 *)a16+i);
+}
+
+__device__ __forceinline__ void xw_load(xw_q4_0 &r, const char *row, unsigned k) {
+    const uintptr_t a = (uintptr_t)(row+k/32*18), a16 = a&~(uintptr_t)15;
     r.sb = (unsigned)(a&15);
     #pragma unroll
     for (unsigned i = 0; i < 3; i++) r.c[i] = __ldg((const uint4 *)a16+i);
@@ -3148,6 +3190,42 @@ __device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_mxfp4 &r, u
             out[blk*4+c] = make_uint4(hv[0],hv[1],hv[2],hv[3]);
         }
     }
+}
+
+/* two Q4_0 codes (bytes 0 and 1 of a, already masked to nibbles) as halves
+ * 1024 + q, minus 1032, times d: q - 8 is exact and the product rounds
+ * once, to the half that value4<2>'s float product rounds to */
+__device__ __forceinline__ unsigned xw_q4_0_pair(unsigned a, __half2 d) {
+    const unsigned bits = __byte_perm(a,0x64646464u,0x4140);
+    __half2 h = __hmul2(__hsub2(*(const __half2 *)&bits,__float2half2_rn(1032.0f)),d);
+    return *(const unsigned *)&h;
+}
+
+/* value4<2> for elements k..k+63: the step's 36 bytes moved to word 0 */
+__device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_q4_0 &r, unsigned, const float *) {
+    const unsigned w[12] = {r.c[0].x,r.c[0].y,r.c[0].z,r.c[0].w,r.c[1].x,r.c[1].y,r.c[1].z,r.c[1].w,
+                            r.c[2].x,r.c[2].y,r.c[2].z,r.c[2].w};
+    const unsigned wo = r.sb/4;
+    unsigned u[10], v[9];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; j++) u[j] = wo&2 ? w[j+2] : w[j];
+    #pragma unroll
+    for (unsigned j = 0; j < 9; j++) v[j] = wo&1 ? u[j+1] : u[j];
+    /* block 0: d in bytes 0-1, codes in 2-17; block 1: d in 18-19, codes in 20-35 */
+    const unsigned q[2][4] = {{__funnelshift_r(v[0],v[1],16),__funnelshift_r(v[1],v[2],16),
+                               __funnelshift_r(v[2],v[3],16),__funnelshift_r(v[3],v[4],16)},
+                              {v[5],v[6],v[7],v[8]}};
+    const __half2 d[2] = {__half2half2(__ushort_as_half((unsigned short)(v[0]&0xffff))),
+                          __half2half2(__ushort_as_half((unsigned short)(v[4]>>16)))};
+    #pragma unroll
+    for (unsigned blk = 0; blk < 2; blk++)
+        #pragma unroll
+        for (unsigned c = 0; c < 4; c++) {
+            /* elements c*8..c*8+7: bytes c%2*8 onward, high nibbles from c = 2 */
+            const unsigned a = (q[blk][c%2*2]>>(c/2*4))&0x0f0f0f0fu, b = (q[blk][c%2*2+1]>>(c/2*4))&0x0f0f0f0fu;
+            out[blk*4+c] = make_uint4(xw_q4_0_pair(a,d[blk]),xw_q4_0_pair(a>>16,d[blk]),
+                                      xw_q4_0_pair(b,d[blk]),xw_q4_0_pair(b>>16,d[blk]));
+        }
 }
 
 /* 16-byte chunk c of row r in a 128-byte-row tile, swizzled so the
@@ -3512,9 +3590,11 @@ __global__ void half_rows(__half *out, const float *x, uint64_t n) {
 /* matrix_half_ws with its tile schedule and half activations in the
  * scratch, a block per SM */
 static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
-        const int *lists, const int *counts, unsigned NE, unsigned T, unsigned NS,
+        const int *lists, const int *counts, unsigned type, unsigned NE, unsigned T, unsigned NS,
         unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
-    const uint64_t rb = expert_row_bytes(down ? 39 : 12, K), nx = (uint64_t)T*(down ? NO : 1)*K;
+    const uint64_t rb = expert_row_bytes(type, K), nx = (uint64_t)T*(down ? NO : 1)*K;
+    /* kernel: Q4_K gate/up, MXFP4 down, Q4_0 down */
+    const unsigned kid = !down ? 0 : type == 2 ? 2 : 1;
     const uint64_t tb = (((uint64_t)NE+1)*4+255)/256*256;
     unsigned char *scratch = (unsigned char *)cuda_tmp_alloc(tb+nx*2, "Qwen expert scratch");
     if (!scratch) return 0;
@@ -3527,18 +3607,18 @@ static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
     launch(half_rows, (nx/4+255)/256, 256, 0, xh,x,nx);
     if (!launched()) return 0;
     if (wb) {
-        static int wopted[2] = {-1,-1}, wsms = 0;
-        auto kernel = down ? matrix_half_wb<39,true> : matrix_half_wb<12,false>;
-        if (wopted[down] < 0) {
+        static int wopted[3] = {-1,-1,-1}, wsms = 0;
+        auto kernel = kid == 2 ? matrix_half_wb<2,true> : kid ? matrix_half_wb<39,true> : matrix_half_wb<12,false>;
+        if (wopted[kid] < 0) {
             int dev = 0;
-            wopted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, WB_SMEM) == cudaSuccess &&
-                           cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                                cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
-                           cudaGetDevice(&dev) == cudaSuccess &&
-                           cudaDeviceGetAttribute(&wsms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && wsms > 0;
+            wopted[kid] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, WB_SMEM) == cudaSuccess &&
+                          cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                               cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                          cudaGetDevice(&dev) == cudaSuccess &&
+                          cudaDeviceGetAttribute(&wsms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && wsms > 0;
             (void)cudaGetLastError();
         }
-        if (!wopted[down]) return 0;
+        if (!wopted[kid]) return 0;
         const unsigned wrows = down ? WB_AR : WB_AR/2;
         const uint64_t wjobs = ((uint64_t)T*NS+WB_NT-1)/WB_NT+NE, wblocks = wjobs*((M+wrows-1)/wrows);
         launch(kernel, (unsigned)std::min<uint64_t>(wblocks,(uint64_t)wsms), 384, WB_SMEM,
@@ -3548,18 +3628,18 @@ static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
     const unsigned rows = down ? 256 : 128;
     const uint64_t jobs = ((uint64_t)T*NS+XW_NT-1)/XW_NT+NE, blocks = jobs*((M+rows-1)/rows);
     if (blocks > INT_MAX) return 0;
-    auto kernel = down ? matrix_half_ws<39,true> : matrix_half_ws<12,false>;
-    static int opted[2] = {-1,-1}, sms = 0;
-    if (opted[down] < 0) {
+    auto kernel = kid == 2 ? matrix_half_ws<2,true> : kid ? matrix_half_ws<39,true> : matrix_half_ws<12,false>;
+    static int opted[3] = {-1,-1,-1}, sms = 0;
+    if (opted[kid] < 0) {
         int dev = 0;
-        opted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, XW_SMEM) == cudaSuccess &&
-                      cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                           cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
-                      cudaGetDevice(&dev) == cudaSuccess &&
-                      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0;
+        opted[kid] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, XW_SMEM) == cudaSuccess &&
+                     cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                          cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                     cudaGetDevice(&dev) == cudaSuccess &&
+                     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0;
         (void)cudaGetLastError();
     }
-    if (!opted[down]) return 0;
+    if (!opted[kid]) return 0;
     launch(kernel, (unsigned)std::min<uint64_t>(blocks,(uint64_t)sms), 512, XW_SMEM,
            out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
     return launched();
@@ -3571,10 +3651,11 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
-        if (lists && !g_quality_mode && T >= 2048 && type == (down ? 39u : 12u) && !(K%(down ? 64 : 256)) &&
+        if (lists && !g_quality_mode && T >= 2048 && (down ? type == 39u || type == 2u : type == 12u) &&
+            !(K%(down ? 64 : 256)) &&
             !(((uintptr_t)x|(uintptr_t)w0|(uintptr_t)(down ? w0 : w1))&15) && env_on("DS4_QWEN4_EXPERT_WS"))
-            return expert_ws(out,x,w0,w1,lists,counts,NE,T,NS,NO,K,M,cap,down);
-        if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
+            return expert_ws(out,x,w0,w1,lists,counts,type,NE,T,NS,NO,K,M,cap,down);
+        if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39 || type == 2)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
             if (!tiles) return 0;
@@ -3588,7 +3669,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             if (nt == 64) launch(matrix_half_tile<TYPE,DOWN,64,(TYPE == 10 ? 64 : 128)>, blocks, 256, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else launch(matrix_half_tile<TYPE,DOWN,32>, blocks, 256, 0, out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
-            switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
+            switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); QWEN_HALF_TYPE(2); }
 #undef QWEN_HALF_TYPE
 #undef QWEN_HALF
             return launched();
@@ -6946,7 +7027,8 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     return qwen4_moe_down(part, mid, sel, map, size, off, type, NE, T, NS, K, M, so, st, false);
 }
 
-/* Tests only: moe_down_tensor with the original MXFP4 down kernel. */
+/* Tests only: moe_down_tensor with the original MXFP4 or Q4_0 down kernel
+ * (moe_down_q4, not its latency-ordered form). */
 extern "C" int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
@@ -7001,13 +7083,15 @@ static int qwen4_moe_grouped(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const
         uint32_t K, uint32_t M, bool down) {
     using namespace qwen4_cuda;
     const uint64_t rb = expert_row_bytes(type,K);
-    if (!T || !NS || NS > NE || NE > 512 || !M || cap < T || (down ? type != 39 || K%128 : type != 12 || K%256) ||
+    if (!T || !NS || NS > NE || NE > 512 || !M || cap < T ||
+        (down ? (type != 39 && type != 2) || K%128 : type != 12 || K%256) ||
         !tensor(out,(uint64_t)T*NS*M*4) || !tensor(x,(uint64_t)T*(down ? NS : 1)*K*4) ||
         !tensor(sel,(uint64_t)T*NS*4) || !tensor(lists,(uint64_t)NE*cap*4) || !tensor(counts,(uint64_t)NE*4)) return 0;
     const char *w0 = weight(map,size,o0,rb*M*NE), *w1 = down ? NULL : weight(map,size,o1,rb*M*NE);
     if (!w0 || (!down && !w1)) return 0;
     const dim3 grid((M+(down ? 7 : 3))/(down ? 8 : 4),T*NS);
-    if (down) launch(moe_grouped<true>,grid,128,4*(2*(rb/4)+1)*4,(float *)out->ptr,(const float *)x->ptr,
+    if (down) launch(type == 2 ? moe_grouped<true,2> : moe_grouped<true,39>,grid,128,4*(2*(rb/4)+1)*4,
+        (float *)out->ptr,(const float *)x->ptr,
         (const int *)sel->ptr,(const int *)lists->ptr,(const int *)counts->ptr,w0,w1,NE,NS,K,M,cap,rb);
     else launch(moe_grouped<false>,grid,128,0,(float *)out->ptr,(const float *)x->ptr,
         (const int *)sel->ptr,(const int *)lists->ptr,(const int *)counts->ptr,w0,w1,NE,NS,K,M,cap,rb);
