@@ -59483,6 +59483,15 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
 static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *norm, const ds4_tensor *down,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+#ifndef DS4_HAS_QWEN4_METAL
+    /* CUDA prefill: the norm with the down projection's pack, and the up
+     * projection with the mix (xn is not kept; hc_u is free scratch here) */
+    if (qwen4_select_rows(T) > 8u && down->type == DS4_TENSOR_F16 && up->type == DS4_TENSOR_F16 &&
+        ds4_gpu_qwen4_hc_mix_prefill_tensor(g->mixed, g->inj, g->lo, g->hc_lo_act, g->xn, g->hc_u, g->R,
+            m->map, m->size, norm->abs_offset, inject ? inject->abs_offset : 0,
+            inject ? inject->type : DS4_TENSOR_F32, down->abs_offset, up->abs_offset, T, DS4_N_EMBD, DS4_N_HC,
+            inject ? DS4_N_HC : 0u, DS4_N_HC_LOWRANK, DS4_RMS_EPS)) return true;
+#endif
     bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
@@ -59490,8 +59499,13 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if (qwen4_select_rows(T) > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
-        return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
-               qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
+        ok = ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK);
+#ifndef DS4_HAS_QWEN4_METAL
+        /* CUDA: the projection and the mix in one kernel where it applies */
+        if (ok && ds4_gpu_qwen4_hc_up_rows_tensor(g->mixed, g->hc_lo_act, g->xn, m->map, m->size, up->abs_offset,
+                                                  up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK)) return true;
+#endif
+        return ok && qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
 #ifdef DS4_HAS_QWEN4_METAL
