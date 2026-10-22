@@ -481,6 +481,12 @@ tests/test_cuda_v41_index_scores.o: tests/test_cuda_v41_index_scores.c ds4_gpu.h
 tests/test_cuda_v41_index_scores: tests/test_cuda_v41_index_scores.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/test_cuda_q8_mma_groups.o: tests/test_cuda_q8_mma_groups.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_q8_mma_groups: tests/test_cuda_q8_mma_groups.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 .PHONY: test-cuda-ssd-cache
 test-cuda-ssd-cache: tests/test_cuda_ssd_cache
 	./tests/test_cuda_ssd_cache
@@ -1419,6 +1425,7 @@ clean:
 	rm -f tests/test_cuda_v41_fusion
 	rm -f tests/test_cuda_v41_projection_rows
 	rm -f tests/test_cuda_v41_index_scores
+	rm -f tests/test_cuda_q8_mma_groups
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
