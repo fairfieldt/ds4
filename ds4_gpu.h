@@ -3726,13 +3726,15 @@ int ds4_gpu_qwen4_hc_up_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor 
                                     uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank);
 /* CUDA: a prefill HC mix (norm, down, activation, up, mix) of F16 down and
  * up weights in four launches, xn not kept (hilo and scales are scratch);
+ * with comb, hc_combine_tensor(R, comb, inj) first in the norm's launch.
  * 0 before any launch where it does not apply. */
 int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *lo,
                                         ds4_gpu_tensor *lo_act, ds4_gpu_tensor *hilo, ds4_gpu_tensor *scales,
-                                        const ds4_gpu_tensor *R, const void *model_map, uint64_t model_size,
+                                        ds4_gpu_tensor *R, const void *model_map, uint64_t model_size,
                                         uint64_t norm_offset, uint64_t inject_offset, uint32_t inject_type,
                                         uint64_t down_offset, uint64_t up_offset, uint32_t n_tokens, uint32_t n_embd,
-                                        uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps);
+                                        uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps,
+                                        const ds4_gpu_tensor *comb);
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
