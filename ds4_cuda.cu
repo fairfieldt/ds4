@@ -29100,6 +29100,51 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* DS4_CUDA_SSD_STATS=1 prints expert cache hits and miss time at exit.
+ * DS4_CUDA_SSD_TRACE=FILE writes "layer slots expert..." per load request. */
+struct cuda_ssd_stats {
+    uint64_t calls[2], unique[2], hits[2], misses[2], wait_ns[2], miss_ns[2];
+};
+static cuda_ssd_stats g_ssd_stats;
+static int g_ssd_stats_on = -1;
+static FILE *g_ssd_trace;
+
+static uint64_t cuda_ssd_stats_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static void cuda_ssd_stats_print(void) {
+    static const char *names[2] = {"decode", "prefill"};
+    for (int k = 0; k < 2; k++) {
+        const cuda_ssd_stats &s = g_ssd_stats;
+        if (!s.calls[k]) continue;
+        fprintf(stderr,
+                "ds4: CUDA SSD stats %s: %llu loads, %llu experts, %.2f%% hits, "
+                "%llu misses, wait %.1f ms, miss %.1f ms (%.3f ms/miss)\n",
+                names[k], (unsigned long long)s.calls[k], (unsigned long long)s.unique[k],
+                s.unique[k] ? 100.0 * (double)s.hits[k] / (double)s.unique[k] : 0.0,
+                (unsigned long long)s.misses[k], (double)s.wait_ns[k] / 1e6,
+                (double)s.miss_ns[k] / 1e6,
+                s.misses[k] ? (double)s.miss_ns[k] / 1e6 / (double)s.misses[k] : 0.0);
+    }
+    if (g_ssd_trace) fflush(g_ssd_trace);
+}
+
+static bool cuda_ssd_stats_enabled(void) {
+    if (g_ssd_stats_on < 0) {
+        g_ssd_stats_on = getenv("DS4_CUDA_SSD_STATS") != NULL;
+        const char *trace = getenv("DS4_CUDA_SSD_TRACE");
+        if (trace && trace[0]) {
+            g_ssd_trace = fopen(trace, "w");
+            if (!g_ssd_trace) fprintf(stderr, "ds4: cannot open %s\n", trace);
+        }
+        if (g_ssd_stats_on || g_ssd_trace) atexit(cuda_ssd_stats_print);
+    }
+    return g_ssd_stats_on || g_ssd_trace;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -29114,8 +29159,16 @@ static int cuda_stream_selected_cache_begin_load(
         fprintf(stderr, "ds4: CUDA SSD streaming requires single-GPU placement\n");
         return 0;
     }
+    const bool stats = cuda_ssd_stats_enabled();
+    const int stats_kind = slot_count > 64u ? 1 : 0;
+    uint64_t stats_t0 = stats ? cuda_ssd_stats_now_ns() : 0;
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
         return 0;
+    if (stats) {
+        const uint64_t t = cuda_ssd_stats_now_ns();
+        g_ssd_stats.wait_ns[stats_kind] += t - stats_t0;
+        stats_t0 = t;
+    }
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
         std::vector<int32_t> unique, remap(slot_count);
@@ -29231,6 +29284,19 @@ static int cuda_stream_selected_cache_begin_load(
                 return unique[a] < unique[b];
             });
         }
+        if (stats) {
+            uint64_t hits = 0;
+            for (int32_t slot : slots) hits += slot >= 0;
+            g_ssd_stats.calls[stats_kind]++;
+            g_ssd_stats.unique[stats_kind] += unique.size();
+            g_ssd_stats.hits[stats_kind] += hits;
+            g_ssd_stats.misses[stats_kind] += unique.size() - hits;
+            if (g_ssd_trace) {
+                fprintf(g_ssd_trace, "%u %u", table->layer, slot_count);
+                for (int32_t expert : unique) fprintf(g_ssd_trace, " %d", expert);
+                fputc('\n', g_ssd_trace);
+            }
+        }
         cuda_stream_upload_batch uploads;
         for (size_t at = 0; at < unique.size(); at++) {
             const size_t i = ordered ? order[at] : at;
@@ -29326,6 +29392,7 @@ static int cuda_stream_selected_cache_begin_load(
             const uint32_t slot = (uint32_t)slots[i];
             g_stream_expert_by_gate[g_stream_expert_slots[slot].gate] = slot;
         }
+        if (stats) g_ssd_stats.miss_ns[stats_kind] += cuda_ssd_stats_now_ns() - stats_t0;
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
