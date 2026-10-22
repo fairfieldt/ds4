@@ -1672,6 +1672,70 @@ static void test_pack_once_exact(arena_t *a, uint32_t T, uint32_t K, uint32_t N,
     ds4_gpu_tensor_free(gx); free(x);
 }
 
+/* Q8 prefill projections take dense_split_tma where cuBLAS does not split
+ * k: the outputs equal the three GEMMs' and the rescale's bit for bit
+ * (DS4_QWEN4_SPLIT_TMA=0).  The weights are the first M rows of one Q8
+ * tensor per K. */
+static void test_split_tma_exact(arena_t *a, uint32_t T, uint32_t K, uint32_t M) {
+    static uint64_t woff[3];
+    static const uint32_t wk[3] = { 2560, 6144, 640 }, wm[3] = { 12288, 2560, 2560 };
+    unsigned wi = K == wk[0] ? 0 : K == wk[1] ? 1 : 2;
+    require_ok(K == wk[wi] && M <= wm[wi], "split tma shape");
+    if (!woff[wi]) { double *sh; woff[wi] = arena_q8_0(a, wm[wi], K, &sh, 0.05f); free(sh); }
+    float *x = rand_vec((uint64_t)T * K, 1.0f), *got[2];
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K);
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_SPLIT_TMA", pipe ? "1" : "0", 1);
+        ds4_gpu_tensor *go = upload(NULL, (uint64_t)T * M);
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(go, gx, a->base, a->size, woff[wi], 8u, T, K, M), "split tma mm");
+        got[pipe] = download(go, (uint64_t)T * M);
+        ds4_gpu_tensor_free(go);
+    }
+    unsetenv("DS4_QWEN4_SPLIT_TMA");
+    char name[96];
+    snprintf(name, sizeof(name), "split tma exact T=%u K=%u M=%u", T, K, M);
+    uint64_t diff = 0;
+    for (uint64_t i = 0; i < (uint64_t)T * M; i++) diff += memcmp(&got[0][i], &got[1][i], 4) != 0;
+    if (diff) printf("  %-44s %llu of %llu differ\n", name, (unsigned long long)diff, (unsigned long long)T * M);
+    require_ok(diff == 0, name);
+    printf("  %-44s ok\n", name);
+    free(got[0]); free(got[1]); free(x); ds4_gpu_tensor_free(gx);
+}
+
+/* Q8 projections of one input (multi_gemv): the weights dense_split_tma
+ * takes share a launch, the others keep cuBLAS; every output equals the
+ * cuBLAS path's bit for bit (DS4_QWEN4_SPLIT_TMA=0). */
+static void test_split_multi_exact(arena_t *a, uint32_t T, uint32_t K, uint32_t N, const uint32_t *M) {
+    static uint64_t woff[3];
+    static const uint32_t wk[3] = { 2560, 6144, 640 }, wm[3] = { 12288, 2560, 2560 };
+    unsigned wi = K == wk[0] ? 0 : K == wk[1] ? 1 : 2;
+    require_ok(K == wk[wi], "split multi shape");
+    if (!woff[wi]) { double *sh; woff[wi] = arena_q8_0(a, wm[wi], K, &sh, 0.05f); free(sh); }
+    uint64_t off[4];
+    const uint64_t rb = (uint64_t)K / 32 * 34;
+    uint32_t r0 = 0;
+    for (uint32_t i = 0; i < N; i++) { require_ok(r0 + M[i] <= wm[wi], "split multi rows"); off[i] = woff[wi] + (uint64_t)r0 * rb; r0 += M[i]; }
+    float *x = rand_vec((uint64_t)T * K, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *o[2][4];
+    const uint32_t types[4] = { 8u, 8u, 8u, 8u };
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_SPLIT_TMA", pipe ? "1" : "0", 1);
+        for (uint32_t i = 0; i < N; i++) o[pipe][i] = upload(NULL, (uint64_t)T * M[i]);
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, K, N, o[pipe], a->base, a->size, off, types, M), "split multi");
+    }
+    unsetenv("DS4_QWEN4_SPLIT_TMA");
+    char name[96];
+    snprintf(name, sizeof(name), "split tma multi exact T=%u K=%u N=%u M0=%u", T, K, N, M[0]);
+    for (uint32_t i = 0; i < N; i++) {
+        float *r = download(o[0][i], (uint64_t)T * M[i]), *g = download(o[1][i], (uint64_t)T * M[i]);
+        require_ok(memcmp(r, g, (uint64_t)T * M[i] * 4) == 0, name);
+        free(r); free(g);
+        ds4_gpu_tensor_free(o[0][i]); ds4_gpu_tensor_free(o[1][i]);
+    }
+    printf("  %-44s ok\n", name);
+    ds4_gpu_tensor_free(gx); free(x);
+}
+
 static void test_gdn_pipe_exact(uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t st, uint32_t st2) {
     const uint32_t D = 128, C = (2 * Hk + Hv) * D;
     const uint64_t ns = (uint64_t)Hv * D * D, no = (uint64_t)T * Hv * D, nq = (uint64_t)T * C;
@@ -1777,7 +1841,30 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
     free(x); free(sel);
 }
 
+/* The Q8 projections of a prefill chunk's shapes, and partial chunks
+ * where the rule keeps cuBLAS for the small tiles. */
+static void test_split_exact_all(arena_t *a) {
+    static const uint32_t sk[] = { 2560, 2560, 2560, 2560, 2560, 2560, 2560, 6144, 640 },
+                          sm[] = { 10240, 6144, 12288, 512, 128, 640, 2560, 2560, 2560 };
+    for (unsigned i = 0; i < sizeof(sk) / sizeof(sk[0]); i++) test_split_tma_exact(a, 8192, sk[i], sm[i]);
+    /* the attention layer's keys, values and indexer projections, the shared expert's gate and up */
+    static const uint32_t m4[4] = { 512, 512, 512, 128 }, m2[2] = { 640, 640 };
+    test_split_multi_exact(a, 8192, 2560, 4, m4);
+    test_split_multi_exact(a, 8192, 2560, 2, m2);
+    test_split_tma_exact(a, 7000, 2560, 10240);
+    /* the tiles of 3264 rows fused, the last 448 on cuBLAS */
+    test_split_tma_exact(a, 2048, 2560, 10240);
+    test_split_tma_exact(a, 4096, 2560, 12288);
+    test_split_tma_exact(a, 3001, 2560, 6144);
+    test_split_tma_exact(a, 1500, 2560, 2560);
+    test_split_tma_exact(a, 900, 6144, 2560);
+    test_split_tma_exact(a, 4500, 640, 2560);
+    test_split_multi_exact(a, 5000, 2560, 2, m2);
+}
+
 static void test_prefill_pipes_exact_all(arena_t *a) {
+    test_split_exact_all(a);
+    if (getenv("DS4_TEST_QWEN4_SPLIT_ONLY")) return;
     {
         static const uint32_t m2[2] = { 4096, 2048 }, m4[4] = { 512, 512, 512, 128 }, m3[3] = { 640, 3300, 64 };
         test_pack_once_exact(a, 2048, 2560, 2, m2);
@@ -4411,6 +4498,7 @@ static double bench_run(const char *name, bench_fn fn, void *ud, uint32_t reps) 
     require_ok(fn(ud), name);
     require_ok(ds4_gpu_end_commands(), "end");
     require_ok(ds4_gpu_synchronize(), "sync");
+    if (getenv("QWEN4_BENCH_REPS")) reps = (uint32_t)atoi(getenv("QWEN4_BENCH_REPS"));
     const double t0 = bench_now();
     require_ok(ds4_gpu_begin_commands(), "begin");
     for (uint32_t r = 0; r < reps; r++) require_ok(fn(ud), name);
@@ -5443,6 +5531,53 @@ static void bench_f16_prefill(arena_t *a) {
     ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.out); free(x);
 }
 
+/* DS4_TEST_QWEN4_Q8_BENCH=1: one prefill chunk's Q8 projections of the
+ * main shapes (8192 rows), per path (DS4_QWEN4_SPLIT_TMA=0 for the three
+ * cuBLAS GEMMs and the rescale); weights copied to the device first */
+typedef struct { arena_t *a; ds4_gpu_tensor *x, *out; uint64_t w; uint32_t K, M; } q8_bench;
+static int bench_q8_one(void *ud) {
+    q8_bench *c = ud;
+    return ds4_gpu_qwen4_dense_mm_tensor(c->out, c->x, c->a->base, c->a->size, c->w, 8u, 8192, c->K, c->M);
+}
+
+/* the GDN layer's qkv and gate projections, packed once and in one launch */
+typedef struct { arena_t *a; ds4_gpu_tensor *x, *o0, *o1; uint64_t w0, w1; } q8_pair_bench;
+static int bench_q8_pair(void *ud) {
+    q8_pair_bench *c = ud;
+    return ds4_gpu_qwen4_q8_pair_tensor(c->o0, c->o1, c->a->base, c->a->size, c->w0, c->w1, 2560, 10240, 6144, c->x, 8192);
+}
+
+static void bench_q8_prefill(arena_t *a) {
+    static const uint32_t sk[] = { 2560, 2560, 6144, 2560, 640 }, sm[] = { 10240, 6144, 2560, 640, 2560 };
+    uint64_t w[5];
+    for (unsigned i = 0; i < 5; i++) { double *sh; w[i] = arena_q8_0(a, sm[i], sk[i], &sh, 0.05f); free(sh); }
+    setenv("DS4_CUDA_COPY_MODEL", "1", 1);
+    require_ok(ds4_gpu_set_model_map(a->base, (a->used + 4095) & ~(uint64_t)4095), "q8 bench device copy");
+    {
+        float *x = rand_vec((uint64_t)8192 * 2560, 1.0f);
+        q8_pair_bench c = { a, upload(x, (uint64_t)8192 * 2560), upload(NULL, (uint64_t)8192 * 10240),
+                            upload(NULL, (uint64_t)8192 * 6144), w[0], w[1] };
+        for (int pipe = 0; pipe < 2; pipe++) {
+            setenv("DS4_QWEN4_SPLIT_TMA", pipe ? "1" : "0", 1);
+            bench_run(pipe ? "q8 split tma qkv+gate T=8192" : "q8 cublas x3 qkv+gate T=8192", bench_q8_pair, &c, 10);
+        }
+        unsetenv("DS4_QWEN4_SPLIT_TMA");
+        ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.o0); ds4_gpu_tensor_free(c.o1); free(x);
+    }
+    for (unsigned i = 0; i < 5; i++) {
+        float *x = rand_vec((uint64_t)8192 * sk[i], 1.0f);
+        q8_bench c = { a, upload(x, (uint64_t)8192 * sk[i]), upload(NULL, (uint64_t)8192 * sm[i]), w[i], sk[i], sm[i] };
+        for (int pipe = 0; pipe < 2; pipe++) {
+            setenv("DS4_QWEN4_SPLIT_TMA", pipe ? "1" : "0", 1);
+            char name[64];
+            snprintf(name, sizeof(name), "q8 %s K=%u M=%u T=8192", pipe ? "split tma" : "cublas x3", sk[i], sm[i]);
+            bench_run(name, bench_q8_one, &c, 10);
+        }
+        unsetenv("DS4_QWEN4_SPLIT_TMA");
+        ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.out); free(x);
+    }
+}
+
 static void bench_expert_prefill(arena_t *a) {
     const uint32_t T = getenv("QWEN4_BENCH_T") ? (uint32_t)atoi(getenv("QWEN4_BENCH_T")) : 8192, NE = 512, NS = 10, E = 2560, F = 640;
     const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * 17;
@@ -5638,7 +5773,7 @@ static void test_select_rows(arena_t *a) {
 
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)1536 << 20;
+    arena.size = (uint64_t)2048 << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -5695,6 +5830,7 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_ATTN_BENCH")) { bench_attn_prefill(); return 0; }
     if (getenv("DS4_TEST_QWEN4_PREFILL_PIPES_ONLY")) { test_prefill_pipes_exact_all(&arena); printf("all qwen4 prefill pipe tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_EXPERT_BENCH")) { bench_expert_prefill(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_Q8_BENCH")) { bench_q8_prefill(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_F16_BENCH")) { bench_f16_prefill(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_GDN_BENCH")) { bench_gdn_prefill(&arena); return 0; }
 #endif
