@@ -1834,8 +1834,9 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
 
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
-/* Prefill takes conv_seg, ngram_conv_seg and gdn_scan_pipe (the outputs
- * of conv, ngram_conv and gdn_scan); DS4_QWEN4_CONV_SEG=0 (both convs) and
+/* Prefill takes matrix_half_ws, conv_seg, ngram_conv_seg and
+ * gdn_scan_pipe (the outputs of matrix_half_tile, conv, ngram_conv and
+ * gdn_scan); DS4_QWEN4_EXPERT_WS=0, DS4_QWEN4_CONV_SEG=0 (both convs) and
  * DS4_QWEN4_GDN_PIPE=0 keep the originals.  Read per call for the tests. */
 static bool env_on(const char *name) {
     const char *env = getenv(name);
@@ -3018,12 +3019,371 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
 #endif
 }
 
+/* Prefill expert GEMMs of the Q4 model (Q4_K gate/up, MXFP4 down): the
+ * products of matrix_half_tile, every output rounded the same way.  The
+ * operands are the same halves (value4's arithmetic, rounded to nearest)
+ * and every output takes the same m16n8k16 chain over k in order, so only
+ * the schedule differs.  matrix_half_tile dequantizes through value4's
+ * byte loads and reads each activation as a float, so a block waits on
+ * dependent loads before every k step and the tensor cores idle.
+ *
+ * matrix_half_ws runs one persistent block per SM over tiles of 256 A rows
+ * (128 gate rows and the same up rows, or 256 down rows) by 64 tokens.
+ * Eight producer warps load the weights two k steps ahead (a thread per A
+ * row), dequantize them into one of two A stages and copy the activations
+ * (packed to halves once per call) into one of three B stages a step
+ * ahead; eight consumer warps only multiply.  Named barriers hand the
+ * stages over: FULL (producers arrive, consumers wait) and EMPTY (the
+ * reverse).  An expert's last tile is partly empty: its consumers skip the
+ * 8-token columns past the expert's tokens, whose products are never
+ * stored. */
+constexpr unsigned XW_NT = 64;
+
+/* shared memory: two A stages, three B stages, two tiles' token pairs and
+ * the E2M1 levels (90,688 bytes) */
+constexpr unsigned XW_SMEM = 2*256*128+3*XW_NT*128+2*XW_NT*4+16*4;
+
+/* One row's raw weights for a 64-element k step: the Q4_K superblock
+ * header and the step's 32 bytes of nibbles, or the three aligned 16-byte
+ * chunks holding the MXFP4 step's two 17-byte blocks (byte sb onward). */
+struct xw_q4k { uint4 h, q0, q1; };
+struct xw_mxfp4 { uint4 c[3]; unsigned sb; };
+template<unsigned TYPE> struct xw_raw { typedef xw_q4k type; };
+template<> struct xw_raw<39> { typedef xw_mxfp4 type; };
+
+__device__ __forceinline__ void xw_load(xw_q4k &r, const char *row, unsigned k) {
+    const char *b = row+k/256*144;
+    r.h = __ldg((const uint4 *)b);
+    r.q0 = __ldg((const uint4 *)(b+16+k%256/64*32));
+    r.q1 = __ldg((const uint4 *)(b+32+k%256/64*32));
+}
+
+__device__ __forceinline__ void xw_load(xw_mxfp4 &r, const char *row, unsigned k) {
+    const uintptr_t a = (uintptr_t)(row+k/32*17), a16 = a&~(uintptr_t)15;
+    r.sb = (unsigned)(a&15);
+    #pragma unroll
+    for (unsigned i = 0; i < 3; i++) r.c[i] = __ldg((const uint4 *)a16+i);
+}
+
+__device__ __forceinline__ unsigned xw_byte(const uint4 &h, unsigned i) {
+    return ((i < 4 ? h.y : i < 8 ? h.z : h.w) >> i%4*8)&255;
+}
+
+__device__ __forceinline__ unsigned half2_bits(float a, float b) {
+    const __half2 h = __floats2half2_rn(a,b);
+    return *(const unsigned *)&h;
+}
+
+/* value4<12> for elements k..k+63, in 16-byte chunks of halves; a nibble n
+ * becomes the float 2^23 + n by a byte permute, minus 2^23 (exact, where
+ * the integer conversion issues at half rate) */
+__device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_q4k &r, unsigned k, const float *) {
+    const unsigned g0 = k%256/32, q[8] = {r.q0.x,r.q0.y,r.q0.z,r.q0.w,r.q1.x,r.q1.y,r.q1.z,r.q1.w};
+    const float d = __half2float(__ushort_as_half((unsigned short)(r.h.x&0xffff)));
+    const float dm = __half2float(__ushort_as_half((unsigned short)(r.h.x>>16)));
+    float scale[2], offset[2];
+    #pragma unroll
+    for (unsigned s = 0; s < 2; s++) {
+        const unsigned g = g0+s;
+        unsigned sc, mn;
+        if (g < 4) { sc = xw_byte(r.h,g)&63; mn = xw_byte(r.h,g+4)&63; }
+        else {
+            sc = (xw_byte(r.h,g+4)&15)|((xw_byte(r.h,g-4)>>6)<<4);
+            mn = (xw_byte(r.h,g+4)>>4)|((xw_byte(r.h,g)>>6)<<4);
+        }
+        scale[s] = d*sc; offset[s] = dm*mn;
+    }
+    #pragma unroll
+    for (unsigned c = 0; c < 8; c++) {
+        unsigned hv[4];
+        #pragma unroll
+        for (unsigned w = 0; w < 2; w++) {
+            const unsigned word = (c/4 ? q[c%4*2+w]>>4 : q[c%4*2+w])&0x0f0f0f0fu;
+            float v[4];
+            #pragma unroll
+            for (unsigned b = 0; b < 4; b++)
+                v[b] = scale[c/4]*(__uint_as_float(__byte_perm(word,0x4b000000u,b|0x7540u))-8388608.0f)-offset[c/4];
+            hv[w*2] = half2_bits(v[0],v[1]);
+            hv[w*2+1] = half2_bits(v[2],v[3]);
+        }
+        out[c] = make_uint4(hv[0],hv[1],hv[2],hv[3]);
+    }
+}
+
+/* value4<39> for elements k..k+63: the step's 34 bytes moved to word 0,
+ * then lut[q] (the signed E2M1 level) times the block scale */
+__device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_mxfp4 &r, unsigned, const float *lut) {
+    const unsigned w[12] = {r.c[0].x,r.c[0].y,r.c[0].z,r.c[0].w,r.c[1].x,r.c[1].y,r.c[1].z,r.c[1].w,
+                            r.c[2].x,r.c[2].y,r.c[2].z,r.c[2].w};
+    const unsigned wo = r.sb/4, sh = r.sb%4*8;
+    unsigned u[11], v[10], b[9];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; j++) u[j] = wo&2 ? w[j+2] : w[j];
+    u[10] = wo&2 ? 0 : w[10];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; j++) v[j] = wo&1 ? u[j+1] : u[j];
+    #pragma unroll
+    for (unsigned i = 0; i < 9; i++) b[i] = __funnelshift_r(v[i],v[i+1],sh);
+    #pragma unroll
+    for (unsigned blk = 0; blk < 2; blk++) {
+        const unsigned b0 = (b[blk*17/4]>>(blk*17%4*8))&255;
+        const float scale = b0 == 0 ? 0x1p-127f : __uint_as_float(b0<<23);
+        #pragma unroll
+        for (unsigned c = 0; c < 4; c++) {
+            unsigned hv[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                float f[2];
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const unsigned m = c*8+j*2+h, byte = blk*17+1+m%16;
+                    f[h] = lut[(b[byte/4]>>(byte%4*8+m/16*4))&15]*scale;
+                }
+                hv[j] = half2_bits(f[0],f[1]);
+            }
+            out[blk*4+c] = make_uint4(hv[0],hv[1],hv[2],hv[3]);
+        }
+    }
+}
+
+/* 16-byte chunk c of row r in a 128-byte-row tile, swizzled so the
+ * ldmatrix rows and the dequant stores hit distinct banks */
+__device__ __forceinline__ unsigned xw_chunk(unsigned r, unsigned c) { return r*128+((c^(r%8))*16); }
+
+__device__ __forceinline__ void bar_sync(unsigned id, unsigned n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void bar_arrive(unsigned id, unsigned n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+
+/* tile q of the schedule: the expert, its token count, first token and first A row */
+struct xw_tile { unsigned e, count, t0, r0; };
+__device__ __forceinline__ xw_tile xw_decode(unsigned q, unsigned nr, unsigned rows, const unsigned *tiles,
+        const int *counts, unsigned NE) {
+    const unsigned job = q/nr;
+    unsigned e = 0, end = NE;
+    while (e < end) {
+        const unsigned mid = (e+end)/2;
+        if (tiles[mid+1] <= job) e = mid+1; else end = mid;
+    }
+    return {e,(unsigned)counts[e],(job-tiles[e])*XW_NT,q%nr*rows};
+}
+
+template<unsigned TYPE, bool DOWN>
+__global__ void __launch_bounds__(512, 1) matrix_half_ws(float *out, const __half *xh,
+        const char *w0, const char *w1, const int *lists, const int *counts, const unsigned *tiles,
+        unsigned NE, unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    extern __shared__ __align__(128) unsigned char xw_smem[];
+    unsigned char *As = xw_smem, *Bs = xw_smem+2*256*128;
+    int *pairs = (int *)(Bs+3*XW_NT*128);
+    float *lut = (float *)(pairs+2*XW_NT);
+    enum { FULL = 1, EMPTY = 3, PROD = 5 };
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, rows = DOWN ? 256 : 128, nr = (M+rows-1)/rows, KS = K/64;
+    const unsigned ntiles = tiles[NE]*nr, mine = blockIdx.x < ntiles ? (ntiles-blockIdx.x+gridDim.x-1)/gridDim.x : 0;
+    const unsigned steps = mine*KS;
+    if (tid >= 256) {
+        /* producers: thread p dequantizes A row p (gate rows, then the same up rows) */
+        const unsigned p = tid-256;
+        if (TYPE == 39 && p < 16) {
+            const unsigned mag = p&7;
+            const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+            lut[p] = p&8 ? -level : level;
+        }
+        bar_sync(PROD,256);
+        typedef typename xw_raw<TYPE>::type raw_t;
+        /* a tile's expert, weight row and activation rows */
+        struct state { unsigned it; xw_tile t; const char *wrow; const __half *b[2]; };
+        auto enter = [&](state &st, unsigned it) {
+            st.it = it;
+            st.t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE);
+            const unsigned arow = DOWN ? st.t.r0+p : st.t.r0+p%128;
+            st.wrow = (DOWN || p < 128 ? w0 : w1)+((uint64_t)st.t.e*M+(arow < M ? arow : 0))*rb;
+            #pragma unroll
+            for (unsigned c = 0; c < 2; c++) {
+                const unsigned item = st.t.t0+p/8+c*32;
+                const int pr = item < st.t.count ? lists[(uint64_t)st.t.e*cap+item] : -1;
+                st.b[c] = pr < 0 ? nullptr : xh+(DOWN ? (uint64_t)(pr/NS)*NO+pr%NS : (uint64_t)pr/NS)*K+p%8*8;
+            }
+        };
+        /* three cursors over (tile, k step): the step being dequantized, the
+         * activations one step ahead and the weights two steps ahead */
+        struct cursor { state st; unsigned ks; };
+        auto advance = [&](cursor &c) {
+            if (++c.ks == KS) { c.ks = 0; if (c.st.it+1 < mine) enter(c.st,c.st.it+1); else c.st.it++; }
+        };
+        cursor cur = {}, braw, bb;
+        if (steps) enter(cur.st,0);
+        braw = cur;
+        bb = cur;
+        auto load_raw = [&](raw_t &raw, unsigned g) {
+            if (g < steps) xw_load(raw,braw.st.wrow,braw.ks*64);
+            advance(braw);
+        };
+        /* the activation chunks of step g: tokens p/8 and p/8+32, chunk p%8 */
+        auto load_b = [&](unsigned g) {
+            if (g < steps) {
+                unsigned char *dst = Bs+g%3*XW_NT*128;
+                #pragma unroll
+                for (unsigned c = 0; c < 2; c++)
+                    tt_cp_async_16B(dst+xw_chunk(p/8+c*32,p%8),bb.st.b[c] ? bb.st.b[c]+bb.ks*64 : xh,bb.st.b[c] != nullptr);
+                advance(bb);
+            }
+            tt_cp_async_commit();
+        };
+        auto produce = [&](unsigned g, const raw_t &raw) {
+            if (g >= 2) bar_sync(EMPTY+g%2,512);
+            load_b(g+1);
+            const unsigned ks = cur.ks, arow = DOWN ? cur.st.t.r0+p : cur.st.t.r0+p%128;
+            if (ks == 0 && p < XW_NT)
+                pairs[cur.st.it%2*XW_NT+p] = cur.st.t.t0+p < cur.st.t.count ? lists[(uint64_t)cur.st.t.e*cap+cur.st.t.t0+p] : -1;
+            uint4 h[8];
+            if (arow < M) xw_dequant(h,raw,ks*64,lut);
+            else for (unsigned c = 0; c < 8; c++) h[c] = make_uint4(0,0,0,0);
+            unsigned char *A = As+g%2*256*128;
+            #pragma unroll
+            for (unsigned c = 0; c < 8; c++) *(uint4 *)(A+xw_chunk(p,c)) = h[c];
+            tt_cp_async_wait_group<1>();
+            __threadfence_block();
+            bar_arrive(FULL+g%2,512);
+            advance(cur);
+        };
+        raw_t ra, rbuf;
+        load_b(0);
+        load_raw(ra,0);
+        load_raw(rbuf,1);
+        for (unsigned g = 0; g < steps; g += 2) {
+            produce(g,ra);
+            load_raw(ra,g+2);
+            if (g+1 < steps) {
+                produce(g+1,rbuf);
+                load_raw(rbuf,g+3);
+            }
+        }
+        tt_cp_async_wait_group<0>();
+    } else {
+        /* consumers: warp tile of 4 m16 tiles of A rows (gate/up: two of each) by 32 tokens */
+        const unsigned lane = tid%32, warp = tid/32, wm = warp%4, wn = warp/4;
+        unsigned mrow[4];
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++) mrow[i] = DOWN ? wm*64+i*16 : i/2*128+wm*32+i%2*16;
+        unsigned g = 0;
+        for (unsigned it = 0; it < mine; it++) {
+            const xw_tile t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE);
+            /* the 8-token columns holding the tile's tokens: an expert's last
+             * tile is partly empty, and those products are never stored */
+            const int left = (int)(t.count-t.t0)-(int)(wn*32);
+            const unsigned nj = left <= 0 ? 0 : left >= 32 ? 4 : (unsigned)(left+7)/8;
+            float acc[4][4][4] = {};
+            for (unsigned ks = 0; ks < KS; ks++, g++) {
+                bar_sync(FULL+g%2,512);
+                const unsigned char *A = As+g%2*256*128, *B = Bs+g%3*XW_NT*128;
+                /* the next 16 k's fragments load during this slice's products */
+                uint32_t a[2][4][4], b[2][2][4];
+                auto frags = [&](unsigned k16, uint32_t (&fa)[4][4], uint32_t (&fb)[2][4]) {
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; i++)
+                        tt_ldmatrix_x4(fa[i],A+xw_chunk(mrow[i]+lane%16,k16*2+lane/16));
+                    #pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (j*2 < nj) tt_ldmatrix_x4(fb[j],B+xw_chunk(wn*32+j*16+lane%8+lane/16*8,k16*2+lane/8%2));
+                };
+                if (nj) {
+                    frags(0,a[0],b[0]);
+                    #pragma unroll
+                    for (unsigned k16 = 0; k16 < 4; k16++) {
+                        if (k16 < 3) frags(k16+1,a[(k16+1)%2],b[(k16+1)%2]);
+                        #pragma unroll
+                        for (unsigned j = 0; j < 4; j++) {
+                            if (j >= nj) break;
+                            #pragma unroll
+                            for (unsigned i = 0; i < 4; i++) {
+                                const uint32_t bb[2] = {b[k16%2][j/2][j%2*2],b[k16%2][j/2][j%2*2+1]};
+                                tt_mma_m16n8k16_f16_f32(acc[i][j],a[k16%2][i],bb);
+                            }
+                        }
+                    }
+                }
+                if (g+2 < steps) bar_arrive(EMPTY+g%2,512);
+            }
+            const int *pp = pairs+it%2*XW_NT;
+            /* c0,c1: row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const int pr = pp[wn*32+j*8+lane%4*2+h];
+                    if (pr < 0) continue;
+                    float *o = out+((uint64_t)(pr/NS)*NO+pr%NS)*M;
+                    #pragma unroll
+                    for (unsigned i = 0; i < (DOWN ? 4 : 2); i++)
+                        #pragma unroll
+                        for (unsigned v = 0; v < 2; v++) {
+                            const unsigned row = t.r0+(DOWN ? mrow[i] : wm*32+i*16)+lane/4+v*8;
+                            if (row >= M) continue;
+                            if (DOWN) o[row] = acc[i][j][v*2+h];
+                            else o[row] = silu(acc[i][j][v*2+h])*acc[(i+2)%4][j][v*2+h];
+                        }
+                }
+        }
+    }
+#endif
+}
+
+/* The activations rounded to half once per call, as matrix_half_tile
+ * rounds each one it loads. */
+__global__ void half_rows(__half *out, const float *x, uint64_t n) {
+    pdl_enter();
+    const uint64_t i = ((uint64_t)blockIdx.x*blockDim.x+threadIdx.x)*4;
+    if (i >= n) return;
+    const float4 v = *(const float4 *)(x+i);
+    uint2 h;
+    h.x = half2_bits(v.x,v.y);
+    h.y = half2_bits(v.z,v.w);
+    *(uint2 *)(out+i) = h;
+}
+
+/* matrix_half_ws with its tile schedule and half activations in the
+ * scratch, a block per SM */
+static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
+        const int *lists, const int *counts, unsigned NE, unsigned T, unsigned NS,
+        unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
+    const uint64_t rb = expert_row_bytes(down ? 39 : 12, K), nx = (uint64_t)T*(down ? NO : 1)*K;
+    const uint64_t tb = (((uint64_t)NE+1)*4+255)/256*256;
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc(tb+nx*2, "Qwen expert scratch");
+    if (!scratch) return 0;
+    unsigned *tiles = (unsigned *)scratch;
+    __half *xh = (__half *)(scratch+tb);
+    launch(expert_tiles, 1, 1, 0, tiles,counts,NE,XW_NT);
+    launch(half_rows, (nx/4+255)/256, 256, 0, xh,x,nx);
+    if (!launched()) return 0;
+    const unsigned rows = down ? 256 : 128;
+    const uint64_t jobs = ((uint64_t)T*NS+XW_NT-1)/XW_NT+NE, blocks = jobs*((M+rows-1)/rows);
+    if (blocks > INT_MAX) return 0;
+    auto kernel = down ? matrix_half_ws<39,true> : matrix_half_ws<12,false>;
+    static int opted[2] = {-1,-1}, sms = 0;
+    if (opted[down] < 0) {
+        int dev = 0;
+        opted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, XW_SMEM) == cudaSuccess &&
+                      cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                           cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                      cudaGetDevice(&dev) == cudaSuccess &&
+                      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0;
+        (void)cudaGetLastError();
+    }
+    if (!opted[down]) return 0;
+    launch(kernel, (unsigned)std::min<uint64_t>(blocks,(uint64_t)sms), 512, XW_SMEM,
+           out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+    return launched();
+}
+
 static int matrix_dispatch(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, unsigned type, unsigned NE, unsigned T,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
+        if (lists && !g_quality_mode && T >= 2048 && type == (down ? 39u : 12u) && !(K%(down ? 64 : 256)) &&
+            !(((uintptr_t)x|(uintptr_t)w0|(uintptr_t)(down ? w0 : w1))&15) && env_on("DS4_QWEN4_EXPERT_WS"))
+            return expert_ws(out,x,w0,w1,lists,counts,NE,T,NS,NO,K,M,cap,down);
         if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
