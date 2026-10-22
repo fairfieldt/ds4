@@ -29248,6 +29248,140 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* A cache miss outside the host tier reads three expert tensors from the
+ * file. One pread at a time keeps the NVMe below its bandwidth (MXFP4: 18.8
+ * MB in about 3.5 ms), so a few readers, each with its own pinned staging and
+ * stream, read the spans of a load at once and copy each to its slot.
+ * DS4_CUDA_SSD_READERS=N sets the count (default 3; 1 reads in the caller). */
+struct cuda_ssd_read_job {
+    char *dst;
+    uint64_t offset, bytes;
+    uint32_t slot;
+    bool ok;
+};
+static struct {
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t work = PTHREAD_COND_INITIALIZER, done = PTHREAD_COND_INITIALIZER;
+    std::vector<cuda_ssd_read_job> jobs;
+    size_t next = 0, finished = 0;
+    bool failed = false, stop = false;
+    unsigned started = 0;
+    pthread_t threads[8];
+    int device = 0;
+} g_ssd_readers;
+
+static unsigned cuda_ssd_reader_count(void) {
+    static const unsigned n = [] {
+        const char *env = getenv("DS4_CUDA_SSD_READERS");
+        const long v = env ? strtol(env, NULL, 10) : 3;
+        return (unsigned)(v < 1 ? 1 : v > 8 ? 8 : v);
+    }();
+    return n;
+}
+
+/* The caller waits in cuda_ssd_read_parallel, so the model descriptors cannot
+ * change under a read. A failed direct read falls back to a buffered one and
+ * leaves disabling direct I/O to the caller's own reads. */
+static int cuda_ssd_reader_read(char *stage, uint64_t stage_bytes, uint64_t offset,
+                                uint64_t bytes, const char **payload) {
+    *payload = stage;
+#if defined(__linux__) && defined(O_DIRECT)
+    const uint64_t align = g_model_direct_align;
+    if (g_model_direct_fd >= 0 && align > 1 && g_model_file_size != 0) {
+        const uint64_t aligned_off = cuda_round_down(offset, align);
+        const uint64_t read_size = cuda_round_up(offset - aligned_off + bytes, align);
+        if (read_size <= stage_bytes && aligned_off <= g_model_file_size &&
+            read_size <= g_model_file_size - aligned_off &&
+            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            *payload = stage + (offset - aligned_off);
+            return 1;
+        }
+    }
+#endif
+    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+}
+
+static void *cuda_ssd_reader_main(void *) {
+    auto &r = g_ssd_readers;
+    bool ready = cudaSetDevice(r.device) == cudaSuccess;
+    cudaStream_t stream = NULL;
+    ready = ready && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    void *raw = NULL;
+    char *stage = NULL;
+    uint64_t stage_bytes = 0;
+    pthread_mutex_lock(&r.mu);
+    for (;;) {
+        while (!r.stop && r.next >= r.jobs.size()) pthread_cond_wait(&r.work, &r.mu);
+        if (r.stop) break;
+        const size_t index = r.next++;
+        const cuda_ssd_read_job job = r.jobs[index];
+        pthread_mutex_unlock(&r.mu);
+        const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+        bool ok = ready;
+        if (ok && job.bytes + 2 * align > stage_bytes) {
+            if (raw) (void)cudaFreeHost(raw);
+            raw = NULL;
+            stage_bytes = 0;
+            ok = cudaHostAlloc(&raw, job.bytes + 3 * align, cudaHostAllocDefault) == cudaSuccess;
+            if (ok) {
+                stage = (char *)cuda_align_ptr(raw, align);
+                stage_bytes = job.bytes + 2 * align;
+            }
+        }
+        const char *payload = NULL;
+        ok = ok && cuda_ssd_reader_read(stage, stage_bytes, job.offset, job.bytes, &payload) &&
+            cudaMemcpyAsync(job.dst, payload, (size_t)job.bytes, cudaMemcpyHostToDevice,
+                stream) == cudaSuccess;
+        /* Even a failed request must not leave a copy in flight. */
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) ok = false;
+        if (!ok) (void)cudaGetLastError();
+        pthread_mutex_lock(&r.mu);
+        r.jobs[index].ok = ok;
+        if (!ok) r.failed = true;
+        if (++r.finished == r.jobs.size()) pthread_cond_signal(&r.done);
+    }
+    pthread_mutex_unlock(&r.mu);
+    if (raw) (void)cudaFreeHost(raw);
+    if (stream) (void)cudaStreamDestroy(stream);
+    return NULL;
+}
+
+static void cuda_ssd_readers_exit(void) {
+    auto &r = g_ssd_readers;
+    pthread_mutex_lock(&r.mu);
+    r.stop = true;
+    pthread_cond_broadcast(&r.work);
+    pthread_mutex_unlock(&r.mu);
+    for (unsigned i = 0; i < r.started; i++) pthread_join(r.threads[i], NULL);
+    r.started = 0;
+}
+
+/* Runs the jobs and returns when no copy is in flight; each job's ok tells
+ * whether its copy landed. */
+static int cuda_ssd_read_parallel(std::vector<cuda_ssd_read_job> &jobs) {
+    auto &r = g_ssd_readers;
+    if (jobs.empty()) return 1;
+    if (!r.started) {
+        if (cudaGetDevice(&r.device) != cudaSuccess) return 0;
+        for (unsigned i = 0; i < cuda_ssd_reader_count(); i++) {
+            if (pthread_create(&r.threads[r.started], NULL, cuda_ssd_reader_main, NULL) != 0) break;
+            r.started++;
+        }
+        if (!r.started) return 0;
+        (void)atexit(cuda_ssd_readers_exit);
+    }
+    pthread_mutex_lock(&r.mu);
+    r.jobs.swap(jobs);
+    r.next = r.finished = 0;
+    r.failed = false;
+    pthread_cond_broadcast(&r.work);
+    while (r.finished < r.jobs.size()) pthread_cond_wait(&r.done, &r.mu);
+    const bool ok = !r.failed;
+    r.jobs.swap(jobs);
+    pthread_mutex_unlock(&r.mu);
+    return ok;
+}
+
 /* DS4_CUDA_SSD_STATS=1 prints expert cache hits and miss time at exit.
  * DS4_CUDA_SSD_TRACE=FILE writes "layer slots expert..." per load request. */
 struct cuda_ssd_stats {
@@ -29487,6 +29621,10 @@ static int cuda_stream_selected_cache_begin_load(
             }
         }
         cuda_stream_upload_batch uploads;
+        /* File spans for the parallel readers (see cuda_ssd_read_parallel). */
+        std::vector<cuda_ssd_read_job> file_jobs;
+        const bool parallel_reads = cuda_ssd_reader_count() > 1 && g_model_fd >= 0 &&
+            (g_model_fd_host_base == NULL || table->model_map == g_model_fd_host_base);
         /* Prefill victims, oldest first, from the slots it may evict. */
         const bool prefill_load = slot_count > 64u;
         std::vector<uint32_t> prefill_victims;
@@ -29544,20 +29682,34 @@ static int cuda_stream_selected_cache_begin_load(
             uploads.active = true;
             if (stats && cuda_ssd_host_lookup(table->model_map, gate, table->gate_expert_bytes))
                 g_ssd_stats.host[stats_kind]++;
-            if (!cuda_model_copy_to_device_streamed(
-                    cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
-                return 0;
+            const cuda_ssd_read_job spans[3] = {
+                {cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes, gate, table->gate_expert_bytes, 0, false},
+                {cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes, up, table->gate_expert_bytes, 0, false},
+                {cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes, 0, false}};
+            static const char *span_names[3] = {"stream gate", "stream up", "stream down"};
+            for (unsigned k = 0; k < 3; k++) {
+                if (parallel_reads && !cuda_ssd_host_lookup(table->model_map, spans[k].offset, spans[k].bytes)) {
+                    file_jobs.push_back(spans[k]);
+                    file_jobs.back().slot = victim;
+                } else if (!cuda_model_copy_to_device_streamed(spans[k].dst, table->model_map,
+                        table->model_size, spans[k].offset, spans[k].bytes, span_names[k], uploads.chunks)) {
+                    return 0;
+                }
+            }
             slot = {gate, up, down, stamp, slot_count <= 64u, stamp};
             cuda_stream_touch(slot);
             g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
+        }
+        if (!cuda_ssd_read_parallel(file_jobs)) {
+            /* Experts whose copies all landed stay cached; drop the others. */
+            for (const auto &job : file_jobs) {
+                if (job.ok) continue;
+                auto &slot = g_stream_expert_slots[job.slot];
+                if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
+                slot.used = 0;
+            }
+            return 0;
         }
         if (!uploads.finish()) return 0;
         if (stats) g_ssd_stats.miss_ns[stats_kind] += cuda_ssd_stats_now_ns() - stats_t0;
