@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
@@ -1063,6 +1064,94 @@ static inline cudaStream_t cuda_decode_stream(void) {
     if (g_dsv41_shared.active) return g_dsv41_shared.stream;
     return g_decode_graph_capturing ? g_decode_graph_stream : (cudaStream_t)0;
 }
+
+/* Many independent one-row F16 GEMVs y[r] = W x[r] (W: m outputs of k
+ * halves) with the bits of one cublasGemmEx(m, 1, k) call per row. cuBLASLt's
+ * first heuristic for the one-row problem is the algorithm that call uses;
+ * run as a strided batch it repeats the same per-row arithmetic. Returns 0
+ * when cuBLASLt cannot take the shape, so callers keep the per-row loop. */
+struct cuda_lt_rows_plan {
+    int m = 0, k = 0;
+    bool ok = false;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t a = NULL, b = NULL, c = NULL;
+    cublasLtMatmulAlgo_t algo;
+};
+static cublasLtHandle_t g_cublaslt;
+static void *g_cublaslt_ws;
+static const size_t g_cublaslt_ws_bytes = (size_t)64 << 20;
+static std::vector<cuda_lt_rows_plan> g_lt_rows_plans;
+
+static bool cuda_lt_rows_layouts(cuda_lt_rows_plan &p, int batch) {
+    const long long sa = 0, sb = p.k, sc = p.m;
+    const cublasLtMatrixLayout_t l[3] = {p.a, p.b, p.c};
+    const long long stride[3] = {sa, sb, sc};
+    for (int i = 0; i < 3; i++) {
+        if (cublasLtMatrixLayoutSetAttribute(l[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                &batch, sizeof(batch)) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutSetAttribute(l[i], CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &stride[i], sizeof(stride[i])) != CUBLAS_STATUS_SUCCESS) return false;
+    }
+    return true;
+}
+
+static cuda_lt_rows_plan *cuda_lt_rows_plan_for(int m, int k) {
+    for (auto &p : g_lt_rows_plans) if (p.m == m && p.k == k) return p.ok ? &p : NULL;
+    g_lt_rows_plans.emplace_back();
+    cuda_lt_rows_plan &p = g_lt_rows_plans.back();
+    p.m = m;
+    p.k = k;
+    if (!g_cublaslt && cublasLtCreate(&g_cublaslt) != CUBLAS_STATUS_SUCCESS) return NULL;
+    if (!g_cublaslt_ws && cudaMalloc(&g_cublaslt_ws, g_cublaslt_ws_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_cublaslt_ws = NULL;
+        return NULL;
+    }
+    const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+    cublasLtMatmulPreference_t pref = NULL;
+    cublasLtMatmulHeuristicResult_t res;
+    int found = 0;
+    p.ok = cublasLtMatmulDescCreate(&p.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, k, m, k) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, k, 1, k) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(&p.c, CUDA_R_32F, m, 1, m) == CUBLAS_STATUS_SUCCESS &&
+        cuda_lt_rows_layouts(p, 1) &&
+        cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &g_cublaslt_ws_bytes, sizeof(g_cublaslt_ws_bytes)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulAlgoGetHeuristic(g_cublaslt, p.desc, p.a, p.b, p.c, p.c, pref, 1,
+            &res, &found) == CUBLAS_STATUS_SUCCESS && found > 0;
+    if (pref) (void)cublasLtMatmulPreferenceDestroy(pref);
+    if (p.ok) p.algo = res.algo;
+    return p.ok ? &p : NULL;
+}
+
+static int cuda_lt_f16_rows(float *y, const __half *w, const __half *x, int m, int k, uint32_t rows) {
+    cuda_lt_rows_plan *p = cuda_lt_rows_plan_for(m, k);
+    if (!p) return 0;
+    const float alpha = 1.0f, beta = 0.0f;
+    /* Split-K plans put the batch in the grid's z dimension. */
+    const uint32_t piece_rows = 2048u;
+    for (uint32_t first = 0; first < rows; first += piece_rows) {
+        const int batch = (int)(rows - first < piece_rows ? rows - first : piece_rows);
+        cublasLtMatmulHeuristicResult_t check;
+        if (!cuda_lt_rows_layouts(*p, batch) ||
+            cublasLtMatmulAlgoCheck(g_cublaslt, p->desc, p->a, p->b, p->c, p->c, &p->algo,
+                                    &check) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmul(g_cublaslt, p->desc, &alpha, w, p->a, x + (uint64_t)first * k, p->b,
+                           &beta, y + (uint64_t)first * m, p->c, y + (uint64_t)first * m, p->c,
+                           &p->algo, g_cublaslt_ws, g_cublaslt_ws_bytes,
+                           cuda_decode_stream()) != CUBLAS_STATUS_SUCCESS) {
+            (void)cudaGetLastError();
+            /* Rows before this piece are done; the caller redoes them all. */
+            return 0;
+        }
+    }
+    return 1;
+}
+
 
 static void cuda_dsv41_shared_free(void) {
     if (g_side_cublas) (void)cublasDestroy(g_side_cublas);
