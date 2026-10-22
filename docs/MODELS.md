@@ -46,8 +46,8 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 ## DeepSeek V4.1 Flash
 
 V4.1 Flash text and vision inference work on Metal. CUDA supports text with
-Q2 SSD streaming on one Spark or one discrete GPU, or resident shards across
-two Sparks. ROCm
+Q2 SSD streaming on one Spark or one discrete GPU, the 1017 MXFP4 experts with
+SSD streaming on one discrete GPU, or resident shards across two Sparks. ROCm
 supports single-host text inference with SSD streaming. It needs its own
 GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
 are not interchangeable with it.

@@ -105,10 +105,15 @@ DS4_CUDA_SSD_HOST_GB=auto ./ds4 --cuda --ssd-streaming \
 ```
 
 `auto` pins whole layers while 16 GiB of RAM stay available. A number caps
-the pinned GiB instead. Q2's routed experts take 142.4 GiB. Other programs
-cannot use that memory while DwarfStar runs. Startup reads and pins the
-experts first: 30 seconds from a cold page cache and 11 to 16 seconds when
-the file is already cached.
+the pinned GiB instead. Q2's routed experts take 142.4 GiB and the 1017 MXFP4
+experts 268.9 GiB. Other programs cannot use that memory while DwarfStar runs.
+Startup reads and pins the experts first: for Q2, 30 seconds from a cold page
+cache and 11 to 16 seconds when the file is already cached; for MXFP4's 24
+layers (161 GiB), about 70 seconds cold.
+
+When only some layers fit in RAM, a miss outside them reads the SSD, about
+eight times slower than a copy from RAM. The VRAM cache then keeps the experts
+that only the SSD holds longer.
 
 On an RTX PRO 6000 (96 GB) with 192 GB of RAM, pinning all of Q2's experts
 took a 2K-token prefill from 75 to 510 t/s and decode from 21 to 48 t/s.
