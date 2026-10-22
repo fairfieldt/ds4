@@ -123,6 +123,41 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
         fprintf(stderr, "CUDA SSD cache types=%u/%u width=%u selected=%u rows=%u eviction/remap/budgets: PASS\n",
                 gate_type, down_type, dim, selected, rows);
     }
+    /* Pinned host copies serve every miss, the read-ahead's too, while the
+     * file is unreadable. The last pass above left ROWS rows in place. */
+    const uint64_t pin_offset = 0, pin_bytes = model_bytes;
+    CHECK(ds4_gpu_stream_expert_host_pin(model, model_bytes, &pin_offset, &pin_bytes, 1) == model_bytes);
+    CHECK(ftruncate(fd, 0) == 0);
+    const unsigned host_budgets[] = {3, 2u * EXPERTS};
+    for (unsigned bi = 0; bi < sizeof(host_budgets) / sizeof(*host_budgets); bi++) {
+        ds4_gpu_set_streaming_expert_cache_budget(host_budgets[bi]);
+        unsigned prefetched = 0;
+        for (unsigned pass = 0; pass < 2; pass++) for (unsigned l = 0; l < LAYERS; l++) {
+            const uint64_t g = l * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
+            const ds4_gpu_stream_expert_table current = {
+                model, model_bytes, l, EXPERTS, g, u, d, gate_bytes, down_bytes};
+            const uint64_t next_gate = (l + 1u) % LAYERS * layer_bytes;
+            const ds4_gpu_stream_expert_table next = {
+                model, model_bytes, (l + 1u) % LAYERS, EXPERTS, next_gate,
+                next_gate + EXPERTS * gate_bytes, next_gate + 2 * EXPERTS * gate_bytes,
+                gate_bytes, down_bytes};
+            prefetched += ds4_gpu_stream_expert_cache_prefetch(&current, &next) != 0;
+            bool half = false;
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
+                g, u, d, gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+                dim, dim, dim, si, sw, EXPERTS, selected, 10, x, l, ROWS, &half, false));
+            CHECK(!half && ds4_gpu_tensor_read(out, 0, actual, ROWS * dim * 4));
+            for (unsigned i = 0; i < ROWS * dim; i++)
+                CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[l][i]) <=
+                      2e-5f * (1 + fabsf(reference[l][i])));
+        }
+        ds4_gpu_stream_expert_cache_prefetch_finish(false);
+        if (host_budgets[bi] >= 2u * EXPERTS) CHECK(prefetched > 0);
+    }
+    CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+    ds4_gpu_stream_expert_host_release();
+    ds4_gpu_stream_expert_cache_release_resident();
+    fprintf(stderr, "CUDA SSD host tier serves misses and read-ahead without the file: PASS\n");
     const ds4_gpu_stream_expert_table table = {
         model, model_bytes, 0, EXPERTS, 0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
         gate_bytes, down_bytes};
