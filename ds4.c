@@ -42169,7 +42169,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    /* One CUDA device runs every layer in stream order, so it can queue them
+     * the same way as TP instead of draining the device after each layer. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool ordered_device = g->tp_world == 1 && !getenv("DS4_CUDA_V41_DRAIN_LAYERS");
+#else
+    const bool ordered_device = false;
+#endif
+    const bool queue_layers = (g->tp_world == 2 || ordered_device) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
