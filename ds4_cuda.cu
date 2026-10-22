@@ -29410,7 +29410,14 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            /* Prefill later stages up to one whole layer of experts in a
+             * compact copy (cuda_stream_compact_prefill). Hold that back on
+             * top of a margin for MMQ and library scratch: an 8 GiB margin
+             * alone left 0.8 GB free on a 32K prompt with MXFP4 experts. */
+            const uint64_t staged = cache.prefill_capacity;
+            const uint64_t layer_stage = (uint64_t)table->n_total_expert * expert_bytes;
+            const uint64_t reserve = integrated ? UINT64_C(8) << 30 :
+                (UINT64_C(5) << 29) + (layer_stage > staged ? layer_stage - staged : 0);
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
