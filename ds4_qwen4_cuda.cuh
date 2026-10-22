@@ -1834,6 +1834,14 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
 
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
+/* Prefill takes conv_seg, ngram_conv_seg and gdn_scan_pipe (the outputs
+ * of conv, ngram_conv and gdn_scan); DS4_QWEN4_CONV_SEG=0 (both convs) and
+ * DS4_QWEN4_GDN_PIPE=0 keep the originals.  Read per call for the tests. */
+static bool env_on(const char *name) {
+    const char *env = getenv(name);
+    return !env || env[0] != '0';
+}
+
 __device__ __forceinline__ float sum(float x) {
     for (int d = 16; d; d >>= 1) x += __shfl_xor_sync(0xffffffff, x, d);
     return x;
@@ -4599,6 +4607,46 @@ __global__ void conv(float *x, float *history, const float *w, unsigned T, unsig
     conv_body(x,history,w,T,C,K,activate,snap,snap_t,snap2,snap2_t);
 }
 
+/* Prefill: conv_body's arithmetic for every channel and token, with each
+ * channel's tokens split among the block's warps.  conv walks a chunk with
+ * one thread per channel, a dependent load per token (40 blocks for 8192
+ * tokens).  Each warp reads the K-1 inputs before its segment (or the
+ * history) ahead of the barrier, then convolves the segment in place,
+ * loading CONV_GROUP tokens before it stores any. */
+constexpr unsigned CONV_SEGS = 16, CONV_GROUP = 8;
+
+__global__ void __launch_bounds__(32*CONV_SEGS) conv_seg(float *x, float *history, const float *w,
+        unsigned T, unsigned C, unsigned K, bool activate) {
+    pdl_enter();
+    const unsigned c = blockIdx.x*32+threadIdx.x%32, L = (T+CONV_SEGS-1)/CONV_SEGS;
+    const unsigned t0 = min(T,threadIdx.x/32*L), t1 = min(T,t0+L);
+    const bool active = c < C && t0 < t1;
+    float win[3], taps[4];
+    if (active) {
+        for (unsigned i = 0; i < K-1; i++) {
+            const int p = (int)t0-(int)(K-1)+(int)i;
+            win[i] = p < 0 ? history[(uint64_t)(p+(int)K-1)*C+c] : x[(uint64_t)p*C+c];
+        }
+        for (unsigned i = 0; i < K; i++) taps[i] = w[c*K+i];
+    }
+    __syncthreads();
+    if (!active) return;
+    for (unsigned t = t0; t < t1; t += CONV_GROUP) {
+        float raw[CONV_GROUP];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) raw[g] = x[(uint64_t)(t+g)*C+c];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            float v = taps[K-1]*raw[g];
+            for (unsigned i = 0; i < K-1; i++) v += taps[i]*win[i];
+            for (unsigned i = 0; i+2 < K; i++) win[i] = win[i+1];
+            win[K-2] = raw[g];
+            x[(uint64_t)(t+g)*C+c] = activate ? silu(v) : v;
+        }
+    }
+    if (t1 == T) for (unsigned i = 0; i < K-1; i++) history[(uint64_t)i*C+c] = win[i];
+}
+
 __global__ void conv_rows(float *x, const float *w, const gdn_row *table,
         unsigned C, unsigned K, bool activate) {
     pdl_enter();
@@ -4683,6 +4731,125 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv, const float
         unsigned T, unsigned Hk, unsigned Hv, float *snap, unsigned st, float *snap2, unsigned st2) {
     pdl_enter_early();
     gdn_scan_body<ROWS,D>(out,state,qkv,a,b,T,Hk,Hv,snap,st,snap2,st2);
+}
+
+__device__ __forceinline__ void cp_async_4B(void *dst, const void *src) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(tt_smem_addr(dst)), "l"(src));
+#endif
+}
+
+/* Prefill (D = 128): the scan of gdn_scan<4,128>, every output and state
+ * element rounded the same way, with the steps' inputs staged in shared
+ * memory GDN_PIPE_STAGES-1 groups of GDN_PIPE_STEPS tokens ahead.
+ * gdn_scan_body reloads them after each output store, so every token
+ * waited on a memory latency.  A thread keeps the quarters of lanes l and
+ * l+16 of two rows: the butterfly's first level, lane l's partial plus
+ * lane l^16's, becomes one add in registers (the same sum either way
+ * round), and each half-warp finishes its rows over lanes l^8 .. l^1.
+ * 26 KB per block: the 384 blocks of a layer fit the GPU at once. */
+constexpr unsigned GDN_PIPE_STEPS = 8, GDN_PIPE_STAGES = 3;
+
+__global__ void __launch_bounds__(128) gdn_scan_pipe(float *out, float *state, const float *qkv,
+        const float *a, const float *b, unsigned T, unsigned Hk, unsigned Hv,
+        float *snap, unsigned st, float *snap2, unsigned st2) {
+    constexpr unsigned D = 128, S = GDN_PIPE_STEPS, NB = GDN_PIPE_STAGES;
+    struct stage { float q[S][D], k[S][D], v[S][16], ab[S][2]; };
+    __shared__ __align__(16) stage ring[NB];
+    pdl_enter_early();
+    const unsigned tid = threadIdx.x, l = tid%16, h = blockIdx.y, dv0 = blockIdx.x*16;
+    const unsigned rv = tid/32*4+tid%32/16*2, C = (2*Hk+Hv)*D, G = (T+S-1)/S;
+    const float *qs = qkv+(h%Hk)*D, *ks = qs+Hk*D, *vs = qkv+2*Hk*D+h*D+dv0;
+    /* group g: tokens g*S.. into ring[g%NB]; every thread commits a group */
+    auto load = [&](unsigned g) {
+        if (g < G) {
+            stage &sg = ring[g%NB];
+            for (unsigned i = tid; i < S*64; i += 128) {
+                const unsigned s = i/64, c = i%32*4, t = g*S+s;
+                if (t < T) tt_cp_async_16B(i/32%2 ? &sg.k[s][c] : &sg.q[s][c], (i/32%2 ? ks : qs)+(uint64_t)t*C+c, true);
+            }
+            if (tid < S*4) {
+                const unsigned s = tid/4, t = g*S+s;
+                if (t < T) tt_cp_async_16B(&sg.v[s][tid%4*4], vs+(uint64_t)t*C+tid%4*4, true);
+            } else if (tid < S*6) {
+                const unsigned s = (tid-S*4)/2, t = g*S+s;
+                if (t < T) cp_async_4B(&sg.ab[s][tid%2], (tid%2 ? b : a)+(uint64_t)t*Hv+h);
+            }
+        }
+        tt_cp_async_commit();
+    };
+    for (unsigned g = 0; g+1 < NB; g++) load(g);
+    /* rows dv0+rv and dv0+rv+1; elements l*4.. (e < 4) and 64+l*4.. */
+    const uint64_t base = ((uint64_t)h*D+dv0+rv)*D+l*4;
+    float s[2][8];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) s[j][e] = state[base+j*D+e/4*64+e%4];
+    /* a token's output partials (o0+o1 per row) finish their butterfly
+     * beside the next token's, off the state's dependency chain */
+    float op[2] = {0,0};
+    unsigned tp = UINT_MAX;
+    for (unsigned g = 0; g < G; g++) {
+        tt_cp_async_wait_group<NB-2>();
+        __syncthreads();
+        load(g+NB-1);
+        const stage &sg = ring[g%NB];
+        const unsigned n = min(S,T-g*S);
+        #pragma unroll
+        for (unsigned i = 0; i < S; i++) {
+            if (i >= n) break;
+            const unsigned t = g*S+i;
+            const float4 q0 = *(const float4 *)&sg.q[i][l*4], q1 = *(const float4 *)&sg.q[i][64+l*4];
+            const float4 k0 = *(const float4 *)&sg.k[i][l*4], k1 = *(const float4 *)&sg.k[i][64+l*4];
+            const float q[8] = {q0.x,q0.y,q0.z,q0.w,q1.x,q1.y,q1.z,q1.w};
+            const float k[8] = {k0.x,k0.y,k0.z,k0.w,k1.x,k1.y,k1.z,k1.w};
+            const float decay = sg.ab[i][0], beta = sg.ab[i][1];
+            float u[2], o[2] = {op[0],op[1]};
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++) {
+                float u0 = 0, u1 = 0;
+                #pragma unroll
+                for (unsigned e = 0; e < 4; e++) { s[j][e] *= decay; u0 += s[j][e]*k[e]; }
+                #pragma unroll
+                for (unsigned e = 4; e < 8; e++) { s[j][e] *= decay; u1 += s[j][e]*k[e]; }
+                u[j] = u0+u1;
+            }
+            for (int d = 8; d; d >>= 1)
+                #pragma unroll
+                for (unsigned j = 0; j < 2; j++) {
+                    u[j] += __shfl_xor_sync(0xffffffff,u[j],d);
+                    o[j] += __shfl_xor_sync(0xffffffff,o[j],d);
+                }
+            if (!l && tp != UINT_MAX) *(float2 *)(out+((uint64_t)tp*Hv+h)*D+dv0+rv) = make_float2(o[0],o[1]);
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++) {
+                const float delta = (sg.v[i][rv+j]-u[j])*beta;
+                float o0 = 0, o1 = 0;
+                #pragma unroll
+                for (unsigned e = 0; e < 4; e++) { s[j][e] += k[e]*delta; o0 += s[j][e]*q[e]; }
+                #pragma unroll
+                for (unsigned e = 4; e < 8; e++) { s[j][e] += k[e]*delta; o1 += s[j][e]*q[e]; }
+                op[j] = o0+o1;
+            }
+            tp = t;
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++)
+                #pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    if (snap && t == st) snap[base+j*D+e/4*64+e%4] = s[j][e];
+                    if (snap2 && t == st2) snap2[base+j*D+e/4*64+e%4] = s[j][e];
+                }
+        }
+    }
+    for (int d = 8; d; d >>= 1)
+        #pragma unroll
+        for (unsigned j = 0; j < 2; j++) op[j] += __shfl_xor_sync(0xffffffff,op[j],d);
+    if (!l && tp != UINT_MAX) *(float2 *)(out+((uint64_t)tp*Hv+h)*D+dv0+rv) = make_float2(op[0],op[1]);
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) state[base+j*D+e/4*64+e%4] = s[j][e];
 }
 
 template<unsigned D>
@@ -4863,6 +5030,48 @@ __global__ void ngram_conv(float *R, const float *gated, const float *normed, fl
     for (unsigned i = 0; i < H; i++) history[(uint64_t)i * C + c] = hist[i];
 }
 
+/* Prefill: ngram_conv's arithmetic with each channel's tokens split among
+ * the block's warps, as conv_seg does: every warp reads the H inputs
+ * before its segment (or the history) ahead of the barrier that orders
+ * them before the history is rewritten. */
+__global__ void __launch_bounds__(32*CONV_SEGS) ngram_conv_seg(float *R, const float *gated, const float *normed,
+        float *history, const char *w, unsigned type, unsigned T, unsigned C, unsigned K,
+        unsigned dilation, float *snap, unsigned st, float *snap2, unsigned st2) {
+    pdl_enter();
+    const unsigned c = blockIdx.x*32+threadIdx.x%32, L = (T+CONV_SEGS-1)/CONV_SEGS, H = (K-1)*dilation;
+    const unsigned t0 = min(T,threadIdx.x/32*L), t1 = min(T,t0+L);
+    const bool active = c < C && t0 < t1;
+    float hist[9], taps[4];
+    if (active) {
+        for (unsigned i = 0; i < H; i++) {
+            const int p = (int)t0-(int)H+(int)i;
+            hist[i] = p < 0 ? history[(uint64_t)(p+(int)H)*C+c] : normed[(uint64_t)p*C+c];
+        }
+        for (unsigned i = 0; i < K; i++) taps[i] = scalar(w,c*K+i,type);
+    }
+    __syncthreads();
+    if (!active) return;
+    for (unsigned t = t0; t < t1; t += CONV_GROUP) {
+        float cur[CONV_GROUP], gt[CONV_GROUP], r[CONV_GROUP];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            const uint64_t p = (uint64_t)(t+g)*C+c;
+            cur[g] = normed[p]; gt[g] = gated[p]; r[g] = R[p];
+        }
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            float v = taps[K-1]*cur[g];
+            for (unsigned i = 0; i < K-1; i++) v += taps[i]*hist[i*dilation];
+            for (unsigned i = 0; i+1 < H; i++) hist[i] = hist[i+1];
+            hist[H-1] = cur[g];
+            R[(uint64_t)(t+g)*C+c] = r[g]+(gt[g]+silu(v));
+            if (snap && t+g == st) for (unsigned i = 0; i < H; i++) snap[(uint64_t)i*C+c] = hist[i];
+            if (snap2 && t+g == st2) for (unsigned i = 0; i < H; i++) snap2[(uint64_t)i*C+c] = hist[i];
+        }
+    }
+    if (t1 == T) for (unsigned i = 0; i < H; i++) history[(uint64_t)i*C+c] = hist[i];
+}
+
 } // namespace qwen4_cuda
 
 extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *history,
@@ -4871,7 +5080,10 @@ extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tenso
     if (!T || !C || K < 2 || K > 4 || !tensor(x, (uint64_t)T * C * 4) || !tensor(history, (uint64_t)(K - 1) * C * 4)) return 0;
     const char *w = weight(map, size, offset, (uint64_t)C * K * 4);
     if (!w) return 0;
-    launch(conv, (C + 255) / 256, 256, 0, (float *)x->ptr, (float *)history->ptr,
+    if (T > 8 && env_on("DS4_QWEN4_CONV_SEG"))
+        launch(conv_seg, (C + 31) / 32, 32 * CONV_SEGS, 0, (float *)x->ptr, (float *)history->ptr,
+            (const float *)w, T, C, K, activate);
+    else launch(conv, (C + 255) / 256, 256, 0, (float *)x->ptr, (float *)history->ptr,
         (const float *)w, T, C, K, activate, nullptr, UINT_MAX, nullptr, UINT_MAX);
     return launched();
 }
@@ -4904,6 +5116,14 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         !tensor(qkv, (uint64_t)T * (2 * Hk + Hv) * D * 4) ||
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4) ||
         (snap && !tensor(snap, bytes)) || (snap2 && !tensor(snap2, bytes))) return 0;
+    const uintptr_t align = (uintptr_t)out->ptr | (uintptr_t)state->ptr | (uintptr_t)qkv->ptr |
+        (snap ? (uintptr_t)snap->ptr : 0) | (snap2 ? (uintptr_t)snap2->ptr : 0);
+    if (T > 8 && D == 128 && !(align & 15) && env_on("DS4_QWEN4_GDN_PIPE")) {
+        launch(gdn_scan_pipe, dim3(D / 16, Hv), 128, 0, (float *)out->ptr, (float *)state->ptr,
+            (const float *)qkv->ptr, (const float *)a->ptr, (const float *)b->ptr, T, Hk, Hv,
+            snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
+        return launched();
+    }
 #define QWEN_GDN(ROWS, DIM) launch(gdn_scan<ROWS,DIM>, dim3((DIM+4*ROWS-1)/(4*ROWS),Hv), 128, 0, (float *)out->ptr, \
         (float *)state->ptr,(const float *)qkv->ptr,(const float *)a->ptr,(const float *)b->ptr, \
         T,Hk,Hv,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2)
@@ -4952,7 +5172,11 @@ extern "C" int ds4_gpu_qwen4_ple_conv_tensor(ds4_gpu_tensor *R, const ds4_gpu_te
         !tensor(history, hb) || (snap && !tensor(snap, hb)) || (snap2 && !tensor(snap2, hb))) return 0;
     const char *w = weight(map, size, off, row_bytes(type, (uint64_t)C * K));
     if (!w) return 0;
-    launch(ngram_conv, (C + 255) / 256, 256, 0, (float *)R->ptr,
+    if (T > 8 && env_on("DS4_QWEN4_CONV_SEG"))
+        launch(ngram_conv_seg, (C + 31) / 32, 32 * CONV_SEGS, 0, (float *)R->ptr,
+            (const float *)gated->ptr, (const float *)normed->ptr, (float *)history->ptr, w, type, T, C, K,
+            dilation, snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
+    else launch(ngram_conv, (C + 255) / 256, 256, 0, (float *)R->ptr,
         (const float *)gated->ptr, (const float *)normed->ptr, (float *)history->ptr, w, type, T, C, K,
         dilation, snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
     return launched();
