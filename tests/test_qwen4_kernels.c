@@ -1744,32 +1744,35 @@ static void test_expert_ws_exact(arena_t *a, uint32_t T) {
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E), *gs = ds4_gpu_tensor_alloc((uint64_t)T * NS * 4);
     ds4_gpu_tensor *gl = ds4_gpu_tensor_alloc((uint64_t)NE * cap * 4), *gc = ds4_gpu_tensor_alloc(NE * 4);
     const uint64_t nm = (uint64_t)T * NS * F, np = (uint64_t)T * NS * E;
-    ds4_gpu_tensor *mid[2], *part[2];
+    ds4_gpu_tensor *mid[3], *part[3];
     require_ok(gs && gl && gc && ds4_gpu_tensor_write(gs, 0, sel, (uint64_t)T * NS * 4) &&
                ds4_gpu_qwen4_moe_build_lists_tensor(gl, gc, gs, T, NS, NE, cap), "expert ws lists");
-    for (int ws = 0; ws < 2; ws++) {
+    /* matrix_half_tile, then matrix_half_ws on wide tiles (matrix_half_wb) and on 64-token tiles */
+    for (int ws = 0; ws < 3; ws++) {
         setenv("DS4_QWEN4_EXPERT_WS", ws ? "1" : "0", 1);
+        setenv("DS4_QWEN4_EXPERT_WB", ws == 1 ? "1" : "0", 1);
         mid[ws] = upload(NULL, nm + guard);
         part[ws] = upload(NULL, np + guard);
         require_ok(ds4_gpu_tensor_fill_f32(mid[ws], -1234.5f, nm + guard) &&
                    ds4_gpu_tensor_fill_f32(part[ws], -1234.5f, np + guard), "expert ws sentinels");
         require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(mid[ws], gx, gl, gc, a->base, a->size, off[0], off[1], 12u,
                                                    NE, T, NS, NS, E, F, cap), "expert ws mid");
-        /* both down kernels read the reference mid */
+        /* every down kernel reads the reference mid */
         require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(part[ws], mid[0], gl, gc, a->base, a->size, off[2], 39u,
                                                     NE, T, NS, NS, F, E, cap), "expert ws down");
     }
     unsetenv("DS4_QWEN4_EXPERT_WS");
+    unsetenv("DS4_QWEN4_EXPERT_WB");
     char name[96];
-    for (int which = 0; which < 2; which++) {
-        const uint64_t n = (which ? np : nm) + guard;
-        float *r = download(which ? part[0] : mid[0], n), *g = download(which ? part[1] : mid[1], n);
-        snprintf(name, sizeof(name), "expert ws exact T=%u %s", T, which ? "down" : "gate/up");
+    for (int which = 0; which < 4; which++) {
+        const uint64_t n = (which % 2 ? np : nm) + guard;
+        float *r = download(which % 2 ? part[0] : mid[0], n), *g = download(which % 2 ? part[1 + which / 2] : mid[1 + which / 2], n);
+        snprintf(name, sizeof(name), "expert %s exact T=%u %s", which / 2 ? "ws" : "wb", T, which % 2 ? "down" : "gate/up");
         require_ok(memcmp(r, g, n * 4) == 0, name);
         printf("  %-44s ok\n", name);
         free(r); free(g);
     }
-    for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(mid[i]); ds4_gpu_tensor_free(part[i]); }
+    for (int i = 0; i < 3; i++) { ds4_gpu_tensor_free(mid[i]); ds4_gpu_tensor_free(part[i]); }
     ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(gc);
     free(x); free(sel);
 }
@@ -5441,7 +5444,7 @@ static void bench_f16_prefill(arena_t *a) {
 }
 
 static void bench_expert_prefill(arena_t *a) {
-    const uint32_t T = 8192, NE = 512, NS = 10, E = 2560, F = 640;
+    const uint32_t T = getenv("QWEN4_BENCH_T") ? (uint32_t)atoi(getenv("QWEN4_BENCH_T")) : 8192, NE = 512, NS = 10, E = 2560, F = 640;
     const uint64_t gb = (uint64_t)NE * F * (E / 256) * 144, db = (uint64_t)NE * E * (F / 32) * 17;
     expert_bench c = { a, NULL, NULL, NULL, NULL, NULL, { arena_alloc(a, gb), arena_alloc(a, gb), arena_alloc(a, db) }, T };
     for (int m = 0; m < 2; m++) {
@@ -5483,8 +5486,8 @@ static void bench_expert_prefill(arena_t *a) {
                ds4_gpu_qwen4_moe_build_lists_tensor(c.lists, c.counts, gs, T, NS, NE, T), "expert bench setup");
     for (int ws = 0; ws < 2; ws++) {
         setenv("DS4_QWEN4_EXPERT_WS", ws ? "1" : "0", 1);
-        bench_run(ws ? "expert gate/up ws T=8192" : "expert gate/up tile T=8192", bench_expert_mid, &c, ws ? 10 : 3);
-        bench_run(ws ? "expert down ws T=8192" : "expert down tile T=8192", bench_expert_down, &c, ws ? 10 : 3);
+        bench_run(ws ? "expert gate/up ws" : "expert gate/up tile", bench_expert_mid, &c, ws ? 10 : 3);
+        bench_run(ws ? "expert down ws" : "expert down tile", bench_expert_down, &c, ws ? 10 : 3);
     }
     unsetenv("DS4_QWEN4_EXPERT_WS");
     ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.lists); ds4_gpu_tensor_free(c.counts);
