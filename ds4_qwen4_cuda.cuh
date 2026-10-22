@@ -5385,18 +5385,36 @@ __global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
  * a stream, each group doing what a hc_norm_prefill block does, the same
  * partial sums in the same order), then pack_half_rows of the token's hc *
  * E values for the HC down projection, without writing them: hc_up_rows
- * recomputes them from R and inv[t * hc + stream].  Needs E <= 3072. */
+ * recomputes them from R and inv[t * hc + stream].  With comb, the block
+ * first does hc_combine's update of the token's streams (R += w * comb, w
+ * from the injection partials the previous mix left in inj), stores them
+ * and normalizes them from shared memory.  Needs E <= 3072. */
 template<unsigned TYPE>
 __global__ void __launch_bounds__(1024) hc_norm_split(__half *hi, __half *lo, float *xs, float *invs, float *inj,
-        const float *R, const float *gamma, const char *wi, unsigned E, unsigned hc, unsigned ni, float eps) {
+        float *R, const float *gamma, const char *wi, unsigned E, unsigned hc, unsigned ni, float eps,
+        const float *comb) {
+    extern __shared__ float hc_row[];
     pdl_enter();
     const unsigned tok = blockIdx.x, stream = threadIdx.x/256, tid = threadIdx.x%256, lane = tid&31, chunk = tid/32;
     const unsigned dim = E*hc, per = (E+7)/8;
-    const uint64_t base = ((uint64_t)tok*hc+stream)*E;
-    __shared__ float red[4][8], mxs[32], sinv;
+    __shared__ float red[4][8], mxs[32], sinv, wts[4];
+    const float *src = R+(uint64_t)tok*dim;
+    if (comb) {
+        if (threadIdx.x < hc) wts[threadIdx.x] = injection(inj+(uint64_t)tok*hc*hc*8,hc,threadIdx.x);
+        __syncthreads();
+        for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+            float r = src[i];
+            r += wts[i/E]*comb[(uint64_t)tok*E+i%E];
+            R[(uint64_t)tok*dim+i] = r;
+            hc_row[i] = r;
+        }
+        __syncthreads();
+        src = hc_row;
+    }
+    const float *row = src+stream*E;
     float ss = 0;
     if (tid < 128) for (unsigned i = tid; i < E; i += 128)
-        ss += R[base+i]*R[base+i];
+        ss += row[i]*row[i];
     /* block_sum over the stream's eight warps */
     ss = sum(ss);
     if (!lane) red[stream][chunk] = ss;
@@ -5412,7 +5430,7 @@ __global__ void __launch_bounds__(1024) hc_norm_split(__half *hi, __half *lo, fl
         for (unsigned k = 0; k < 3; k++) {
             const unsigned i = chunk*per+lane+part*32+k*128;
             if (i < end) {
-                const float x = R[base+i]*inv*gamma[stream*E+i];
+                const float x = row[i]*inv*gamma[stream*E+i];
                 v[part][k] = x;
                 mx = fmaxf(mx,fabsf(x));
                 #pragma unroll
@@ -6434,9 +6452,9 @@ extern "C" int ds4_gpu_qwen4_hc_up_rows_tensor(ds4_gpu_tensor *dst, const ds4_gp
  * hc) floats) are scratch.  Returns 0 before any launch where it does not
  * apply (DS4_QWEN4_HC_FUSE=0 too). */
 extern "C" int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *lo,
-        ds4_gpu_tensor *act, ds4_gpu_tensor *hilo, ds4_gpu_tensor *scales, const ds4_gpu_tensor *R,
+        ds4_gpu_tensor *act, ds4_gpu_tensor *hilo, ds4_gpu_tensor *scales, ds4_gpu_tensor *R,
         const void *map, uint64_t size, uint64_t norm, uint64_t io, uint32_t itype, uint64_t down, uint64_t up,
-        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, uint32_t rank, float eps) {
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, uint32_t rank, float eps, const ds4_gpu_tensor *comb) {
     using namespace qwen4_cuda;
     const uint64_t n = (uint64_t)T*E*hc, K = (uint64_t)E*hc;
     /* past K = 512 the reference's down projection is dense_f16_blas's cuBLAS path */
@@ -6446,7 +6464,8 @@ extern "C" int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gp
         !env_on("DS4_QWEN4_HC_FUSE") || !env_on("DS4_QWEN4_HC_UP_ROWS") || !env_on("DS4_QWEN4_F16_PIPE") ||
         !env_on("DS4_QWEN4_PACK_ROWS") || !tensor(mixed,(uint64_t)T*E*4) || !tensor(R,n*4) || !tensor(hilo,n*4) ||
         !tensor(scales,(uint64_t)T*(1+hc)*4) || !tensor(lo,(uint64_t)T*rank*4) || !tensor(act,(uint64_t)T*rank*4) ||
-        (ni && !tensor(inj,(uint64_t)T*hc*8*ni*4))) return 0;
+        (ni && !tensor(inj,(uint64_t)T*hc*8*ni*4)) ||
+        (comb && (!env_on("DS4_QWEN4_HC_COMB") || !tensor(comb,(uint64_t)T*E*4) || !tensor(inj,(uint64_t)T*hc*hc*8*4)))) return 0;
     const float *gamma = (const float *)weight(map,size,norm,n/T*4);
     const char *wi = ni ? weight(map,size,io,row_bytes(itype,K)*ni) : (const char *)gamma;
     const __half *wd = (const __half *)weight(map,size,down,K*rank*2), *wu = (const __half *)weight(map,size,up,K*rank*2);
@@ -6455,11 +6474,19 @@ extern "C" int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gp
         opted = cudaFuncSetAttribute(hc_up_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, HU_SMEM) == cudaSuccess;
         (void)cudaGetLastError();
     }
-    if (!gamma || !wi || !wd || !wu || ((uintptr_t)wu&15) || !opted) return 0;
+    static int copted = -1;
+    if (copted < 0) {
+        copted = cudaFuncSetAttribute(hc_norm_split<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 3072*4*4) == cudaSuccess &&
+                 cudaFuncSetAttribute(hc_norm_split<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 3072*4*4) == cudaSuccess &&
+                 cudaFuncSetAttribute(hc_norm_split<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 3072*4*4) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    if (!gamma || !wi || !wd || !wu || ((uintptr_t)wu&15) || !opted || (comb && !copted)) return 0;
     __half *hi = (__half *)hilo->ptr, *lw = hi+n;
     float *xs = (float *)scales->ptr, *invs = xs+T;
-#define QWEN_HC_SPLIT(TYPE) launch(hc_norm_split<TYPE>, T, 256*hc, 0, hi,lw,xs,invs,ni ? (float *)inj->ptr : nullptr, \
-        (const float *)R->ptr,gamma,wi,E,hc,ni,eps)
+#define QWEN_HC_SPLIT(TYPE) launch(hc_norm_split<TYPE>, T, 256*hc, comb ? (size_t)K*4 : 0, hi,lw,xs,invs, \
+        ni || comb ? (float *)inj->ptr : nullptr,(float *)R->ptr,gamma,wi,E,hc,ni,eps, \
+        comb ? (const float *)comb->ptr : (const float *)nullptr)
     if (!ni || itype == 0) { QWEN_HC_SPLIT(0); }
     else if (itype == 1) { QWEN_HC_SPLIT(1); }
     else { QWEN_HC_SPLIT(8); }
