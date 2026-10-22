@@ -582,6 +582,70 @@ __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
     if (!lane) scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
 }
 
+/* dsv41_index_scores_kernel with one thread per score instead of a warp.
+ * Every head shares the 128-value key, so a thread keeps it in registers and
+ * reads the rows' queries from shared memory. It forms the warp's 32 lane
+ * partials itself and sums them in warp_sum_f32's order (lane 0 of a
+ * shuffle-down tree), so the scores are the same bits without shuffles.
+ * FUSED selects the head accumulation the compiled warp kernel uses. */
+#define DSV41_INDEX_THREAD_ROWS 2u
+template <bool FUSED>
+__global__ static void __launch_bounds__(128) dsv41_index_scores_thread_kernel(
+        float *scores, const float *q, const float *weights, const float *keys,
+        uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
+    __shared__ float sq[DSV41_INDEX_THREAD_ROWS][32u * 128u];
+    __shared__ float sw[DSV41_INDEX_THREAD_ROWS][32u];
+    const uint32_t row0 = blockIdx.y * DSV41_INDEX_THREAD_ROWS;
+    for (uint32_t i = threadIdx.x; i < DSV41_INDEX_THREAD_ROWS * 32u * 128u; i += blockDim.x) {
+        const uint32_t r = i / (32u * 128u), row = row0 + r;
+        sq[r][i % (32u * 128u)] = row < rows ? q[(uint64_t)row * 32u * 128u + i % (32u * 128u)] : 0.0f;
+    }
+    for (uint32_t i = threadIdx.x; i < DSV41_INDEX_THREAD_ROWS * 32u; i += blockDim.x) {
+        const uint32_t r = i / 32u, row = row0 + r;
+        sw[r][i % 32u] = row < rows ? weights[(uint64_t)row * 32u + i % 32u] : 0.0f;
+    }
+    const uint32_t key = blockIdx.x * blockDim.x + threadIdx.x;
+    float k[128];
+    if (key < width) {
+        const float4 *kr = (const float4 *)(keys + (uint64_t)key * 128u);
+#pragma unroll
+        for (uint32_t i = 0; i < 32u; i++) {
+            const float4 v = kr[i];
+            k[4u * i] = v.x; k[4u * i + 1u] = v.y; k[4u * i + 2u] = v.z; k[4u * i + 3u] = v.w;
+        }
+    }
+    __syncthreads();
+    if (key >= width) return;
+#pragma unroll 1
+    for (uint32_t r = 0; r < DSV41_INDEX_THREAD_ROWS; r++) {
+        const uint32_t row = row0 + r;
+        if (row >= rows) break;
+        if (key >= (start + row + 1u) / ratio) {
+            scores[(uint64_t)row * width + key] = -INFINITY;
+            continue;
+        }
+        float total = 0;
+#pragma unroll 1
+        for (uint32_t h = 0; h < 32u; h++) {
+            const float *x = sq[r] + h * 128u;
+            float p[32];
+#pragma unroll
+            for (uint32_t l = 0; l < 32u; l++) {
+                const float a = __fadd_rn(__fmul_rn(x[l], k[l]), __fmul_rn(x[l + 64u], k[l + 64u]));
+                const float b = __fadd_rn(__fmul_rn(x[l + 32u], k[l + 32u]), __fmul_rn(x[l + 96u], k[l + 96u]));
+                p[l] = __fadd_rn(a, b);
+            }
+#pragma unroll
+            for (uint32_t off = 16u; off; off >>= 1u)
+#pragma unroll
+                for (uint32_t l = 0; l < off; l++) p[l] = __fadd_rn(p[l], p[l + off]);
+            const float relu = fmaxf(p[0], 0.0f);
+            total = FUSED ? __fmaf_rn(relu, sw[r][h], total) : __fadd_rn(total, __fmul_rn(relu, sw[r][h]));
+        }
+        scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                                    const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
                                                    const ds4_gpu_tensor *keys, uint32_t source_rows,
@@ -592,6 +656,25 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         !dsv41_has_floats(q, (uint64_t)rows * 32u * 128u) ||
         !dsv41_has_floats(weights, (uint64_t)rows * 32u) ||
         !dsv41_has_floats(keys, (uint64_t)source_rows * 128u)) return 0;
+#ifndef __HIP_PLATFORM_AMD__
+    /* Each thread runs all heads serially: worth it only with two blocks
+     * per SM or more. Both kernels write the same bits. */
+    const dim3 grid((source_rows + 127u) / 128u,
+                    (rows + DSV41_INDEX_THREAD_ROWS - 1u) / DSV41_INDEX_THREAD_ROWS);
+    if (!getenv("DS4_CUDA_V41_INDEX_SCORES_WARP") && ((uintptr_t)keys->ptr & 15u) == 0u &&
+        ((uint64_t)grid.x * grid.y >= 2u * (uint64_t)cuda_sm_count() ||
+         getenv("DS4_CUDA_V41_INDEX_SCORES_THREAD"))) {
+        if (getenv("DS4_CUDA_V41_INDEX_SCORES_UNFUSED"))
+            dsv41_index_scores_thread_kernel<false><<<grid, 128, 0, cuda_decode_stream()>>>(
+                (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+                (const float *)keys->ptr, source_rows, rows, start, ratio);
+        else
+            dsv41_index_scores_thread_kernel<true><<<grid, 128, 0, cuda_decode_stream()>>>(
+                (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+                (const float *)keys->ptr, source_rows, rows, start, ratio);
+        return cuda_ok(cudaGetLastError(), "V4.1 index scores");
+    }
+#endif
     /* FP4 with power-of-two scales can exceed FP16's exponent range.
      * Do not pass these already-quantized values through the GLM FP16 tile. */
     dsv41_index_scores_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
