@@ -92,6 +92,27 @@ Unset that old experimental sort flag to use the new prefill-only default.
 These switches use presence semantics: unset them to return to the default;
 setting a switch to `0` still enables it.
 
+## Discrete CUDA GPUs
+
+With DeepSeek V4.1 on a discrete NVIDIA GPU, the expert cache is in VRAM.
+
+A host with spare RAM can pin routed experts, so a cache miss copies from RAM
+instead of reading the SSD:
+
+```sh
+DS4_CUDA_SSD_HOST_GB=auto ./ds4 --cuda --ssd-streaming \
+  -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf
+```
+
+`auto` pins whole layers while 16 GiB of RAM stay available. A number caps
+the pinned GiB instead. Q2's routed experts take 142.4 GiB. Other programs
+cannot use that memory while DwarfStar runs. Startup reads and pins the
+experts first: 30 seconds from a cold page cache and 11 to 16 seconds when
+the file is already cached.
+
+On an RTX PRO 6000 (96 GB) with 192 GB of RAM, pinning all of Q2's experts
+took a 2K-token prefill from 75 to 510 t/s and decode from 21 to 48 t/s.
+
 ## M5 Max measurements
 
 On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:

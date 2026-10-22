@@ -415,6 +415,12 @@ int ds4_gpu_stream_expert_cache_prefetch(
         const ds4_gpu_stream_expert_table *current,
         const ds4_gpu_stream_expert_table *next);
 void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
+/* Pin whole routed expert tensors of the model map in host RAM; misses
+ * inside them become DMA copies. Returns the pinned bytes. */
+uint64_t ds4_gpu_stream_expert_host_pin(const void *model_map, uint64_t model_size,
+                                        const uint64_t *offsets, const uint64_t *sizes,
+                                        uint32_t n_spans);
+void ds4_gpu_stream_expert_host_release(void);
 /* True when the CUDA device has its own memory rather than sharing host RAM. */
 bool ds4_gpu_discrete_memory(void);
 #endif

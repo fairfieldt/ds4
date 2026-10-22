@@ -71644,6 +71644,54 @@ static void tp_dspark_split_meta(const ds4_engine *e, uint8_t meta[DS4_TP_DSPARK
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* DS4_CUDA_SSD_HOST_GB=N pins the routed experts of the first layers that fit
+ * in N GiB of host RAM, so VRAM expert cache misses there are DMA copies.
+ * "auto" uses what is available beyond the headroom. */
+static void ds41_cuda_host_tier_pin(ds4_engine *e) {
+    const char *env = getenv("DS4_CUDA_SSD_HOST_GB");
+    if (!env || !env[0]) return;
+    const uint64_t headroom = UINT64_C(16) << 30;
+    uint64_t available = 0, budget = 0;
+    const bool have_available = ds4_linux_nonmovable_memory(&available);
+    if (!strcmp(env, "auto")) {
+        budget = have_available && available > headroom ? available - headroom : 0;
+    } else {
+        const double gib = strtod(env, NULL);
+        if (!(gib > 0)) return;
+        budget = (uint64_t)(gib * 1073741824.0);
+    }
+    uint64_t offsets[3 * DS4_MAX_LAYER], sizes[3 * DS4_MAX_LAYER], bytes = 0;
+    uint32_t n = 0, layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        const ds4_tensor *t[3] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+        uint64_t layer_bytes = 0;
+        for (uint32_t j = 0; j < 3; j++) {
+            if (!t[j] || t[j]->abs_offset % 4096u || t[j]->bytes % 4096u) return;
+            layer_bytes += t[j]->bytes;
+        }
+        if (bytes + layer_bytes > budget) break;
+        for (uint32_t j = 0; j < 3; j++) {
+            offsets[n] = t[j]->abs_offset;
+            sizes[n++] = t[j]->bytes;
+        }
+        bytes += layer_bytes;
+        layers++;
+    }
+    if (!n || !have_available || available < bytes + headroom) {
+        fprintf(stderr, "ds4: CUDA SSD host tier skipped: %u layers need %.2f GiB plus "
+                "%.0f GiB headroom, %.2f GiB available\n", layers,
+                (double)bytes / 1073741824.0, (double)headroom / 1073741824.0,
+                (double)available / 1073741824.0);
+        return;
+    }
+    fprintf(stderr, "ds4: CUDA SSD host tier: pinning routed experts of layers 0-%u (%.2f GiB)\n",
+            layers - 1, (double)bytes / 1073741824.0);
+    (void)ds4_gpu_stream_expert_host_pin(e->model.map, e->model.size, offsets, sizes, n);
+}
+#endif
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
@@ -72845,6 +72893,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
             free(spans.v);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            if (model_map_ok && e->backend == DS4_BACKEND_CUDA &&
+                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
+                ds41_cuda_host_tier_pin(e);
+#endif
         } else if (load_slice) {
             const bool map_output =
                 load_output ||
@@ -74074,6 +74127,7 @@ void ds4_engine_close(ds4_engine *e) {
         e->tp.dspark_split_built = false;
         e->tp.dspark_split_bytes = 0;
     }
+    ds4_gpu_stream_expert_host_release();
 #endif
     ds4_expert_profile_close();
     weights_free(&e->weights);
