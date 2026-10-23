@@ -27,6 +27,41 @@ static inline float qwen4_silu(float x) {
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg);
 
+/* NVFP4 (NVIDIA's QAD checkpoint): sign << 15 | magnitude << 9 is an E2M1
+ * code's value times 2^-14 as a half.  The low nibbles of a word's four
+ * bytes become four halves in byte order; pass w >> 4 for the high ones. */
+static inline half4 qwen4_e2m1x4_s14(uint w) {
+    const uint a = w & 0x0f0f0f0fu;
+    const uint p01 = (a & 0xffu) | ((a & 0xff00u) << 8);
+    const uint p23 = ((a >> 16) & 0xffu) | ((a >> 8) & 0xff0000u);
+    return half4(as_type<half2>(((p01 & 0x00070007u) << 9) | ((p01 & 0x00080008u) << 12)),
+                 as_type<half2>(((p23 & 0x00070007u) << 9) | ((p23 & 0x00080008u) << 12)));
+}
+
+/* an NVFP4 block scale (E4M3) times the 2^14 of the halves above */
+static inline float qwen4_nvfp4_scale(uchar e) {
+    return (float)as_type<half>((ushort)(((uint)(e & 0x80u) << 8) | ((uint)(e & 0x7fu) << 7))) * 4194304.0f;
+}
+
+/* dot of an NVFP4 row (36-byte blocks of 64: four E4M3 scales, one per 16,
+ * then 32 code bytes; byte j of a 16-group holds elements j and j + 8) with
+ * x, without the expert's global scale.  Eight lanes per block, each owning
+ * four code bytes: elements o..o+3 and o+8..o+11 of group it/2, o = 4*(it%2). */
+static inline float qwen4_nvfp4_row_dot(device const char *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = in_dim / 64;
+    float acc = 0.0f;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 36);
+        const float d = qwen4_nvfp4_scale(b[it / 2]);
+        const uint q = *(device const uint *)(b + 4 + it * 4);
+        device const float *y = x + ib * 64 + (it / 2) * 16 + (it % 2) * 4;
+        acc += d * (dot(float4(qwen4_e2m1x4_s14(q)), *(device const float4 *)y) +
+                    dot(float4(qwen4_e2m1x4_s14(q >> 4)), *(device const float4 *)(y + 8)));
+    }
+    return simd_sum(acc);
+}
+
 /* --- hyper-connections -------------------------------------------------- */
 
 struct ds4_metal_args_qwen4_hc_norm {
@@ -2581,6 +2616,20 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t pad0;
 };
 
+/* One lane's step over a Q4_0 block (code bytes q0, q1 against x[0], x[1],
+ * x[16], x[17]) with contraction and reassociation off, so the per-token
+ * row dot and the grouped down kernel round alike. */
+static inline float qwen4_q4_0_step(float acc, float d, uint q0, uint q1,
+                                    float y0, float y1, float y16, float y17) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+    float s = y0 * ((float)(q0 & 0xfu) - 8.0f);
+    s = s + y1 * ((float)(q1 & 0xfu) - 8.0f);
+    s = s + y16 * ((float)(q0 >> 4) - 8.0f);
+    s = s + y17 * ((float)(q1 >> 4) - 8.0f);
+    return acc + d * s;
+}
+
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
  * ix = block stride, it = element pair inside the block */
 static inline float qwen4_row_dot(device const char *row, device const float *x,
@@ -2618,8 +2667,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             device const float *y = x + ib * 32 + (uint)it * 2;
             const float d = (float)(*(device const half *)b);
             const uint q0 = b[2 + it * 2], q1 = b[3 + it * 2];
-            acc += d * (y[0] * ((float)(q0 & 0xfu) - 8.0f) + y[1] * ((float)(q1 & 0xfu) - 8.0f) +
-                        y[16] * ((float)(q0 >> 4) - 8.0f) + y[17] * ((float)(q1 >> 4) - 8.0f));
+            acc = qwen4_q4_0_step(acc, d, q0, q1, y[0], y[1], y[16], y[17]);
         }
     } else if (weight_type == 12) {
         /* q4_K: 256-element super-blocks (d, dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes);
@@ -2677,6 +2725,18 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             for (uint i = 0; i < 8; i++) part += (float)grid[i] * ((signs >> i) & 1u ? -y[i] : y[i]);
             acc += dl * part;
         }
+    } else if (weight_type == 100) {
+        /* MXFP8: 132-byte blocks of 128 (four UE8M0 scales, one per 32, then
+         * the E4M3 codes); a lane owns four consecutive codes of every block */
+        const uint nb = in_dim / 128;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 132);
+            const float d = ds4_metal_mxfp8_scale(b[tiisg / 8]);
+            const float4 w = float4(ds4_metal_e4m3x4_s8(*(device const uint *)(b + 4 + tiisg * 4)));
+            acc += d * dot(w, *(device const float4 *)(x + ib * 128 + tiisg * 4));
+        }
+    } else if (weight_type == 40) {
+        return qwen4_nvfp4_row_dot(row, x, in_dim, tiisg);
     } else if (weight_type == 30) {
         device const ushort *w = (device const ushort *)row;
         for (uint i = tiisg * 4; i < in_dim; i += 128) {
@@ -3063,6 +3123,127 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
+/* NR consecutive rows (row_bytes apart) of NM NVFP4 matrices dotted with x,
+ * with qwen4_nvfp4_row_dot's lane map: every row's loads of a block step
+ * issue before its arithmetic.  out[m * NR + r]. */
+template <uint NR, uint NM>
+static inline void qwen4_nvfp4_rows_dot(device const char *w0, device const char *w1, uint64_t row_bytes,
+                                        device const float *x, uint in_dim, ushort tiisg, thread float *out) {
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = in_dim / 64;
+    float acc[NM * NR];
+    for (uint i = 0; i < NM * NR; i++) acc[i] = 0.0f;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        uint q[NM * NR];
+        uchar sc[NM * NR];
+        for (uint m = 0; m < NM; m++) {
+            for (uint r = 0; r < NR; r++) {
+                device const uchar *b = (device const uchar *)((m ? w1 : w0) + r * row_bytes + (uint64_t)ib * 36);
+                sc[m * NR + r] = b[it / 2];
+                q[m * NR + r] = *(device const uint *)(b + 4 + it * 4);
+            }
+        }
+        device const float *y = x + ib * 64 + (it / 2) * 16 + (it % 2) * 4;
+        const float4 y0 = *(device const float4 *)y, y1 = *(device const float4 *)(y + 8);
+        for (uint i = 0; i < NM * NR; i++) {
+            acc[i] += qwen4_nvfp4_scale(sc[i]) * (dot(float4(qwen4_e2m1x4_s14(q[i])), y0) +
+                                                  dot(float4(qwen4_e2m1x4_s14(q[i] >> 4)), y1));
+        }
+    }
+    for (uint i = 0; i < NM * NR; i++) out[i] = simd_sum(acc[i]);
+}
+
+/* NVFP4 routed experts (NVIDIA's QAD checkpoint): kernel_qwen4_moe_mid and
+ * kernel_qwen4_moe_down with each routed row's dots times its expert's
+ * global scale (gate and up before the activation), NR rows per simdgroup.
+ * The shared slot keeps its own weight type and no scale. */
+template <uint NR>
+kernel void kernel_qwen4_moe_mid_nvfp4(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,   /* [T][n_slots] */
+        device const float   *x,          /* [T][in_dim] */
+        device float         *mid,        /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        device const float   *gate_scale, /* [n_total_expert] */
+        device const float   *up_scale,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    device float *out = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) out[r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+    const uint e = (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    const uint64_t off = (uint64_t)e * args.expert_bytes + (uint64_t)row0 * args.row_bytes;
+    float d[2 * NR];
+    qwen4_nvfp4_rows_dot<NR, 2>(gate_base + off, up_base + off, args.row_bytes, xt, args.in_dim, tiisg, d);
+    const float sg = gate_scale[e], su = up_scale[e];
+    for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+        if (tiisg == 0) out[row0 + r] = qwen4_silu(sg * d[r]) * (su * d[NR + r]);
+    }
+}
+
+template <uint NR>
+kernel void kernel_qwen4_moe_down_nvfp4(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,   /* [T][n_slots] */
+        device const float   *mid,        /* [T][n_slots+has_shared][in_dim] */
+        device float         *part,       /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_down,
+        device const float   *down_scale, /* [n_total_expert] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    device const float *m = mid + pair * args.in_dim;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, args.shared_type,
+                                          args.in_dim, tiisg);
+            if (tiisg == 0) part[pair * args.out_rows + r] = v;
+        }
+        return;
+    }
+    const uint e = (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const char *db = down_base + (uint64_t)e * args.expert_bytes + (uint64_t)row0 * args.row_bytes;
+    float d[NR];
+    qwen4_nvfp4_rows_dot<NR, 1>(db, db, args.row_bytes, m, args.in_dim, tiisg, d);
+    const float sd = down_scale[e];
+    for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+        if (tiisg == 0) part[pair * args.out_rows + row0 + r] = sd * d[r];
+    }
+}
+
+#define QWEN4_NVFP4_MID_SIG constant ds4_metal_args_qwen4_moe &, device const char *, device const char *, device const int32_t *, device const float *, device float *, device const char *, device const char *, device const float *, device const float *, uint3, ushort, ushort, ushort3
+#define QWEN4_NVFP4_DOWN_SIG constant ds4_metal_args_qwen4_moe &, device const char *, device const int32_t *, device const float *, device float *, device const char *, device const float *, uint3, ushort, ushort, ushort3
+template [[host_name("kernel_qwen4_moe_mid_nvfp4_r1")]] kernel void kernel_qwen4_moe_mid_nvfp4<1>(QWEN4_NVFP4_MID_SIG);
+template [[host_name("kernel_qwen4_moe_mid_nvfp4_r2")]] kernel void kernel_qwen4_moe_mid_nvfp4<2>(QWEN4_NVFP4_MID_SIG);
+template [[host_name("kernel_qwen4_moe_down_nvfp4_r1")]] kernel void kernel_qwen4_moe_down_nvfp4<1>(QWEN4_NVFP4_DOWN_SIG);
+template [[host_name("kernel_qwen4_moe_down_nvfp4_r2")]] kernel void kernel_qwen4_moe_down_nvfp4<2>(QWEN4_NVFP4_DOWN_SIG);
+#undef QWEN4_NVFP4_MID_SIG
+#undef QWEN4_NVFP4_DOWN_SIG
+
 /* MXFP4 routed down rows with four blocks per lane requested before the
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that
@@ -3303,6 +3484,93 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     }
 }
 
+/* One pass of the Q4_0 grouped down kernel over NJ pairs of one expert:
+ * both rows of the simdgroup walk their blocks together, each pair with its
+ * own accumulators, every step qwen4_row_dot's lane order and rounding. */
+template <uint NJ>
+static inline void qwen4_moe_down_q4_0_pass(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base, device const float *mid, device float *part,
+        device const int32_t *list, uint64_t ebase, uint row0, uint nb, uint ix, uint it, ushort tiisg) {
+    uint pairs[NJ];
+    device const float *ms[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        pairs[j] = (uint)list[j];
+        ms[j] = mid + (uint64_t)pairs[j] * args.in_dim;
+    }
+    const bool two = row0 + 1u < args.out_rows;
+    device const uchar *rowa = (device const uchar *)(down_base + ebase + (uint64_t)row0 * args.row_bytes);
+    device const uchar *rowb = rowa + (two ? args.row_bytes : 0u);
+    float acca[NJ], accb[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) { acca[j] = 0.0f; accb[j] = 0.0f; }
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        device const uchar *a0 = rowa + (uint64_t)ib * 18u, *c0 = rowb + (uint64_t)ib * 18u;
+        const float da = (float)(*(device const half *)a0), db = (float)(*(device const half *)c0);
+        const uint pa = a0[2 + it * 2u], qa = a0[3 + it * 2u];
+        const uint pb = c0[2 + it * 2u], qb = c0[3 + it * 2u];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            device const float *y = ms[j] + ib * 32u + it * 2u;
+            const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
+            acca[j] = qwen4_q4_0_step(acca[j], da, pa, qa, y0, y1, y16, y17);
+            accb[j] = qwen4_q4_0_step(accb[j], db, pb, qb, y0, y1, y16, y17);
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        const float va = simd_sum(acca[j]);
+        const float vb = simd_sum(accb[j]);
+        if (tiisg == 0) {
+            part[(uint64_t)pairs[j] * args.out_rows + row0] = va;
+            if (two) part[(uint64_t)pairs[j] * args.out_rows + row0 + 1u] = vb;
+        }
+    }
+}
+
+/* kernel_qwen4_moe_down_mxfp4_grouped for Q4_0 rows: each pair's rows are
+ * kernel_qwen4_moe_down's (qwen4_row_dot) bit for bit. */
+kernel void kernel_qwen4_moe_down_q4_0_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) part[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return;
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = args.in_dim / 32;
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        const uint nj = min(4u, count - j0);
+        switch (nj) {
+        case 1u: qwen4_moe_down_q4_0_pass<1>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        case 2u: qwen4_moe_down_q4_0_pass<2>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        case 3u: qwen4_moe_down_q4_0_pass<3>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        default: qwen4_moe_down_q4_0_pass<4>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        }
+    }
+}
+
 struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t n_tokens;
     uint32_t n_slots;
@@ -3419,6 +3687,20 @@ kernel void kernel_qwen4_moe_build_lists(
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
 static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
+    if (type == 40) {
+        /* nvfp4 without the expert's global scale (exact as halves): 32-block
+         * b is half b % 2 of 64-block b / 2; quarter q is the low (even q) or
+         * high nibbles of the 8 code bytes of 16-group (b % 2) * 2 + q / 2 */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 2) * 36);
+        const uint g = (b % 2) * 2 + q / 2, shift = (q & 1u) * 4u;
+        const float d = qwen4_nvfp4_scale(blk[g]);
+        device const uint *qs = (device const uint *)(blk + 4 + g * 8);
+        const float4 v0 = d * float4(qwen4_e2m1x4_s14(qs[0] >> shift));
+        const float4 v1 = d * float4(qwen4_e2m1x4_s14(qs[1] >> shift));
+        dst[0] = (D)v0.x; dst[1] = (D)v0.y; dst[2] = (D)v0.z; dst[3] = (D)v0.w;
+        dst[4] = (D)v1.x; dst[5] = (D)v1.y; dst[6] = (D)v1.z; dst[7] = (D)v1.w;
+        return;
+    }
     if (type == 2) {
         /* q4_0: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
@@ -3530,8 +3812,8 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
  * register prefetch: Q4_K keeps the 16-byte header (d, dmin, scales) and the
  * 16 nibble bytes of the quarter pair; Q2_K keeps d|dmin, the group's scale
  * nibble and the 16 bit-plane bytes of its group pair; IQ2XXS keeps d, the
- * 32-bit grid indices and the sign/scale word of the block; MXFP4 keeps the
- * 17 block bytes. */
+ * 32-bit grid indices and the sign/scale word of the block; Q4_0 keeps d and
+ * the 16 nibble bytes; MXFP4 keeps the 17 block bytes. */
 struct qwen4_raw16 { uint4 h; uint4 q; uchar m[17]; };
 static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type) {
     qwen4_raw16 r;
@@ -3556,6 +3838,11 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         r.h.x = ((uint)*(device const ushort *)blk) | (ag << 16);
         r.h.y = (ag >> 16) | (auxs << 16);
         r.h.z = auxs >> 16;
+    } else if (type == 2) {
+        device const ushort *h = (device const ushort *)(row + (uint64_t)b * 18);   /* 2-byte aligned */
+        r.h.x = h[0];
+        r.q = uint4(h[1] | ((uint)h[2] << 16), h[3] | ((uint)h[4] << 16),
+                    h[5] | ((uint)h[6] << 16), h[7] | ((uint)h[8] << 16));
     } else {
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
 #pragma unroll
@@ -3604,6 +3891,12 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
         }
         return;
     }
+    if (type == 2) {
+        const float d = (float)as_type<half>((ushort)(r.h.x & 0xFFFFu));
+        const uint shift = q0 >= 2 ? 4u : 0u;
+        for (uint i = 0; i < 16; i++) dst[i] = (half)(d * ((float)((r.q[i >> 2] >> (8u * (i & 3u) + shift)) & 0xFu) - 8.0f));
+        return;
+    }
     const float d = ds4_metal_e8m0_to_f32(r.m[0]);
     const bool hi = q0 >= 2;
     for (uint i = 0; i < 16; i++) {
@@ -3628,6 +3921,8 @@ kernel void kernel_qwen4_moe_mm_mid(
         device const int32_t *counts,
         device const float   *x,          /* [T][in_dim] */
         device float         *mid,        /* [T][n_out][out_rows] */
+        device const float   *gate_scale, /* nvfp4: [n_expert] global scales */
+        device const float   *up_scale,
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -3721,7 +4016,11 @@ kernel void kernel_qwen4_moe_mm_mid(
                 if (tok >= n_tile || row >= args.out_rows) continue;
                 const int pair = list[t0 + tok];
                 const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
-                const float g = Cs[sg][0][el], u = Cs[sg][1][el];
+                float g = Cs[sg][0][el], u = Cs[sg][1][el];
+                if ((qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type) == 40u) {
+                    g *= gate_scale[e];
+                    u *= up_scale[e];
+                }
                 mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = qwen4_silu(g) * u;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3730,18 +4029,18 @@ kernel void kernel_qwen4_moe_mm_mid(
 }
 
 template [[host_name("kernel_qwen4_moe_mm_mid_nt1")]]
-kernel void kernel_qwen4_moe_mm_mid<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_mid<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, device const float *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_mid_nt2")]]
-kernel void kernel_qwen4_moe_mm_mid<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_mid<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, device const float *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_mid")]]
-kernel void kernel_qwen4_moe_mm_mid<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_mid<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, device const float *, uint3, ushort, ushort);
 
 /* 64-token tiles: each decoded weight tile serves twice the tokens (8 KB of
  * activations staged per K step); remainders take the 8/16/32-token kernels. */
 template [[host_name("kernel_qwen4_moe_mm_mid_nt8")]]
-kernel void kernel_qwen4_moe_mm_mid<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_mid<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, device const float *, uint3, ushort, ushort);
 
 /* part[t][slot][r] = down . mid[t][slot], same tiling with mid as B */
 template <uint NT>
@@ -3752,6 +4051,7 @@ kernel void kernel_qwen4_moe_mm_down(
         device const int32_t *counts,
         device const float   *midv,       /* [T][n_out][in_dim] */
         device float         *part,       /* [T][n_out][out_rows] */
+        device const float   *down_scale, /* nvfp4: [n_expert] global scales */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -3833,7 +4133,9 @@ kernel void kernel_qwen4_moe_mm_down(
                 if (tok >= n_tile || row >= args.out_rows) continue;
                 const int pair = list[t0 + tok];
                 const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
-                part[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = Cs[sg][el];
+                float v = Cs[sg][el];
+                if ((qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type) == 40u) v *= down_scale[e];
+                part[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = v;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -3841,16 +4143,16 @@ kernel void kernel_qwen4_moe_mm_down(
 }
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt1")]]
-kernel void kernel_qwen4_moe_mm_down<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt2")]]
-kernel void kernel_qwen4_moe_mm_down<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down")]]
-kernel void kernel_qwen4_moe_mm_down<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt8")]]
-kernel void kernel_qwen4_moe_mm_down<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const float *, uint3, ushort, ushort);
 
 /* rows of floats -> halves (round to nearest even), four values per thread;
  * the tensor-op tiles read their activation operand from this copy. */

@@ -165,7 +165,7 @@ the responses and diagnostics for inspection; it does not grade image content.
 
 The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
-hyper-connection mixers and the original BF16 n-gram table. CUDA also runs
+hyper-connection mixers and the original BF16 n-gram table. Both also run
 NVIDIA's NVFP4 checkpoint with its own values: MXFP8 dense weights, NVFP4
 experts with per-expert global scales and NVFP4 n-gram rows; see
 [GGUF conversion](../gguf-tools/README.md#nvidias-nvfp4-checkpoint).
