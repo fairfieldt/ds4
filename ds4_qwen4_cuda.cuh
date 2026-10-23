@@ -2155,8 +2155,11 @@ __global__ void mtp_combine(float *out, const float *proj, unsigned E, unsigned 
 
 struct max_pair { float value; int index; };
 template<bool FINISH>
-__global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigned n) {
+__global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigned n, int *host_out) {
     pdl_enter();
+    out += blockIdx.y;
+    scratch += (uint64_t)blockIdx.y*(FINISH ? n : (n+4095)/4096);
+    if (!FINISH) logits += (uint64_t)blockIdx.y*n;
     const unsigned tid = threadIdx.x;
     __shared__ max_pair best[256];
     max_pair v = {-1e30f, 0};
@@ -2174,7 +2177,24 @@ __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigne
         }
         __syncthreads();
     }
-    if (!tid) { if (FINISH) *out = best[0].index; else scratch[blockIdx.x] = best[0]; }
+    if (!tid) {
+        if (!FINISH) scratch[blockIdx.x] = best[0];
+        else {
+            *out = best[0].index;
+            if (host_out) host_out[blockIdx.y] = best[0].index;
+        }
+    }
+}
+
+/* Copies a span the host wrote into mapped page-locked memory before this
+ * launch.  No kernel writes that memory, so it is loaded before the
+ * dependency wait (hidden under the predecessor); only the store waits. */
+__global__ void stage_host(uint4 *dst, const uint4 *src, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint4 a = {};
+    if (i < n) a = __ldcv(src + i);
+    pdl_enter();
+    if (i < n) dst[i] = a;
 }
 
 __global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
@@ -3290,13 +3310,47 @@ extern "C" int ds4_gpu_qwen4_mtp_combine_tensor(ds4_gpu_tensor *out, const ds4_g
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
-        const ds4_gpu_tensor *logits, uint32_t N) {
+extern "C" int ds4_gpu_qwen4_argmax_host_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, int32_t *host_out) {
     using namespace qwen4_cuda;
     const uint64_t blocks = ((uint64_t)N+4095)/4096;
     if (!N || !tensor(out,4) || !tensor(logits,(uint64_t)N*4) || !tensor(scratch,blocks*sizeof(max_pair))) return 0;
-    launch(argmax<false>, blocks, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N);
-    launch(argmax<true>, 1, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks);
+    launch(argmax<false>, blocks, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N,
+           (int *)nullptr);
+    launch(argmax<true>, 1, 256, 0, (int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks,(int *)host_out);
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, uint32_t T, int32_t *host_out) {
+    using namespace qwen4_cuda;
+    const uint64_t blocks = ((uint64_t)N+4095)/4096;
+    if (!N || !T || T > 65535 || !tensor(out,(uint64_t)T*4) || !tensor(logits,(uint64_t)T*N*4) ||
+        !tensor(scratch,(uint64_t)T*blocks*sizeof(max_pair))) return 0;
+    launch(argmax<false>,dim3(blocks,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,(const float *)logits->ptr,N,
+           (int *)nullptr);
+    launch(argmax<true>,dim3(1,T),256,0,(int *)out->ptr,(max_pair *)scratch->ptr,nullptr,blocks,(int *)host_out);
+    return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N) {
+    return ds4_gpu_qwen4_argmax_host_tensor(out, scratch, logits, N, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4_argmax_rows_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t N, uint32_t T) {
+    return ds4_gpu_qwen4_argmax_rows_host_tensor(out, scratch, logits, N, T, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes) {
+    using namespace qwen4_cuda;
+    if (!dst || !src || !bytes || (bytes | off | (uintptr_t)src) % 16u ||
+        off > dst->bytes || bytes > dst->bytes - off) return 0;
+    const uint64_t n = bytes / 16u;
+    if (n > UINT32_MAX - 255u) return 0;
+    launch(stage_host, (unsigned)((n + 255u) / 256u), 256, 0,
+           (uint4 *)((char *)dst->ptr + off), (const uint4 *)src, (unsigned)n);
     return launched();
 }
 

@@ -3473,6 +3473,28 @@ int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_
                                              uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
                                const ds4_gpu_tensor *logits, uint32_t n_vocab);
+/* CUDA batched greedy reduction: row t of logits (n_rows x n_vocab) to
+ * out_idx[t], same ties and NaN handling. Scratch needs T*ceil(V/4096)*8 bytes. */
+int ds4_gpu_qwen4_argmax_rows_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
+                                    const ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows);
+/* CUDA only.  Mapped page-locked host memory that kernels access through the
+ * host pointer.  The host writes it only while no enqueued kernel uses it
+ * (after end_commands) and reads what kernels stored after end_commands. */
+void *ds4_gpu_host_alloc(uint64_t bytes);
+void ds4_gpu_host_free(void *p);
+/* The argmax forms above that also store the row ids into mapped host memory. */
+int ds4_gpu_qwen4_argmax_host_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
+                                    const ds4_gpu_tensor *logits, uint32_t n_vocab, int32_t *host_out);
+int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
+                                         const ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows,
+                                         int32_t *host_out);
+/* Kernel copy of a span the host staged in mapped memory (bytes, offset and
+ * source 16-byte aligned).  It loads the host data before its dependency
+ * wait, hiding the transfer. */
+int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+/* D2D copy queued on the decode stream without a host wait. */
+int ds4_gpu_tensor_copy_queued(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                               const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */

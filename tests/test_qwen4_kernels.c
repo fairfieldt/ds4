@@ -2165,6 +2165,88 @@ static void test_qwen4_argmax(void) {
     printf("Qwen predictor argmax: CPU indices, ties, special values and guards passed\n");
 }
 
+#ifndef __APPLE__
+static void test_argmax_rows(void) {
+    const unsigned N = 8193, T = 3, guard = 8, chunks = (N+4095)/4096;
+    float *v = rand_vec(N*T,1.f);
+    v[4096] = v[8192] = 20;
+    for (unsigned j = 0; j < N; j++) v[N+j] = NAN;
+    v[2*N+8192] = 30;
+    ds4_gpu_tensor *x = upload(v,N*T), *out = upload(NULL,T+guard), *tmp = upload(NULL,T*chunks*2+guard);
+    require_ok(ds4_gpu_tensor_fill_f32(out,17.25f,T+guard) && ds4_gpu_tensor_fill_f32(tmp,17.25f,T*chunks*2+guard) &&
+        ds4_gpu_qwen4_argmax_rows_tensor(out,tmp,x,N,T),"argmax rows");
+    int got[3]; float tail[8];
+    require_ok(ds4_gpu_tensor_read(out,0,got,sizeof(got)) && got[0] == 4096 && got[1] == 0 && got[2] == 8192,"argmax row indices");
+    require_ok(ds4_gpu_tensor_read(out,T*4,tail,sizeof(tail)),"argmax row guard");
+    for (unsigned j = 0; j < guard; j++) require_ok(tail[j] == 17.25f,"argmax output row guard");
+    require_ok(ds4_gpu_tensor_read(tmp,T*chunks*8,tail,sizeof(tail)),"argmax scratch row guard");
+    for (unsigned j = 0; j < guard; j++) require_ok(tail[j] == 17.25f,"argmax scratch row guard");
+    require_ok(!ds4_gpu_qwen4_argmax_rows_tensor(out,tmp,x,N,T+1),"argmax rows rejects short input");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); free(v);
+    puts("  argmax rows: ties, chunk boundaries, NaNs, independent rows and guards passed");
+}
+
+/* The argmax kernels also store the ids into mapped page-locked host memory:
+ * the same ids as the device tensor, readable after end_commands, and only
+ * the requested rows. */
+static void test_host_argmax(void) {
+    const unsigned N = 8193, T = 3;
+    int32_t *top = ds4_gpu_host_alloc(64);
+    require_ok(top != NULL, "mapped argmax ids");
+    float *v = rand_vec(N * T, 1.f);
+    const unsigned want[3] = {977u, 4096u, N - 1u};
+    for (unsigned r = 0; r < T; r++) v[r * N + want[r]] = 40.f + (float)r;
+    v[4096] = 40.f;   /* tie in row 0: the lower index wins */
+    ds4_gpu_tensor *x = upload(v, N * T), *out = upload(NULL, T), *tmp = upload(NULL, T * 3 * 2);
+    for (unsigned j = 0; j < 16; j++) top[j] = -7;
+    int32_t dev[3];
+    require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_rows_host_tensor(out, tmp, x, N, T, top) &&
+               ds4_gpu_end_commands() && ds4_gpu_tensor_read(out, 0, dev, sizeof(dev)), "host argmax rows");
+    for (unsigned r = 0; r < T; r++) require_ok(top[r] == (int32_t)want[r] && dev[r] == top[r], "host argmax row ids");
+    require_ok(top[3] == -7, "host argmax row guard");
+    top[0] = -7;
+    require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_host_tensor(out, tmp, x, N, top) &&
+               ds4_gpu_end_commands() && top[0] == 977 && top[1] == (int32_t)want[1], "host argmax single row");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); free(v);
+    ds4_gpu_host_free(top);
+    puts("  host argmax: mapped ids match the device rows passed");
+}
+
+/* Rows the host staged in mapped page-locked memory reach the device through
+ * the staging kernel byte for byte: queued behind other work, the host
+ * rewriting the staging only after end_commands (as the graph does), and
+ * misaligned or oversized spans rejected. */
+static void test_host_staging(void) {
+    const unsigned n = 3u * 10240u + 4u;
+    char *pin = ds4_gpu_host_alloc((uint64_t)n * sizeof(float) + 256u);
+    require_ok(pin != NULL, "mapped staging");
+    float *rows = (float *)pin;
+    ds4_gpu_tensor *x = upload(NULL, n + 8u), *slow = upload(NULL, n), *p3 = upload(NULL, 64);
+    for (unsigned round = 0; round < 3; round++) {
+        float *v = rand_vec(n, 1.f);
+        memcpy(rows, v, (size_t)n * sizeof(float));
+        require_ok(ds4_gpu_tensor_fill_f32(x, 17.25f, n + 8u) && ds4_gpu_begin_commands() &&
+                   ds4_gpu_tensor_fill_f32(slow, 1.f, n) &&
+                   ds4_gpu_qwen4_stage_host_tensor(x, 16u, rows, (uint64_t)n * sizeof(float)) &&
+                   ds4_gpu_end_commands(), "staged span");
+        float *back = malloc((size_t)(n + 8u) * sizeof(float));
+        require_ok(back && ds4_gpu_tensor_read(x, 0, back, (uint64_t)(n + 8u) * sizeof(float)), "staged read");
+        require_ok(memcmp(back + 4, v, (size_t)n * sizeof(float)) == 0, "staged row bytes");
+        for (unsigned j = 0; j < 4; j++) require_ok(back[j] == 17.25f && back[n + 4u + j] == 17.25f, "staging guards");
+        free(back);
+        free(v);
+    }
+    require_ok(!ds4_gpu_qwen4_stage_host_tensor(x, 4, rows, 64) &&
+               !ds4_gpu_qwen4_stage_host_tensor(x, 0, rows, 60) &&
+               !ds4_gpu_qwen4_stage_host_tensor(x, 0, rows + 1, 64) &&
+               !ds4_gpu_qwen4_stage_host_tensor(p3, 0, rows, 272) &&
+               !ds4_gpu_qwen4_stage_host_tensor(NULL, 0, rows, 64), "staging rejects bad spans");
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(slow); ds4_gpu_tensor_free(p3);
+    ds4_gpu_host_free(pin);
+    puts("  host staging: mapped span staged byte for byte passed");
+}
+#endif
+
 /* The paired mixer must preserve both token rows and its partial-group guard. */
 /* The prefetched F16 gate/mix must reproduce the plain kernel byte for byte
  * on every lane path: ranks that skip the eight-term rounds, that end in a
@@ -3895,7 +3977,7 @@ int main(void) {
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
-    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
@@ -3958,7 +4040,10 @@ int main(void) {
     test_decode_fusions(&arena);
     test_qwen4_argmax();
 #ifndef __APPLE__
+    test_argmax_rows();
     test_select_rows(&arena);
+    test_host_argmax();
+    test_host_staging();
 #endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);

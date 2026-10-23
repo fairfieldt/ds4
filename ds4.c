@@ -40484,6 +40484,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.scratch_bytes += 3ull * (DS4_N_LAYER - n_attn) *
             ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
              (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+        /* Greedy CUDA verification retains up to three vocabulary rows
+         * per session while the predictor reuses the shared graph arena. */
+        if (backend == DS4_BACKEND_CUDA) m.scratch_bytes += 3ull * DS4_N_VOCAB * sizeof(float);
         m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
         return m;
     }
@@ -58679,6 +58682,8 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
  * transients before the GPU read them.  A batched Qwen decode must therefore
  * be one forward over several rows, which is the shape these buffers already
  * have, and not two forwards sharing an arena. */
+#define DS4_QWEN4_PIN_ROWS 4u
+
 #define DS4_QWEN4_SCRATCH_FIELDS(X) \
     X(R) X(xn) X(lo) X(inj) X(inj_alt) X(mixed) X(blk) X(qkv) X(z) X(ga) \
     X(gb) X(lin_o) X(ple_emb) X(ple_key) X(ple_val) X(ple_gated) X(ple_normed) \
@@ -58706,6 +58711,7 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
     ds4_gpu_tensor *logits;
+    bool gpu_logits_only; /* compute the head without a host download */
     /* Arena only, grown on demand: one logit row per batch member, the
      * attention rows' cache table (one entry per row and layer) and their
      * split partials. */
@@ -58771,6 +58777,16 @@ typedef struct ds4_qwen4_gpu_graph {
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
+    /* CUDA: mapped page-locked staging for decode forwards (T <=
+     * DS4_QWEN4_PIN_ROWS).  A kernel on the decode stream copies the staged
+     * inputs in, and the argmax kernels store the greedy ids straight into
+     * it, so no copy waits for the host; one block, freed with the graph.
+     * top_out, when set together with gpu_logits_only, receives the argmax
+     * row ids. */
+    void *pin_base;
+    float *pin_ngram;
+    int32_t *pin_top;
+    int32_t *top_out;
     ds4_gpu_tensor *steer_dirs;
     float steer_attn_scale;
     float steer_ffn_scale;
@@ -58887,6 +58903,12 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         free(g->host_row);
     }
     g->host_row = NULL;
+#ifndef DS4_HAS_QWEN4_METAL
+    ds4_gpu_host_free(g->pin_base);
+#endif
+    g->pin_base = NULL;
+    g->pin_ngram = NULL;
+    g->pin_top = g->top_out = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -59131,6 +59153,17 @@ private_state:
     ok = ok && g->pos3;
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
+#ifndef DS4_HAS_QWEN4_METAL
+    {
+        const uint64_t ngram_b = (uint64_t)DS4_QWEN4_PIN_ROWS * E * sizeof(float);
+        g->pin_base = ds4_gpu_host_alloc(ngram_b + 256u);
+        if (g->pin_base) {
+            char *p = g->pin_base;
+            g->pin_ngram = (float *)p;
+            g->pin_top = (int32_t *)(p + ngram_b);
+        }
+    }
+#endif
     if (!ok) {
         fprintf(stderr, "ds4: Qwen3.8 graph allocation failed (ctx %u)\n", ctx_cap);
         qwen4_graph_free(g);
@@ -59821,6 +59854,20 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
+/* CUDA decode forwards read the PLE n-grams while layer 0 runs and stage
+ * them in mapped memory for a kernel queued behind it, without the
+ * device-wide syncs that the Metal command buffers need (the il == 1 flush
+ * and the layer-2 flush).  Wider forwards, and a graph whose mapped staging
+ * could not be allocated, keep both syncs and the pageable upload. */
+static bool qwen4_async_ngram(const ds4_qwen4_gpu_graph *g, uint32_t T) {
+#ifdef DS4_HAS_QWEN4_METAL
+    (void)g; (void)T;
+    return false;
+#else
+    return g->pin_ngram && T <= DS4_QWEN4_PIN_ROWS;
+#endif
+}
+
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T) {
@@ -59843,6 +59890,14 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
         !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
         return false;
+    return true;
+}
+
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                    const int *tokens, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    const bool async = qwen4_async_ngram(g, T);
+    float *row = async ? g->pin_ngram : g->host_row;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -59863,6 +59918,9 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             }
         }
     }
+#ifndef DS4_HAS_QWEN4_METAL
+    if (async) return ds4_gpu_qwen4_stage_host_tensor(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+#endif
     return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
@@ -59891,7 +59949,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission. */
-    uint32_t flush_layer = timing != 2 && n_trunk > 2u ? 2u : 0u;
+    const bool async_ngram = qwen4_async_ngram(g, T);
+    uint32_t flush_layer = timing != 2 && n_trunk > 2u && !async_ngram ? 2u : 0u;
     const char *flush_env = getenv("DS4_QWEN4_FLUSH_LAYER");
     if (timing != 2 && flush_env && flush_env[0]) {
         char *end = NULL;
@@ -59902,6 +59961,15 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     const double t0 = timing ? now_sec() : 0.0;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    /* Read the n-gram rows while the GPU runs the first trunk layer, which
+     * does not use them: submit that layer, then read (as the session batch
+     * does).  The PLE layer itself must not be the first. */
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool overlap_ngrams = false;
+#else
+    const bool overlap_ngrams = n_trunk > 1 && !ds4_qwen4_layer_is_ple(0);
+#endif
+    if (!overlap_ngrams && !qwen4_graph_stage_ngrams(g,m,tokens,T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -59920,6 +59988,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         } \
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
+        if (il == 1 && overlap_ngrams) {
+            ok = (async_ngram || ds4_gpu_flush_commands()) && qwen4_graph_stage_ngrams(g,m,tokens,T);
+            if (!ok) break;
+        }
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
@@ -59985,10 +60057,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                 1000.0 * prof[2], 1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
     }
 #undef QWEN4_PROF
-    if (ok && logits_out && all_rows) {
+    if (ok && (logits_out || g->gpu_logits_only) && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);
-    } else if (ok && logits_out) {
+    } else if (ok && (logits_out || g->gpu_logits_only)) {
         /* final mixer on the last token only */
         ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * hc_dim * sizeof(float),
                                                    (uint64_t)hc_dim * sizeof(float));
@@ -60002,6 +60074,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
+#ifndef DS4_HAS_QWEN4_METAL
+    if (ok && g->gpu_logits_only)
+        ok = ds4_gpu_qwen4_argmax_rows_host_tensor(g->selected, g->router, g->logits,
+                                                   DS4_N_VOCAB, all_rows ? T : 1u, g->top_out) != 0;
+#endif
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
@@ -61394,6 +61471,14 @@ struct ds4_session {
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
     bool qwen4_rewound;
     float *qwen4_verify_logits;
+    ds4_gpu_tensor *qwen4_verify_device;
+    uint32_t qwen4_verify_device_rows, qwen4_frontier_row;
+    int qwen4_verify_top[3];
+    /* The on-device frontier: its tensor (the verify rows, or a plain
+     * greedy step's logits), row and argmax. */
+    ds4_gpu_tensor *qwen4_plain_device, *qwen4_frontier_src;
+    int qwen4_frontier_top;
+    bool qwen4_frontier_on_device;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
 #endif
@@ -61487,6 +61572,136 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+/* A greedy verifier retains its rows on the device across the predictor's
+ * scratch reuse. Sampling, logprobs, snapshots and copy_logits materialize
+ * the current frontier on demand; argmax only needs its cached token id. */
+static bool qwen4_session_materialize_logits(ds4_session *s) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && s->qwen4_frontier_on_device) {
+        if (!ds4_gpu_tensor_read(s->qwen4_frontier_src,(uint64_t)s->qwen4_frontier_row*DS4_N_VOCAB*4,
+                                 s->logits,(uint64_t)DS4_N_VOCAB*4)) return false;
+        s->qwen4_frontier_on_device = false;
+    }
+#else
+    (void)s;
+#endif
+    return true;
+}
+
+static void qwen4_session_host_logits(ds4_session *s) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s) s->qwen4_frontier_on_device = false;
+#else
+    (void)s;
+#endif
+}
+
+#ifdef DS4_HAS_QWEN4_GPU
+static void qwen4_session_verify_frontier(ds4_session *s, const float *rows, uint32_t row) {
+    if (s->qwen4_verify_device_rows) {
+        s->qwen4_frontier_src = s->qwen4_verify_device;
+        s->qwen4_frontier_row = row;
+        s->qwen4_frontier_top = s->qwen4_verify_top[row];
+        s->qwen4_frontier_on_device = true;
+    } else {
+        memcpy(s->logits,rows+(uint64_t)row*DS4_N_VOCAB,(uint64_t)DS4_N_VOCAB*4);
+        s->qwen4_frontier_on_device = false;
+    }
+}
+
+static bool qwen4_verify_keep_device(ds4_session *s, const ds4_gpu_tensor *logits,
+                                     uint32_t row0, uint32_t rows, const int *top) {
+    if (!s->qwen4_verify_device) s->qwen4_verify_device = ds4_gpu_tensor_alloc((uint64_t)3*DS4_N_VOCAB*4);
+    if (!s->qwen4_verify_device || !ds4_gpu_tensor_copy(s->qwen4_verify_device,0,logits,
+            (uint64_t)row0*DS4_N_VOCAB*4,(uint64_t)rows*DS4_N_VOCAB*4)) return false;
+    memcpy(s->qwen4_verify_top,top,rows*sizeof(*top));
+    s->qwen4_verify_device_rows = rows;
+    return true;
+}
+
+static bool qwen4_gpu_verify_enabled(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return false;
+#else
+    return true;
+#endif
+}
+
+/* CUDA plain decode: the head's argmax runs on the device and only its id
+ * comes back; the logits stay on the device as the frontier until a sampler,
+ * logprobs, a snapshot or copy_logits materializes them.  The step's logits
+ * tensor is swapped into the session, so the next forward and the MTP
+ * predictor write a different buffer.  Tensor-parallel heads merge vocab
+ * halves on the host after the eval, so they keep the download. */
+static bool qwen4_session_gpu_argmax(const ds4_session *s) {
+#ifdef DS4_HAS_QWEN4_METAL
+    (void)s;
+    return false;
+#else
+    return s->qwen4_graph.pin_top && !s->engine->tp.active && qwen4_gpu_verify_enabled();
+#endif
+}
+
+/* Size the session's frontier tensor like the graph's logits so the plain
+ * step can swap the two. */
+static bool qwen4_session_plain_device(ds4_session *s) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(s->qwen4_graph.logits);
+    if (s->qwen4_plain_device && ds4_gpu_tensor_bytes(s->qwen4_plain_device) != bytes) {
+        ds4_gpu_tensor_free(s->qwen4_plain_device);
+        s->qwen4_plain_device = NULL;
+    }
+    if (!s->qwen4_plain_device) s->qwen4_plain_device = ds4_gpu_tensor_alloc(bytes);
+    return s->qwen4_plain_device != NULL;
+}
+
+#ifndef DS4_HAS_QWEN4_METAL
+/* Batched plain sessions: the same device argmax over the batch's logit rows;
+ * each row is copied into its session's frontier tensor on the device and
+ * the ids come back through the first session's staging. */
+static bool qwen4_batch_gpu_argmax(ds4_decode_item *items, int count, ds4_engine *e) {
+    if (count < 1 || count > 32 || e->tp.active || !qwen4_gpu_verify_enabled() ||
+        !items[0].session->qwen4_graph.pin_top) return false;
+    for (int i = 0; i < count; i++) {
+        if (!qwen4_session_plain_device(items[i].session)) return false;
+    }
+    return true;
+}
+
+static bool qwen4_batch_argmax_encode(ds4_decode_item *items, int count, ds4_engine *e) {
+    ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
+    const uint64_t row = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bool ok = ds4_gpu_qwen4_argmax_rows_host_tensor(arena->selected, arena->router, arena->batch_logits,
+                                                    DS4_N_VOCAB, (uint32_t)count,
+                                                    items[0].session->qwen4_graph.pin_top) != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ok = ds4_gpu_tensor_copy_queued(items[i].session->qwen4_plain_device, 0, arena->batch_logits,
+                                        (uint64_t)i * row, row) != 0;
+    }
+    return ok;
+}
+#endif
+
+static bool qwen4_session_forward_argmax(ds4_session *s, int token) {
+    ds4_engine *e = s->engine;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!qwen4_session_plain_device(s)) return qwen4_graph_forward_token(g, &e->model, &e->weights, token, s->logits);
+    g->gpu_logits_only = true;
+    g->top_out = g->pin_top;
+    const bool ok = qwen4_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, NULL, false);
+    g->gpu_logits_only = false;
+    g->top_out = NULL;
+    if (!ok) return false;
+    ds4_gpu_tensor *step = g->logits;
+    g->logits = s->qwen4_plain_device;
+    s->qwen4_plain_device = step;
+    s->qwen4_frontier_src = step;
+    s->qwen4_frontier_row = 0;
+    s->qwen4_frontier_top = g->pin_top[0];
+    s->qwen4_frontier_on_device = true;
+    return true;
+}
+#endif
 
 static bool ds4_session_tp_leader(const ds4_session *s);
 
@@ -63913,6 +64128,7 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
 }
 
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (!qwen4_session_materialize_logits(s)) return 1;
     if (!s->qwen4_graph_ready || s->qwen4_rewound ||
         s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "Qwen3.8 snapshot requires sync or eval after rewind");
@@ -63992,6 +64208,8 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
 
 static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                       char *err, size_t errlen) {
+    qwen4_session_host_logits(s);
+    s->qwen4_verify_device_rows = 0;
     if (!s->qwen4_graph_ready) {
         payload_set_err(err, errlen, "Qwen3.8 graph is not ready for restore");
         return 1;
@@ -74975,6 +75193,8 @@ void ds4_session_free(ds4_session *s) {
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
             free(s->qwen4_verify_logits);
+            ds4_gpu_tensor_free(s->qwen4_verify_device);
+            ds4_gpu_tensor_free(s->qwen4_plain_device);
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
@@ -75777,7 +75997,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = ds4_session_argmax(s);
         int draft = -1;
         s->glm_mtp_have2 = false;
         if (qwen4_graph_mtp_step(&s->qwen4_graph, m, w, 0, parent, pos, true, NULL, &draft)) {
@@ -75804,6 +76024,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const int d2 = deep ? s->glm_mtp_draft2 : -1;
     const int toks[3] = { first_token, d, d2 };
     const uint32_t T = deep ? 3u : 2u;
+    const bool gpu_verify = temperature <= 0 && !e->dspark_exact_sampling && qwen4_gpu_verify_enabled();
+    if (!gpu_verify && !qwen4_session_materialize_logits(s)) return -1;
+    s->qwen4_verify_device_rows = 0;
     /* Three verifier rows plus the logits before the block, for exact rewinds. */
     if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
     float *rows = s->qwen4_verify_logits;
@@ -75826,7 +76049,16 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     g->snap2_valid = false;
     g->verify_rows_exact = deep;
     ds4_gpu_qwen4_set_verify_rows_exact(deep);
-    const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true);
+    g->gpu_logits_only = gpu_verify;
+    bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, gpu_verify ? NULL : rows, true);
+    g->gpu_logits_only = false;
+#ifndef DS4_HAS_QWEN4_METAL
+    if (ok && gpu_verify) {
+        int top[3];
+        ok = ds4_gpu_tensor_read(g->selected,0,top,T*sizeof(*top)) &&
+            qwen4_verify_keep_device(s,g->logits,0,T,top);
+    }
+#endif
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     g->verify_rows_exact = false;
     g->snap_after_second = false;
@@ -75841,10 +76073,10 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     token_vec_push(&s->checkpoint, first_token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
+    bool accept = (gpu_verify ? s->qwen4_verify_top[0] : sample_argmax(rows, V)) == d || qwen4_spec_force_accept();
     bool accept2 = false;
     if (deep) {
-        accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
+        accept2 = accept && ((gpu_verify ? s->qwen4_verify_top[1] : sample_argmax(rows + V, V)) == d2 || qwen4_spec_force_accept());
     }
     int replacement = -1;
     if (exact_sampling && temperature > 0.0f) {
@@ -75876,8 +76108,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     if (accept && (!deep || accept2)) {
         token_vec_push(&s->checkpoint, d);
         if (deep) token_vec_push(&s->checkpoint, d2);
-        memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        qwen4_session_verify_frontier(s,rows,T-1);
+        const int parent = ds4_session_argmax(s);
         bool have_next = false;
         int draft = -1;
         if (deep) {
@@ -75920,8 +76152,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         }
         s->checkpoint.len = pos + 1;
         token_vec_push(&s->checkpoint, d);
-        memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        qwen4_session_verify_frontier(s,rows,1);
+        const int parent = ds4_session_argmax(s);
         const int next_tokens[2] = {d, parent};
         int draft = -1;
         if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
@@ -75959,9 +76191,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         accepted[1] = replacement;
         return 2;
     }
-    memcpy(s->logits, rows, (size_t)V * sizeof(float));
+    qwen4_session_verify_frontier(s,rows,0);
     {
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = ds4_session_argmax(s);
         int draft = -1;
         if (qwen4_graph_mtp_step(g, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
@@ -76760,6 +76992,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
+    if (!qwen4_session_materialize_logits(s)) return 1;
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -76854,6 +77087,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    if (!qwen4_session_materialize_logits(s)) return 1;
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -78125,10 +78359,20 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s->qwen4_frontier_on_device) return s->qwen4_frontier_top;
+#endif
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && s->checkpoint_valid && s->qwen4_frontier_on_device) {
+        const int top = s->qwen4_frontier_top;
+        if (top != excluded_id) return top;
+    }
+#endif
+    if (!qwen4_session_materialize_logits(s)) return -1;
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
@@ -78149,6 +78393,13 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && s->checkpoint_valid && s->qwen4_frontier_on_device) {
+        const int top = s->qwen4_frontier_top;
+        if (!ds4_token_is_stop_for_think_mode(s->engine,top,think_mode)) return top;
+    }
+#endif
+    if (!qwen4_session_materialize_logits(s)) return -1;
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -78178,12 +78429,20 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && s->checkpoint_valid && s->qwen4_frontier_on_device) {
+        const int top = s->qwen4_frontier_top;
+        if (temperature <= 0.0f) return top;
+    }
+#endif
+    if (!qwen4_session_materialize_logits(s)) return -1;
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+    if (!qwen4_session_materialize_logits(s)) return 0;
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -78221,6 +78480,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+    if (!qwen4_session_materialize_logits(s)) return 0;
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
@@ -78243,6 +78503,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    if (!qwen4_session_materialize_logits(s)) return 0;
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
@@ -78250,6 +78511,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+    qwen4_session_host_logits(s);
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
@@ -79195,7 +79457,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         if (!s->glm_spec_inside) { s->glm_mtp_have = 0; s->glm_mtp_have2 = false; }
-        if (!qwen4_graph_forward_token(&s->qwen4_graph, &e->model, &e->weights, token, s->logits)) {
+        qwen4_session_host_logits(s);
+        if (!(qwen4_session_gpu_argmax(s)
+                  ? qwen4_session_forward_argmax(s, token)
+                  : qwen4_graph_forward_token(&s->qwen4_graph, &e->model, &e->weights, token, s->logits))) {
             if (errlen) snprintf(err, errlen, "Qwen3.8 decode failed");
             s->checkpoint_valid = false;
             return 1;
@@ -80790,6 +81055,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
     g->R = R_save;
     g->mixed = mixed_save;
     if (ok) ok = qwen4_gemv(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count);
+#ifdef DS4_HAS_QWEN4_METAL
     for (int i = 0; ok && i < count; i++) {
         ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
         ds4_gpu_tensor *row = ds4_gpu_tensor_view(g->batch_logits, (uint64_t)i * DS4_N_VOCAB * sizeof(float),
@@ -80807,6 +81073,21 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         sg->mtp_pos = idx0[i] + committed[i];
         sg->mtp_last_rows = 0;
     }
+#else
+    /* one argmax launch pair and one read for every session's draft */
+    if (ok) ok = ds4_gpu_qwen4_argmax_rows_tensor(g->selected, g->router, g->batch_logits,
+                                                DS4_N_VOCAB, (uint32_t)count) != 0;
+    if (!ds4_gpu_end_commands()) ok = false;
+    int32_t top[QWEN4_BATCH_MAX_ROWS];
+    if (ok) ok = ds4_gpu_tensor_read(g->selected, 0, top, (uint64_t)count * sizeof(*top)) != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
+        ok = top[i] >= 0 && top[i] < (int32_t)DS4_N_VOCAB;
+        if (ok) drafts[i] = top[i];
+        sg->mtp_pos = idx0[i] + committed[i];
+        sg->mtp_last_rows = 0;
+    }
+#endif
     return ok;
 }
 
@@ -81295,6 +81576,9 @@ static int ds4_sessions_eval_batch_native(
 #endif
     const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
+#ifdef DS4_HAS_QWEN4_BATCH
+    bool batch_argmax = false;
+#endif
     const bool native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
     if (native_ds41) {
@@ -81318,6 +81602,10 @@ static int ds4_sessions_eval_batch_native(
     } else if (native_qwen4) {
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
+#ifndef DS4_HAS_QWEN4_METAL
+        batch_argmax = ok && qwen4_batch_gpu_argmax(items, count, e);
+        if (batch_argmax) ok = qwen4_batch_argmax_encode(items, count, e);
+#endif
 #endif
     } else if (native_glm53) {
         ok = glm53_graph_encode_native_session_batch(
@@ -81371,10 +81659,18 @@ static int ds4_sessions_eval_batch_native(
         ds4_session *s = items[i].session;
 #ifdef DS4_HAS_QWEN4_BATCH
         if (native_qwen4) {
-            ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
-                                     (uint64_t)i * DS4_N_VOCAB * sizeof(float),
-                                     s->logits,
-                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            qwen4_session_host_logits(s);
+            if (batch_argmax) {
+                s->qwen4_frontier_src = s->qwen4_plain_device;
+                s->qwen4_frontier_row = 0;
+                s->qwen4_frontier_top = items[0].session->qwen4_graph.pin_top[i];
+                s->qwen4_frontier_on_device = true;
+            } else {
+                ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
+                                         (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                         s->logits,
+                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            }
             if (ok) {
                 s->qwen4_graph.pos++;
                 s->qwen4_rewound = false;
@@ -81791,6 +82087,8 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         const ds4_model *m = &e->model;
         const ds4_weights *w = &e->weights;
         const uint32_t V = DS4_N_VOCAB;
+        const bool gpu_verify = qwen4_gpu_verify_enabled();
+        int verify_top[32];
         const double t0 = now_sec();
         if (e->qwen4_batch_width != (uint32_t)count) {
             e->qwen4_batch_width = (uint32_t)count;
@@ -81811,6 +82109,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             pos0[i] = g->pos;
             /* The logit rows below replace those paired with older snapshots. */
             g->snap_valid = g->snap2_valid = g->snap0_valid = false;
+            s->qwen4_verify_device_rows = 0;
             if (s->glm_mtp_have && s->glm_mtp_parent == items[i].token &&
                 s->ctx_size - s->checkpoint.len >= 2 && g->pos + 2u <= g->ctx_cap &&
                 g->snap_ple_hist && g->mtp_R) {
@@ -81825,7 +82124,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
         bool ok = ds4_gpu_begin_commands() != 0 &&
                   qwen4_graph_encode_native_session_batch_ragged(mem, count, N, arena, m, w);
+#ifndef DS4_HAS_QWEN4_METAL
+        if (ok && gpu_verify) ok = ds4_gpu_qwen4_argmax_rows_tensor(arena->selected,arena->router,arena->batch_logits,V,N) != 0;
+#endif
         if (!ds4_gpu_end_commands()) ok = false;
+        if (ok && gpu_verify) ok = ds4_gpu_tensor_read(arena->selected,0,verify_top,N*sizeof(*verify_top)) != 0;
         for (int i = 0; i < count; i++) {
             ds4_qwen4_gpu_graph *g = &items[i].session->qwen4_graph;
             if (g->snap_after_first) {
@@ -81843,8 +82146,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
             if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
             float *rows = s->qwen4_verify_logits;
-            if (!ds4_gpu_tensor_read(arena->batch_logits, (uint64_t)mem[i].row0 * V * sizeof(float), rows,
-                                     (uint64_t)mem[i].n * V * sizeof(float))) {
+            const bool read_ok = gpu_verify ?
+                qwen4_verify_keep_device(s,arena->batch_logits,mem[i].row0,mem[i].n,verify_top+mem[i].row0) :
+                ds4_gpu_tensor_read(arena->batch_logits, (uint64_t)mem[i].row0 * V * sizeof(float), rows,
+                                     (uint64_t)mem[i].n * V * sizeof(float)) != 0;
+            if (!read_ok) {
                 for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
                 if (err && errlen) snprintf(err, errlen, "metal speculative batch: logits read failed");
                 return 1;
@@ -81853,13 +82159,13 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             committed[i] = 1u;
             if (mem[i].n == 2u) {
                 s->qwen4_spec_cycles++;
-                const bool accept = sample_argmax(rows, V) == mem[i].tokens[1] || qwen4_spec_force_accept();
+                const bool accept = (gpu_verify ? s->qwen4_verify_top[0] : sample_argmax(rows, V)) == mem[i].tokens[1] || qwen4_spec_force_accept();
                 qwen4_spec_note_first_draft(s, accept);
                 n_draft++;
                 n_acc += accept;
                 if (accept) {
                     token_vec_push(&s->checkpoint, mem[i].tokens[1]);
-                    memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
+                    qwen4_session_verify_frontier(s,rows,1);
                     g->pos = pos0[i] + 2u;
                     s->qwen4_spec_accepted++;
                     committed[i] = 2u;
@@ -81869,20 +82175,20 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                         if (err && errlen) snprintf(err, errlen, "Qwen3.8 mtp: rejection restore failed");
                         return 1;
                     }
-                    memcpy(s->logits, rows, (size_t)V * sizeof(float));
+                    qwen4_session_verify_frontier(s,rows,0);
                 }
                 if (qwen4_spec_trace()) {
                     fprintf(stderr, "ds4: spec batch pos %u token %d draft %d %s\n", pos0[i], mem[i].tokens[0],
                             mem[i].tokens[1], accept ? "accept" : "reject");
                 }
             } else {
-                memcpy(s->logits, rows, (size_t)V * sizeof(float));
+                qwen4_session_verify_frontier(s,rows,0);
                 g->pos = pos0[i] + 1u;
             }
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             s->qwen4_rewound = false;
-            parents[i] = sample_argmax(s->logits, V);
+            parents[i] = ds4_session_argmax(s);
             n_accepted[i] = (int)committed[i];
             accepted[i][0] = mem[i].tokens[0];
             accepted[i][1] = committed[i] == 2u ? mem[i].tokens[1] : -1;
@@ -87460,6 +87766,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    qwen4_session_host_logits(s);
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -87648,6 +87955,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
             else if (g->snap0_valid && g->snap0_pos == (uint32_t)pos && qwen4_graph_state_copy0(g, false))
                 logit_row = 3;
         }
+        if (logit_row >= 0 && s->qwen4_verify_device_rows) {
+            if ((uint32_t)logit_row >= s->qwen4_verify_device_rows ||
+                !ds4_gpu_tensor_read(s->qwen4_verify_device,(uint64_t)logit_row*DS4_N_VOCAB*4,
+                    s->qwen4_verify_logits+(uint64_t)logit_row*DS4_N_VOCAB,(uint64_t)DS4_N_VOCAB*4)) logit_row = -1;
+        }
+        qwen4_session_host_logits(s);
         if (logit_row >= 0) {
             memcpy(s->logits, s->qwen4_verify_logits + (size_t)logit_row * DS4_N_VOCAB,
                    (size_t)DS4_N_VOCAB * sizeof(float));
