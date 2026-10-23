@@ -2177,14 +2177,51 @@ __global__ void argmax(int *out, max_pair *scratch, const float *logits, unsigne
     if (!tid) { if (FINISH) *out = best[0].index; else scratch[blockIdx.x] = best[0]; }
 }
 
-__global__ void vis_patch(float *x, const float *a, const float *b, const float *bias,
-        const float *pos, unsigned N, unsigned E) {
+/* Start of the residual stream: the learned side x side position table
+ * resampled to the patch grid (bilinear, align_corners, the arithmetic of
+ * qwen4_vision_pos_embed in ds4.c) plus the patch bias.  One block per
+ * patch row; rows are in 2x2 merge-window order. */
+__global__ void vis_pos(float *x, const float *table, const float *bias, unsigned side,
+        unsigned grid_h, unsigned grid_w, unsigned E) {
     pdl_enter();
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < (uint64_t)N * E) x[i] = a[i] + b[i] + bias[i % E] + pos[i];
+    const unsigned row = blockIdx.x, blk = row/4, within = row%4, w2 = grid_w/2;
+    const unsigned py = (blk/w2)*2 + within/2, px = (blk%w2)*2 + within%2;
+    const double sy = grid_h > 1 ? (double)py*(side - 1)/(grid_h - 1) : 0.0;
+    const double sx = grid_w > 1 ? (double)px*(side - 1)/(grid_w - 1) : 0.0;
+    const unsigned y0 = (unsigned)sy, x0 = (unsigned)sx;
+    const unsigned y1 = y0 + 1 < side ? y0 + 1 : y0, x1 = x0 + 1 < side ? x0 + 1 : x0;
+    const float wy = (float)(sy - y0), wx = (float)(sx - x0);
+    const float *t00 = table + ((uint64_t)y0*side + x0)*E, *t01 = table + ((uint64_t)y0*side + x1)*E;
+    const float *t10 = table + ((uint64_t)y1*side + x0)*E, *t11 = table + ((uint64_t)y1*side + x1)*E;
+    for (unsigned d = threadIdx.x; d < E; d += blockDim.x)
+        x[(uint64_t)row*E + d] = (1.0f - wy)*((1.0f - wx)*t00[d] + wx*t01[d]) +
+                                 wy*((1.0f - wx)*t10[d] + wx*t11[d]) + bias[d];
 }
 
-__global__ void vis_norm(float *out, const float *x, const float *w, const float *b, unsigned E, float eps) {
+/* x = hi + lo as two FP16 planes of n values: the operand form of vis_mm.
+ * lo is the unscaled remainder; where it falls below the FP16 normal range
+ * its absolute error (2^-25) is far below the products' FP32 rounding. */
+__device__ __forceinline__ void vis_split(__half *dst, uint64_t n, uint64_t i, float x) {
+    const __half h = __float2half_rn(x);
+    dst[i] = h;
+    dst[n + i] = __float2half_rn(x - __half2float(h));
+}
+
+__device__ __forceinline__ void vis_split2(__half *dst, uint64_t n, uint64_t i, float x0, float x1) {
+    const __half2 h = __floats2half2_rn(x0, x1);
+    const float2 f = __half22float2(h);
+    *(__half2 *)&dst[i] = h;
+    *(__half2 *)&dst[n + i] = __floats2half2_rn(x0 - f.x, x1 - f.y);
+}
+
+__global__ void vis_split_rows(__half *out, const float *x, uint64_t n) {
+    pdl_enter();
+    const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) vis_split(out, n, i, x[i]);
+}
+
+/* LayerNorm of one row per block, written as vis_mm operand planes [rows][E] */
+__global__ void vis_norm(__half *out, const float *x, const float *w, const float *b, unsigned N, unsigned E, float eps) {
     pdl_enter();
     const unsigned tid = threadIdx.x;
     const uint64_t base = (uint64_t)blockIdx.x * E;
@@ -2195,61 +2232,506 @@ __global__ void vis_norm(float *out, const float *x, const float *w, const float
     v = 0;
     for (unsigned i = tid; i < E; i += blockDim.x) { const float d = x[base + i] - mean; v += d*d; }
     const float inv = rsqrtf(block_sum(v, red) / E + eps);
-    for (unsigned i = tid; i < E; i += blockDim.x) out[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
+    for (unsigned i = tid; i < E; i += blockDim.x)
+        vis_split(out, (uint64_t)N*E, base + i, (x[base + i] - mean) * inv * w[i] + b[i]);
 }
 
-__global__ void vis_qkv(float *q, float *k, float *v, const float *qkv, const float *bias,
-        unsigned H, unsigned D, unsigned grid_w) {
+/* qkv rows with the 2D rope, as FP16 planes for vis_flash:
+ * q (scaled by log2(e)/sqrt(D)), k and v, each [H][N][D] with a high and a
+ * scaled low plane (lo = (x - half(x)) * 4096) behind it.  Pair (i, i + D/2)
+ * rotates by hpos*inv(i) for i < D/4 and by wpos*inv(i - D/4) above,
+ * inv(j) = 10000^(-2j/(D/2)); the angles are computed once per row. */
+__global__ void vis_qkv_h(__half *q, __half *k, __half *v, const float *qkv,
+        unsigned N, unsigned H, unsigned D, unsigned grid_w, float qscale) {
     pdl_enter();
     const unsigned row = blockIdx.x, tid = threadIdx.x, E = H*D, hd = D/2, qd = D/4;
     const unsigned blk = row/4, within = row%4, w2 = grid_w/2;
     const float hp = (blk/w2)*2 + within/2, wp = (blk%w2)*2 + within%2;
+    __shared__ float cs[64], sn[64];
+    for (unsigned i = tid; i < hd; i += blockDim.x) {
+        const unsigned j = i < qd ? i : i-qd;
+        const float theta = (i < qd ? hp : wp) * powf(10000.0f, -2.0f*j/hd);
+        sincosf(theta, &sn[i], &cs[i]);
+    }
+    __syncthreads();
     const float *src = qkv + (uint64_t)row*3*E;
-    const uint64_t off = (uint64_t)row*E;
+    const uint64_t plane = (uint64_t)N*E;
+    auto put = [&](__half *dst, unsigned h, unsigned i, float x) {
+        const __half hi = __float2half_rn(x);
+        const uint64_t o = ((uint64_t)h*N + row)*D + i;
+        dst[o] = hi;
+        dst[plane + o] = __float2half_rn((x - __half2float(hi))*4096.0f);
+    };
     for (unsigned idx = tid; idx < 2*H*hd; idx += blockDim.x) {
         const unsigned part = idx/(H*hd), rem = idx%(H*hd), h = rem/hd, i = rem%hd;
         const unsigned base = part*E + h*D;
-        const float x0 = src[base+i] + bias[base+i], x1 = src[base+i+hd] + bias[base+i+hd];
-        const unsigned j = i < qd ? i : i-qd;
-        const float theta = (i < qd ? hp : wp) * powf(10000.0f, -2.0f*j/hd);
-        float s, c; sincosf(theta, &s, &c);
-        float *dst = part ? k : q;
-        dst[off+h*D+i] = x0*c - x1*s;
-        dst[off+h*D+i+hd] = x0*s + x1*c;
+        const float x0 = src[base+i], x1 = src[base+i+hd];
+        const float c = cs[i], s = sn[i], m = part ? 1.0f : qscale;
+        put(part ? k : q, h, i, (x0*c - x1*s)*m);
+        put(part ? k : q, h, i+hd, (x0*s + x1*c)*m);
     }
-    for (unsigned i = tid; i < E; i += blockDim.x) v[off+i] = src[2*E+i] + bias[2*E+i];
+    for (unsigned i = tid; i < E; i += blockDim.x) put(v, i/D, i%D, src[2*E+i]);
 }
 
-__global__ void vis_attention(float *out, const float *q, const float *k, const float *v,
-        unsigned N, unsigned H, unsigned D) {
-    pdl_enter();
-    const unsigned row = blockIdx.x, h = blockIdx.y, lane = threadIdx.x, E = H*D;
-    const uint64_t qb = (uint64_t)row*E + h*D;
-    float query[3] = {}, acc[3] = {};
-    for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) query[j] = q[qb+lane+j*32];
-    float mx = -INFINITY, denom = 0;
-    for (unsigned p = 0; p < N; p++) {
-        const uint64_t kb = (uint64_t)p*E + h*D;
-        float score = 0;
-        for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) score += query[j]*k[kb+lane+j*32];
-        score = sum(score) * rsqrtf((float)D);
-        const float nm = fmaxf(mx, score), old = expf(mx-nm), prob = expf(score-nm);
-        denom = denom*old + prob;
-        for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) acc[j] = acc[j]*old + prob*v[kb+lane+j*32];
-        mx = nm;
-    }
-    for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) out[qb+lane+j*32] = acc[j]/denom;
+__device__ __forceinline__ void vis_ldsm_x4(uint32_t (&r)[4], const __half *p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(tt_smem_addr(p)));
 }
 
-__global__ void vis_add(float *x, const float *add, const float *bias, unsigned N, unsigned E, unsigned mode) {
+__device__ __forceinline__ void vis_ldsm_x4_t(uint32_t (&r)[4], const __half *p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(tt_smem_addr(p)));
+}
+
+__device__ __forceinline__ void vis_ldsm_x2_t(uint32_t (&r)[2], const __half *p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(tt_smem_addr(p)));
+}
+
+__device__ __forceinline__ uint32_t vis_pack(float a, float b) {
+    const __half2 h = __floats2half2_rn(a, b);
+    return *(const uint32_t *)&h;
+}
+
+__device__ __forceinline__ void vis_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    mma_f16_16816(c, a[0], a[1], a[2], a[3], b0, b1);
+}
+
+/* Bidirectional attention over one image as a flash-attention pass on the
+ * tensor cores (mma.sync m16n8k16, FP32 accumulation).  A block is 8 warps
+ * x 16 query rows of one head; 64-key tiles of K and V (high and low planes)
+ * stream through shared memory with cp.async, double-buffered.  Scores are
+ * base 2 (q carries log2(e)/sqrt(D)).  Both products keep about 22 bits of
+ * each operand: q.k = qh.kh + (qh.kl + ql.kh)/4096, and the probabilities
+ * are split the same way for p.v.  The output rows [N][H*D] are vis_mm
+ * operand planes for the output projection. */
+template<unsigned D>
+__global__ void __launch_bounds__(256) vis_flash(__half *out, const __half *q, const __half *k, const __half *v,
+        unsigned N, unsigned H) {
     pdl_enter();
-    const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= (uint64_t)N*E) return;
-    if (add) { x[i] += add[i] + bias[i%E]; return; }
-    float t = x[i] + bias[i%E];
-    if (!mode) t *= .5f * (1 + tanhf(fminf(30, fmaxf(-30, .7978845608f*(t+.044715f*t*t*t)))));
-    else if (mode == 1) t *= .5f * (1 + erff(t*.70710678f));
-    x[i] = t;
+#if __CUDA_ARCH__ >= 800
+    constexpr unsigned DP = (D + 15)/16*16, LD = DP + 8, KS = DP/16, NT = D/8, CH = D/8, BN = 64;
+    constexpr unsigned PLANE = BN*LD, STAGE = 4*PLANE;   /* kh, kl, vh, vl */
+    extern __shared__ __align__(16) __half vis_smem[];
+    const unsigned h = blockIdx.y, tid = threadIdx.x, lane = tid&31, warp = tid/32;
+    const uint64_t plane = (uint64_t)N*H*D, head = (uint64_t)h*N*D;
+    const unsigned r0 = blockIdx.x*128 + warp*16 + lane/4;
+    if (DP > D) {   /* k columns D..DP-1 meet zero q columns; keep them finite */
+        for (unsigned i = tid; i < 4*BN; i += blockDim.x)
+            *(int4 *)&vis_smem[(i/(2*BN))*STAGE + (i%(2*BN))*LD + D] = make_int4(0,0,0,0);
+    }
+    uint32_t qa[2][KS][4];
+    #pragma unroll
+    for (unsigned p = 0; p < 2; p++)
+        #pragma unroll
+        for (unsigned ks = 0; ks < KS; ks++)
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                const unsigned row = r0 + (i&1)*8, col = ks*16 + (lane%4)*2 + (i/2)*8;
+                qa[p][ks][i] = row < N && col < D ? *(const uint32_t *)(q + p*plane + head + (uint64_t)row*D + col) : 0u;
+            }
+    auto load = [&](unsigned st, unsigned key0) {
+        for (unsigned i = tid; i < 4*BN*CH; i += blockDim.x) {
+            const unsigned p = i/(BN*CH), rem = i%(BN*CH), r = rem/CH, c = rem%CH, key = key0 + r;
+            const __half *src = (p < 2 ? k + p*plane : v + (p-2)*plane) + head + (uint64_t)(key < N ? key : 0)*D + c*8;
+            tt_cp_async_16B(&vis_smem[st*STAGE + p*PLANE + r*LD + c*8], src, key < N);
+        }
+        tt_cp_async_commit();
+    };
+    float o[NT][4] = {}, ol[NT][4] = {};
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0, 0};
+    const unsigned tiles = (N + BN - 1)/BN;
+    load(0, 0);
+    for (unsigned t = 0; t < tiles; t++) {
+        if (t + 1 < tiles) { load((t+1)&1, (t+1)*BN); tt_cp_async_wait_group<1>(); }
+        else tt_cp_async_wait_group<0>();
+        __syncthreads();
+        const __half *ks_ = vis_smem + (t&1)*STAGE, *vs = ks_ + 2*PLANE;
+        float s[BN/8][4] = {}, sl[BN/8][4] = {};
+        #pragma unroll
+        for (unsigned kk = 0; kk < KS; kk++) {
+            #pragma unroll
+            for (unsigned nt = 0; nt < BN/8; nt += 2) {
+                const unsigned off = (nt*8 + (lane/16)*8 + lane%8)*LD + kk*16 + ((lane/8)&1)*8;
+                uint32_t b[4], bl[4];
+                vis_ldsm_x4(b, ks_ + off);
+                vis_ldsm_x4(bl, ks_ + PLANE + off);
+                vis_mma(s[nt], qa[0][kk], b[0], b[1]);
+                vis_mma(s[nt+1], qa[0][kk], b[2], b[3]);
+                vis_mma(sl[nt], qa[0][kk], bl[0], bl[1]);
+                vis_mma(sl[nt+1], qa[0][kk], bl[2], bl[3]);
+                vis_mma(sl[nt], qa[1][kk], b[0], b[1]);
+                vis_mma(sl[nt+1], qa[1][kk], b[2], b[3]);
+            }
+        }
+        float mx[2] = {m[0], m[1]};
+        #pragma unroll
+        for (unsigned nt = 0; nt < BN/8; nt++)
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                float x = s[nt][i] + sl[nt][i]*0x1p-12f;
+                if (t*BN + nt*8 + (lane%4)*2 + (i&1) >= N) x = -INFINITY;
+                s[nt][i] = x;
+                mx[i/2] = fmaxf(mx[i/2], x);
+            }
+        float corr[2];
+        #pragma unroll
+        for (unsigned r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            corr[r] = exp2f(m[r] - mx[r]);
+            m[r] = mx[r];
+            l[r] *= corr[r];
+        }
+        #pragma unroll
+        for (unsigned nt = 0; nt < NT; nt++)
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) { o[nt][i] *= corr[i/2]; ol[nt][i] *= corr[i/2]; }
+        #pragma unroll
+        for (unsigned nt = 0; nt < BN/8; nt++)
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                const float p = exp2f(s[nt][i] - m[i/2]);
+                s[nt][i] = p;
+                l[i/2] += p;
+            }
+        #pragma unroll
+        for (unsigned kk = 0; kk < BN/16; kk++) {
+            uint32_t a[4], al[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                const float x0 = s[2*kk + j/2][(j&1)*2], x1 = s[2*kk + j/2][(j&1)*2+1];
+                a[j] = vis_pack(x0, x1);
+                const float2 f = __half22float2(*(const __half2 *)&a[j]);
+                al[j] = vis_pack((x0 - f.x)*4096.0f, (x1 - f.y)*4096.0f);
+            }
+            #pragma unroll
+            for (unsigned nt = 0; nt + 1 < NT; nt += 2) {
+                const unsigned off = (kk*16 + lane%16)*LD + (nt + lane/16)*8;
+                uint32_t b[4], bl[4];
+                vis_ldsm_x4_t(b, vs + off);
+                vis_ldsm_x4_t(bl, vs + PLANE + off);
+                vis_mma(o[nt], a, b[0], b[1]);
+                vis_mma(o[nt+1], a, b[2], b[3]);
+                vis_mma(ol[nt], a, bl[0], bl[1]);
+                vis_mma(ol[nt+1], a, bl[2], bl[3]);
+                vis_mma(ol[nt], al, b[0], b[1]);
+                vis_mma(ol[nt+1], al, b[2], b[3]);
+            }
+            if (NT & 1) {
+                const unsigned off = (kk*16 + lane%16)*LD + (NT-1)*8;
+                uint32_t b[2], bl[2];
+                vis_ldsm_x2_t(b, vs + off);
+                vis_ldsm_x2_t(bl, vs + PLANE + off);
+                vis_mma(o[NT-1], a, b[0], b[1]);
+                vis_mma(ol[NT-1], a, bl[0], bl[1]);
+                vis_mma(ol[NT-1], al, b[0], b[1]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < 2; r++) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+        l[r] = 1.0f/l[r];
+    }
+    const unsigned E = H*D;
+    #pragma unroll
+    for (unsigned nt = 0; nt < NT; nt++)
+        #pragma unroll
+        for (unsigned r = 0; r < 2; r++) {
+            const unsigned row = r0 + r*8;
+            if (row >= N) continue;
+            const float x0 = o[nt][2*r] + ol[nt][2*r]*0x1p-12f, x1 = o[nt][2*r+1] + ol[nt][2*r+1]*0x1p-12f;
+            vis_split2(out, (uint64_t)N*E, (uint64_t)row*E + h*D + nt*8 + (lane%4)*2, x0*l[r], x1*l[r]);
+        }
+#elif defined(__CUDA_ARCH__)
+    __trap();  /* pre-sm_80 build: fail loudly rather than return garbage */
+#endif
+}
+
+template<unsigned D>
+static void vis_flash_launch(__half *out, const __half *q, const __half *k, const __half *v, unsigned N, unsigned H) {
+    constexpr size_t smem = 2*4*64*((D + 15)/16*16 + 8)*sizeof(__half);
+    static bool configured = false;
+    if (!configured) {
+        (void)cudaFuncSetAttribute(vis_flash<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        configured = true;
+    }
+    launch(vis_flash<D>, dim3((N + 127)/128, H), 256, smem, out, q, k, v, N, H);
+}
+
+__device__ __forceinline__ void vis_cp4(void *dst, const void *src, bool pred) {
+    if (pred) asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(tt_smem_addr(dst)), "l"(src));
+    else *(uint32_t *)dst = 0;
+}
+
+__device__ __forceinline__ void vis_mma_z(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+                 : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(0.0f));
+#endif
+}
+
+enum { VIS_STORE, VIS_RESID, VIS_GELU, VIS_GELU_ERF };
+
+/* Per weight type: k per stage, shared-memory row pitches (the X pitch keeps
+ * ldmatrix rows on distinct banks) and stage counts.  A Q8_0 stage holds
+ * two 34-byte blocks per row, 17 aligned words (the row has an even number
+ * of blocks); it is double-buffered, the others are triple-buffered. */
+template<unsigned WT> struct vis_mm_cfg {
+    static constexpr unsigned BK = WT == 0 ? 16 : WT == 8 ? 64 : 32, XLD = BK + 8;
+    static constexpr unsigned WLD = WT == 8 ? 68 : WT == 1 ? (BK + 8)*2 : (BK + 4)*4;
+    static constexpr unsigned XBYTES = 2*128*XLD*2, STAGE = XBYTES + 128*WLD, STAGES = WT == 8 ? 2 : 3;
+    static constexpr unsigned SMEM = STAGE*STAGES;
+};
+
+/* Output pair (t, m), (t, m + 1) of a projection, bias included */
+template<unsigned EPI>
+__device__ __forceinline__ void vis_epi(void *out, uint64_t n, uint64_t o, float v0, float v1) {
+    if (EPI == VIS_STORE) {
+        *(float2 *)((float *)out + o) = make_float2(v0, v1);
+    } else if (EPI == VIS_RESID) {
+        float2 *p = (float2 *)((float *)out + o);
+        const float2 old = *p;
+        *p = make_float2(old.x + v0, old.y + v1);
+    } else {
+        if (EPI == VIS_GELU) {
+            v0 *= .5f * (1 + tanhf(fminf(30, fmaxf(-30, .7978845608f*(v0+.044715f*v0*v0*v0)))));
+            v1 *= .5f * (1 + tanhf(fminf(30, fmaxf(-30, .7978845608f*(v1+.044715f*v1*v1*v1)))));
+        } else {
+            v0 *= .5f * (1 + erff(v0*.70710678f));
+            v1 *= .5f * (1 + erff(v1*.70710678f));
+        }
+        vis_split2((__half *)out, n, o, v0, v1);
+    }
+}
+
+/* Vision tower projection out[t][m] = sum_k w[m][k] x[t][k] + bias[m] on the
+ * tensor cores (mma.sync m16n8k16, FP32 accumulation).  x arrives as the
+ * FP16 planes hi, lo of vis_split, so every weight meets both components:
+ *   Q8_0: the int8 quants are exact in FP16; each 32-wide block sums
+ *         q.(xh + xl) and its FP16 scale multiplies that into the total,
+ *   F16:  w.xh + w.xl,
+ *   F32:  wh.xh + wh.xl + wl.xh with w split like x.
+ * A block computes 128 rows x 128 outputs with 8 warps of 64 x 32; k
+ * streams through shared memory in cp.async stages.  The epilogue
+ * adds the bias and stores FP32 (VIS_STORE), adds into FP32 (VIS_RESID), or
+ * applies tanh / erf GELU and writes operand planes for the next
+ * projection (VIS_GELU, VIS_GELU_ERF).  With part, blockIdx.z sums its share
+ * of k blocks into part[z][T][M] and vis_mm_reduce finishes. */
+template<unsigned WT, unsigned EPI>
+__global__ void __launch_bounds__(256) vis_mm(void *out, const __half *x, const char *w, const float *bias,
+        unsigned T, unsigned K, unsigned M, uint64_t rb, float *part, unsigned splits) {
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    using C = vis_mm_cfg<WT>;
+    constexpr unsigned BK = C::BK, XLD = C::XLD, WLD = C::WLD, XCH = BK/8;
+    extern __shared__ __align__(16) unsigned char vis_mm_smem[];
+    const unsigned tid = threadIdx.x, lane = tid&31, warp = tid/32;
+    const unsigned m0 = blockIdx.x*128, t0 = blockIdx.y*128, wt = (warp/4)*64, wm = (warp%4)*32;
+    const uint64_t xplane = (uint64_t)T*K;
+    const unsigned nkb = (K + BK - 1)/BK, kb0 = blockIdx.z*nkb/splits, nk = (blockIdx.z + 1)*nkb/splits - kb0;
+    auto load = [&](unsigned st, unsigned kb) {
+        unsigned char *base = vis_mm_smem + st*C::STAGE, *ws = base + C::XBYTES;
+        __half *xs = (__half *)base;
+        const unsigned k0 = kb*BK;
+        #pragma unroll
+        for (unsigned j = 0; j < XCH; j++) {
+            const unsigned i = tid + j*256, p = i/(128*XCH), r = (i/XCH)%128, c = i%XCH, t = t0 + r, k = k0 + c*8;
+            const bool ok = t < T && k < K;
+            tt_cp_async_16B(&xs[(p*128 + r)*XLD + c*8], x + p*xplane + (uint64_t)(ok ? t : 0)*K + (ok ? k : 0), ok);
+        }
+        if (WT == 8) {
+            #pragma unroll
+            for (unsigned j = 0; j < 9; j++) {
+                const unsigned i = tid + j*256, r = i/17, c = i%17;
+                if (j == 8 && i >= 128*17) break;
+                const bool ok = m0 + r < M;
+                vis_cp4(ws + r*WLD + c*4, w + (uint64_t)(ok ? m0 + r : 0)*rb + kb*68 + c*4, ok);
+            }
+        } else {
+            constexpr unsigned ES = WT == 1 ? 2 : 4, WCH = BK*ES/16;
+            #pragma unroll
+            for (unsigned j = 0; j < WCH/2; j++) {
+                const unsigned i = tid + j*256, r = i/WCH, c = i%WCH, k = k0 + c*(16/ES);
+                const bool ok = m0 + r < M && k < K;
+                tt_cp_async_16B(ws + r*WLD + c*16, w + (uint64_t)(ok ? m0 + r : 0)*rb + (uint64_t)(ok ? k : 0)*ES, ok);
+            }
+        }
+        tt_cp_async_commit();
+    };
+    float acc[4][4][4] = {};
+    #pragma unroll
+    for (unsigned s = 0; s < C::STAGES - 1; s++) {
+        if (s < nk) load(s, kb0 + s);
+        else tt_cp_async_commit();
+    }
+    for (unsigned i = 0; i < nk; i++) {
+        const unsigned kb = kb0 + i;
+        tt_cp_async_wait_group<C::STAGES - 2>();
+        __syncthreads();
+        if (i + C::STAGES - 1 < nk) load((i + C::STAGES - 1) % C::STAGES, kb + C::STAGES - 1);
+        else tt_cp_async_commit();
+        const unsigned char *base = vis_mm_smem + (i % C::STAGES)*C::STAGE, *ws = base + C::XBYTES;
+        const __half *xs = (const __half *)base;
+        float tmp[WT == 8 ? 4 : 1][4][4];
+        #pragma unroll
+        for (unsigned ks = 0; ks < BK; ks += 16) {
+            uint32_t bh[4][2], bl[WT == 0 ? 4 : 1][2];
+            if (WT == 8) {
+                #pragma unroll
+                for (unsigned mi = 0; mi < 4; mi++) {
+                    const unsigned char *row = ws + (wm + mi*8 + lane/4)*WLD + (ks/32)*34 + 2 + ks%32 + (lane%4)*2;
+                    bh[mi][0] = i8x2_to_h2(*(const uint16_t *)row);
+                    bh[mi][1] = i8x2_to_h2(*(const uint16_t *)(row + 8));
+                }
+            } else if (WT == 1) {
+                #pragma unroll
+                for (unsigned mi = 0; mi < 4; mi += 2) {
+                    uint32_t b[4];
+                    vis_ldsm_x4(b, (const __half *)(ws + (wm + mi*8 + (lane/16)*8 + lane%8)*WLD) + ks + ((lane/8)&1)*8);
+                    bh[mi][0] = b[0]; bh[mi][1] = b[1]; bh[mi+1][0] = b[2]; bh[mi+1][1] = b[3];
+                }
+            } else {
+                #pragma unroll
+                for (unsigned mi = 0; mi < 4; mi++) {
+                    const float *row = (const float *)(ws + (wm + mi*8 + lane/4)*WLD) + ks + (lane%4)*2;
+                    #pragma unroll
+                    for (unsigned j = 0; j < 2; j++) {
+                        const float2 f = *(const float2 *)(row + j*8);
+                        bh[mi][j] = vis_pack(f.x, f.y);
+                        const float2 g = __half22float2(*(const __half2 *)&bh[mi][j]);
+                        bl[WT == 0 ? mi : 0][j] = vis_pack(f.x - g.x, f.y - g.y);
+                    }
+                }
+            }
+            #pragma unroll
+            for (unsigned ti = 0; ti < 4; ti++) {
+                uint32_t ah[4], al[4];
+                const unsigned r = wt + ti*16 + lane%16, c = ks + (lane/16)*8;
+                vis_ldsm_x4(ah, xs + r*XLD + c);
+                vis_ldsm_x4(al, xs + (128 + r)*XLD + c);
+                #pragma unroll
+                for (unsigned mi = 0; mi < 4; mi++) {
+                    if (WT == 8) {
+                        float (&d)[4] = tmp[WT == 8 ? ti : 0][mi];
+                        if (ks%32 == 0) vis_mma_z(d, ah, bh[mi][0], bh[mi][1]);
+                        else vis_mma(d, ah, bh[mi][0], bh[mi][1]);
+                        vis_mma(d, al, bh[mi][0], bh[mi][1]);
+                    } else {
+                        vis_mma(acc[ti][mi], ah, bh[mi][0], bh[mi][1]);
+                        vis_mma(acc[ti][mi], al, bh[mi][0], bh[mi][1]);
+                        if (WT == 0) vis_mma(acc[ti][mi], ah, bl[WT == 0 ? mi : 0][0], bl[WT == 0 ? mi : 0][1]);
+                    }
+                }
+            }
+            if (WT == 8 && ks%32 == 16) {
+                #pragma unroll
+                for (unsigned mi = 0; mi < 4; mi++) {
+                    const unsigned char *row = ws + (wm + mi*8 + (lane%4)*2)*WLD + (ks/32)*34;
+                    const float d0 = __half2float(*(const __half *)row), d1 = __half2float(*(const __half *)(row + WLD));
+                    #pragma unroll
+                    for (unsigned ti = 0; ti < 4; ti++)
+                        #pragma unroll
+                        for (unsigned c = 0; c < 4; c++)
+                            acc[ti][mi][c] = fmaf(c&1 ? d1 : d0, tmp[WT == 8 ? ti : 0][mi][c], acc[ti][mi][c]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned ti = 0; ti < 4; ti++)
+        #pragma unroll
+        for (unsigned mi = 0; mi < 4; mi++)
+            #pragma unroll
+            for (unsigned r = 0; r < 2; r++) {
+                const unsigned t = t0 + wt + ti*16 + lane/4 + r*8, m = m0 + wm + mi*8 + (lane%4)*2;
+                if (t >= T || m >= M) continue;
+                float v0 = acc[ti][mi][2*r], v1 = acc[ti][mi][2*r+1];
+                const uint64_t o = (uint64_t)t*M + m;
+                if (part) {
+                    *(float2 *)(part + (uint64_t)blockIdx.z*T*M + o) = make_float2(v0, v1);
+                    continue;
+                }
+                if (bias) { v0 += bias[m]; v1 += bias[m+1]; }
+                vis_epi<EPI>(out, (uint64_t)T*M, o, v0, v1);
+            }
+#elif defined(__CUDA_ARCH__)
+    __trap();  /* pre-sm_80 build: fail loudly rather than return garbage */
+#endif
+}
+
+/* Sum of the split-k planes in plane order, then bias and epilogue */
+template<unsigned EPI>
+__global__ void vis_mm_reduce(void *out, const float *part, const float *bias, unsigned T, unsigned M, unsigned splits) {
+    pdl_enter();
+    const uint64_t n = (uint64_t)T*M, o = 2*((uint64_t)blockIdx.x*blockDim.x + threadIdx.x);
+    if (o >= n) return;
+    float2 v = *(const float2 *)(part + o);
+    for (unsigned s = 1; s < splits; s++) {
+        const float2 p = *(const float2 *)(part + s*n + o);
+        v.x += p.x; v.y += p.y;
+    }
+    const unsigned m = (unsigned)(o % M);
+    if (bias) { v.x += bias[m]; v.y += bias[m+1]; }
+    vis_epi<EPI>(out, n, o, v.x, v.y);
+}
+
+static unsigned vis_sms(void) {
+    static unsigned sms;
+    if (!sms) {
+        int device = 0, count = 0;
+        (void)cudaGetDevice(&device);
+        sms = cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess && count > 0 ?
+              (unsigned)count : 1u;
+    }
+    return sms;
+}
+
+/* split-k scratch: splits * T * M floats never exceed 2 * SMs * 128 * 128 */
+static uint64_t vis_part_floats(void) { return (uint64_t)2*vis_sms()*128*128; }
+
+/* A projection that fills less than one wave of blocks (a small image, or
+ * the merger) splits k until it has about two blocks per SM, keeping at
+ * least 8 k stages per split. */
+template<unsigned WT, unsigned EPI>
+static void vis_mm_run(void *out, const __half *x, const char *w, const float *bias,
+        unsigned T, unsigned K, unsigned M, uint64_t rb, float *part) {
+    static bool configured = false;
+    if (!configured) {
+        (void)cudaFuncSetAttribute(vis_mm<WT,EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)vis_mm_cfg<WT>::SMEM);
+        configured = true;
+    }
+    const unsigned blocks = ((M + 127)/128)*((T + 127)/128), nkb = (K + vis_mm_cfg<WT>::BK - 1)/vis_mm_cfg<WT>::BK;
+    unsigned splits = 1;
+    if (blocks < vis_sms()) {
+        splits = 2*vis_sms()/blocks;
+        if (splits > nkb/8) splits = nkb/8;
+        if (splits < 1) splits = 1;
+    }
+    launch(vis_mm<WT,EPI>, dim3((M + 127)/128, (T + 127)/128, splits), 256, vis_mm_cfg<WT>::SMEM,
+           out, x, w, bias, T, K, M, rb, splits > 1 ? part : (float *)NULL, splits);
+    if (splits > 1)
+        launch(vis_mm_reduce<EPI>, (unsigned)(((uint64_t)T*M/2 + 255)/256), 256, 0, out, (const float *)part, bias, T, M, splits);
+}
+
+/* type: 0 F32, 1 F16, 8 Q8_0; bias may be NULL.  Needs K % 8 == 0 (16-byte
+ * operand rows), an even number of Q8_0 blocks per row and even M; part is
+ * vis_part_floats() of split-k scratch. */
+template<unsigned EPI>
+static int vis_mm_launch(void *out, const __half *x, const char *w, unsigned type, const float *bias,
+        unsigned T, unsigned K, unsigned M, float *part) {
+    const uint64_t rb = row_bytes(type, K);
+    if (!out || !x || !w || !T || !rb || K%8 || M%2 || (type == 8 && K%64) || !part ||
+        ((uintptr_t)w & (type == 8 ? 3 : 15)) || ((uintptr_t)x & 15)) return 0;
+    if (type == 8) vis_mm_run<8,EPI>(out, x, w, bias, T, K, M, rb, part);
+    else if (type == 1) vis_mm_run<1,EPI>(out, x, w, bias, T, K, M, rb, part);
+    else if (type == 0) vis_mm_run<0,EPI>(out, x, w, bias, T, K, M, rb, part);
+    else return 0;
+    return launched();
 }
 
 template<unsigned TYPE, bool COMBINE = false>
@@ -3300,77 +3782,96 @@ extern "C" int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *
     return launched();
 }
 
+/* pos_embed must be NULL: the position table is resampled on the device */
 extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed,
         uint32_t N, uint32_t grid_w, const void *map, uint64_t size, const ds4_qwen4_vision_weights *w) {
     using namespace qwen4_cuda;
-    if (!out || !patches || !pos_embed || !w || !map || !N || N > 65535 || ds4_gpu_commands_active()) return 0;
+    if (!out || !patches || pos_embed || !w || !map || !N || N > 65535 || ds4_gpu_commands_active()) return 0;
     const unsigned E = w->n_embd, FF = w->n_ff, H = w->n_head, D = H ? E/H : 0;
-    const unsigned P = w->n_patch, M = w->n_merge, O = w->n_out;
+    const unsigned P = w->n_patch, M = w->n_merge, O = w->n_out, side = w->n_pos_side;
+    /* vis_flash is built for D = 72 only: the loader requires 1,152 wide
+     * over 16 heads (qwen4_vision_weights_bind) */
     if (M != 2 || !grid_w || grid_w%M || N%grid_w || (N/grid_w)%M ||
-        (D != 64 && D != 72) || H*D != E || !FF || !O || !P || P > 32 || E%32) return 0;
+        D != 72 || H*D != E || !FF || !O || !P || P > 32 || E%32 || side < 2) return 0;
     const unsigned IP = 3*P*P, ME = E*M*M, merged = N/(M*M);
-    std::vector<ds4_gpu_tensor *> buffers;
-    auto alloc = [&](uint64_t n) {
-        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(n*4);
-        buffers.push_back(t);
-        return t;
-    };
-    ds4_gpu_tensor *patch = alloc((uint64_t)N*IP), *a0 = alloc((uint64_t)N*E), *a1 = alloc((uint64_t)N*E);
-    ds4_gpu_tensor *pos = alloc((uint64_t)N*E), *x = alloc((uint64_t)N*E), *tmp = alloc((uint64_t)N*E);
-    ds4_gpu_tensor *qkv = alloc((uint64_t)N*3*E), *q = alloc((uint64_t)N*E), *k = alloc((uint64_t)N*E);
-    ds4_gpu_tensor *v = alloc((uint64_t)N*E), *attn = alloc((uint64_t)N*E), *ffn = alloc((uint64_t)N*FF);
-    ds4_gpu_tensor *m0 = alloc((uint64_t)merged*ME), *res = alloc((uint64_t)merged*O);
+    /* One scratch arena, kept and grown across encodes: allocating and
+     * freeing a dozen buffers per image cost more than small images take
+     * to encode.  ds4_gpu_cleanup frees it.  It is shared, so encodes must
+     * not overlap.  Like the rest of this backend (process-wide model
+     * maps, device-wide synchronisation) the encoder has one caller at a
+     * time: ds4-server encodes under inference_mu (server_encode_image),
+     * the CLI, the agent and the tests on their single inference thread. */
+    ds4_gpu_tensor *&arena = g_qwen4_vision_scratch;
+    enum { PATCH, PLANES, X, TMP, QKV, Q, K, V, ATTN, FFN, M0, RES, PART, NBUF };
+    const uint64_t floats[NBUF] = { (uint64_t)N*IP, (uint64_t)N*IP, (uint64_t)N*E, (uint64_t)N*E,
+        (uint64_t)N*3*E, (uint64_t)N*E, (uint64_t)N*E, (uint64_t)N*E, (uint64_t)N*E, (uint64_t)N*FF,
+        (uint64_t)merged*ME, (uint64_t)merged*O, vis_part_floats() };
+    uint64_t at[NBUF], total = 0;
+    for (unsigned i = 0; i < NBUF; i++) { at[i] = total; total += (floats[i]*4 + 255) & ~(uint64_t)255; }
+    if (!arena || ds4_gpu_tensor_bytes(arena) < total) {
+        ds4_gpu_tensor_free(arena);
+        arena = ds4_gpu_tensor_alloc(total);
+        if (!arena) return 0;
+    }
+    char *base = (char *)arena->ptr;
+    float *patch = (float *)(base + at[PATCH]), *x = (float *)(base + at[X]), *qkv = (float *)(base + at[QKV]);
+    __half *planes = (__half *)(base + at[PLANES]), *tmp = (__half *)(base + at[TMP]), *attn = (__half *)(base + at[ATTN]);
+    __half *ffn = (__half *)(base + at[FFN]), *m0 = (__half *)(base + at[M0]);
+    float *res = (float *)(base + at[RES]), *part = (float *)(base + at[PART]);
+    /* q, k and v: high and low FP16 planes for vis_flash */
+    __half *qh = (__half *)(base + at[Q]), *kh = (__half *)(base + at[K]), *vh = (__half *)(base + at[V]);
     bool ok = true, active = false;
-    for (const auto b : buffers) if (!b) ok = false;
-    auto ptr = [](ds4_gpu_tensor *t) { return (float *)t->ptr; };
-    auto wf = [&](uint64_t off, unsigned n) { return (const float *)weight(map,size,off,(uint64_t)n*4); };
-    auto mm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t off, unsigned type,
-                  unsigned rows, unsigned K, unsigned M) {
-        return ds4_gpu_qwen4_dense_mm_tensor(dst,src,map,size,off,type,rows,K,M);
+    auto wf = [&](uint64_t off, uint64_t n) { return (const float *)weight(map,size,off,n*4); };
+    /* vis_mm: src holds operand planes; epi picks the output form */
+    auto proj = [&](unsigned epi, void *dst, const __half *src, uint64_t off, unsigned type,
+                    const float *bias, unsigned rows, unsigned K, unsigned M) {
+        const uint64_t rb = row_bytes(type,K);
+        const char *wp = rb ? weight(map,size,off,rb*M) : NULL;
+        if (!wp) return 0;
+        switch (epi) {
+        case VIS_STORE: return vis_mm_launch<VIS_STORE>(dst,src,wp,type,bias,rows,K,M,part);
+        case VIS_RESID: return vis_mm_launch<VIS_RESID>(dst,src,wp,type,bias,rows,K,M,part);
+        case VIS_GELU: return vis_mm_launch<VIS_GELU>(dst,src,wp,type,bias,rows,K,M,part);
+        default: return vis_mm_launch<VIS_GELU_ERF>(dst,src,wp,type,bias,rows,K,M,part);
+        }
     };
-    auto norm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t wo, uint64_t bo) {
+    auto norm = [&](__half *dst, uint64_t wo, uint64_t bo) {
         const float *wgt = wf(wo,E), *bias = wf(bo,E);
         if (!wgt || !bias) return 0;
-        launch(vis_norm, N, 256, 0, ptr(dst),(const float *)src->ptr,wgt,bias,E,w->eps);
-        return launched();
-    };
-    auto add = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bo, unsigned rows,
-                   unsigned width, unsigned mode) {
-        const float *bias = wf(bo,width);
-        if (!bias) return 0;
-        launch(vis_add, ((uint64_t)rows*width+255)/256, 256, 0, ptr(dst),
-            src ? (const float *)src->ptr : nullptr,bias,rows,width,mode);
+        launch(vis_norm, N, 256, 0, dst,(const float *)x,wgt,bias,N,E,w->eps);
         return launched();
     };
     do {
-        if (!ok) break;
-        ok = ds4_gpu_tensor_write(patch,0,patches,(uint64_t)N*IP*4) &&
-             ds4_gpu_tensor_write(pos,0,pos_embed,(uint64_t)N*E*4);
-        if (!ok || !(active = ds4_gpu_begin_commands())) { ok = false; break; }
-        ok = mm(a0,patch,w->patch_w0,w->patch_type,N,IP,E) && mm(a1,patch,w->patch_w1,w->patch_type,N,IP,E);
-        const float *pb = wf(w->patch_b,E);
-        if (!ok || !pb) { ok = false; break; }
-        launch(vis_patch, ((uint64_t)N*E+255)/256, 256, 0, ptr(x),ptr(a0),ptr(a1),pb,ptr(pos),N,E);
-        ok = launched();
+        const float *table = wf(w->pos_embd,(uint64_t)side*side*E), *pb = wf(w->patch_b,E);
+        if (!ok || !table || !pb || !ds4_gpu_tensor_write(arena,at[PATCH],patches,(uint64_t)N*IP*4) ||
+            !(active = ds4_gpu_begin_commands())) { ok = false; break; }
+        /* x = pos + bias + patch . (w0 + w1): both temporal taps of the
+         * patch conv see the same frame */
+        launch(vis_pos, N, 256, 0, x,table,pb,side,N/grid_w,grid_w,E);
+        launch(vis_split_rows, ((uint64_t)N*IP+255)/256, 256, 0, planes,(const float *)patch,(uint64_t)N*IP);
+        ok = launched() && proj(VIS_RESID,x,planes,w->patch_w0,w->patch_type,NULL,N,IP,E) &&
+             proj(VIS_RESID,x,planes,w->patch_w1,w->patch_type,NULL,N,IP,E);
+        /* x is the FP32 residual stream; tmp, attn, ffn and m0 hold operand planes */
         for (unsigned l = 0; ok && l < DS4_QWEN4_VISION_LAYERS; l++) {
             const auto &lw = w->layer[l];
-            ok = norm(tmp,x,lw.ln1_w,lw.ln1_b) && mm(qkv,tmp,lw.qkv_w,lw.qkv_type,N,E,3*E);
-            const float *qb = wf(lw.qkv_b,3*E);
-            if (!ok || !qb) { ok = false; break; }
-            launch(vis_qkv, N, 256, 0, ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
-            launch(vis_attention, dim3(N,H), 32, 0, ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
-            ok = launched() && mm(tmp,attn,lw.out_w,lw.out_type,N,E,E) && add(x,tmp,lw.out_b,N,E,2) &&
-                 norm(tmp,x,lw.ln2_w,lw.ln2_b) && mm(ffn,tmp,lw.up_w,lw.up_type,N,E,FF) &&
-                 add(ffn,NULL,lw.up_b,N,FF,0) && mm(tmp,ffn,lw.down_w,lw.down_type,N,FF,E) &&
-                 add(x,tmp,lw.down_b,N,E,2);
+            const float *qkv_b = wf(lw.qkv_b,3*E), *out_b = wf(lw.out_b,E), *up_b = wf(lw.up_b,FF), *down_b = wf(lw.down_b,E);
+            ok = qkv_b && out_b && up_b && down_b &&
+                 norm(tmp,lw.ln1_w,lw.ln1_b) && proj(VIS_STORE,qkv,tmp,lw.qkv_w,lw.qkv_type,qkv_b,N,E,3*E);
+            if (!ok) break;
+            launch(vis_qkv_h, N, 256, 0, qh,kh,vh,(const float *)qkv,N,H,D,grid_w,1.4426950408889634f/sqrtf((float)D));
+            vis_flash_launch<72>(attn,qh,kh,vh,N,H);
+            ok = launched() && proj(VIS_RESID,x,attn,lw.out_w,lw.out_type,out_b,N,E,E) &&
+                 norm(tmp,lw.ln2_w,lw.ln2_b) && proj(VIS_GELU,ffn,tmp,lw.up_w,lw.up_type,up_b,N,E,FF) &&
+                 proj(VIS_RESID,x,ffn,lw.down_w,lw.down_type,down_b,N,FF,E);
         }
-        ok = ok && norm(tmp,x,w->post_ln_w,w->post_ln_b) && mm(m0,tmp,w->mm0_w,w->mm0_type,merged,ME,ME) &&
-             add(m0,NULL,w->mm0_b,merged,ME,1) && mm(res,m0,w->mm2_w,w->mm2_type,merged,ME,O) &&
-             add(res,NULL,w->mm2_b,merged,O,2);
+        /* the merger reads post-LN rows four at a time: [merged][4E] */
+        const float *mm0_b = wf(w->mm0_b,ME), *mm2_b = wf(w->mm2_b,O);
+        ok = ok && mm0_b && mm2_b && norm(tmp,w->post_ln_w,w->post_ln_b) &&
+             proj(VIS_GELU_ERF,m0,tmp,w->mm0_w,w->mm0_type,mm0_b,merged,ME,ME) &&
+             proj(VIS_STORE,res,m0,w->mm2_w,w->mm2_type,mm2_b,merged,ME,O);
     } while (false);
     if (active && !ds4_gpu_end_commands()) ok = false;
-    if (ok) ok = ds4_gpu_tensor_read(res,0,out,(uint64_t)merged*O*4);
-    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) ds4_gpu_tensor_free(*it);
+    if (ok) ok = ds4_gpu_tensor_read(arena,at[RES],out,(uint64_t)merged*O*4);
     return ok;
 }
 
