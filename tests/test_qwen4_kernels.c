@@ -1450,8 +1450,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
-#ifdef __APPLE__
-/* Native cross-session row kernels are Metal-only; CUDA uses ordered rows. */
+/* Cross-session row dispatch must preserve each session's private state. */
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1468,12 +1467,11 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
 
 /* The rows kernels of the decode batch must reproduce the per-row dispatches
  * bit for bit: the caches written, the block key, scores, selection, token
- * list and output.  Rows: dense, dense completing a block, sparse completing
- * a block on the plain selector's width, sparse on the prefiltered width. */
-static void test_attention_rows(arena_t *a) {
-    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
+ * list and output.  Rows at pos_of[]: a row from sparse_pos = (k_blocks + 1)
+ * * ratio - 1 on selects k_blocks blocks. */
+static void test_attention_rows_at(arena_t *a, uint32_t k_blocks, const uint32_t pos_of[4]) {
+    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, ratio = 4, R = 4;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
-    const uint32_t pos_of[4] = { 5, 11, sparse_pos, 140 };
     const double base = 1.0e7, eps = 1e-6;
     const float scale = 1.0f / sqrtf((float)D);
     const uint32_t sel_stride = k_blocks * ratio + ratio;
@@ -1606,7 +1604,8 @@ static void test_attention_rows(arena_t *a) {
         same_bytes("selected tokens", r, selt[0], (uint64_t)r * sel_stride * 4, selt[1], (uint64_t)r * sel_stride * 4,
                    (uint64_t)n_sel_a * 4);
     }
-    printf("  attention rows: dense, block-completing and sparse rows byte-exact against the per-row kernels\n");
+    printf("  attention rows at %u/%u/%u/%u (sparse from %u): byte-exact against the per-row kernels\n",
+           pos_of[0], pos_of[1], pos_of[2], pos_of[3], sparse_pos);
 
     ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(part1);
     for (uint32_t r = 0; r < R; r++) {
@@ -1626,6 +1625,102 @@ static void test_attention_rows(arena_t *a) {
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
+/* Dense, dense completing a block, sparse completing a block on the plain
+ * selector's width, sparse on the prefiltered width. */
+static void test_attention_rows(arena_t *a) {
+    const uint32_t pos_of[4] = { 5, 11, 19, 140 };
+    test_attention_rows_at(a, 4, pos_of);
+#ifndef __APPLE__
+    /* every row from 128 keys on: the rows take the grouped kernel, as each
+     * row's one-token decode does */
+    const uint32_t long_pos[4] = { 130, 203, 259, 300 };
+    test_attention_rows_at(a, 64, long_pos);
+#endif
+}
+
+#ifndef __APPLE__
+/* Each session's rows through the single-session kernels, as the batch did
+ * before the row kernels: the snapshot is the state after a row's first
+ * token, as the verify takes it. */
+static void gdn_rows_reference(arena_t *a, uint64_t wo, ds4_gpu_tensor *q, ds4_gpu_tensor *out,
+                               const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+                               const ds4_gpu_qwen4_gdn_row *rows, unsigned R,
+                               unsigned K, unsigned V, unsigned D, unsigned C, unsigned CK) {
+    for (unsigned r = 0; r < R; r++) {
+        const ds4_gpu_qwen4_gdn_row *g = &rows[r];
+        if (g->snap_hist && g->n_tok == 2) {
+            ds4_gpu_tensor *x0 = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)C*4);
+            ds4_gpu_tensor *x1 = ds4_gpu_tensor_view(q, (uint64_t)(g->row0+1)*C*4, (uint64_t)C*4);
+            require_ok(x0 && x1 &&
+                ds4_gpu_qwen4_conv_stream_tensor(x0, g->hist, a->base, a->size, wo, 1, C, CK, true) &&
+                ds4_gpu_tensor_copy(g->snap_hist, 0, g->hist, 0, ds4_gpu_tensor_bytes(g->hist)) &&
+                ds4_gpu_qwen4_conv_stream_tensor(x1, g->hist, a->base, a->size, wo, 1, C, CK, true),
+                "GDN reference conv with snapshot");
+            ds4_gpu_tensor_free(x0); ds4_gpu_tensor_free(x1);
+        } else {
+            ds4_gpu_tensor *xs = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)g->n_tok*C*4);
+            require_ok(xs && ds4_gpu_qwen4_conv_stream_tensor(xs, g->hist, a->base, a->size, wo, g->n_tok, C, CK, true),
+                       "GDN reference conv");
+            ds4_gpu_tensor_free(xs);
+        }
+        ds4_gpu_tensor *o = ds4_gpu_tensor_view(out, (uint64_t)g->row0*V*D*4, (uint64_t)g->n_tok*V*D*4);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(q, (uint64_t)g->row0*C*4, (uint64_t)g->n_tok*C*4);
+        ds4_gpu_tensor *av = ds4_gpu_tensor_view(ga, (uint64_t)g->row0*V*4, (uint64_t)g->n_tok*V*4);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_view(gb, (uint64_t)g->row0*V*4, (uint64_t)g->n_tok*V*4);
+        require_ok(o && x && av && bv &&
+                   ds4_gpu_qwen4_gdn_scan_tensor(o, g->state, x, av, bv, g->n_tok, K, V, D, g->snap_state, 0u, NULL, 1u),
+                   "GDN reference scan");
+        ds4_gpu_tensor_free(o); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv);
+    }
+}
+
+static void test_gdn_rows(arena_t *a) {
+    const unsigned K = 2, V = 4, D = 128, C = (2*K+V)*D, N = 5, R = 3, CK = 4, guard = 32;
+    const unsigned row0[] = {3,0,1}, nt[] = {2,1,2};
+    const uint64_t ns = (uint64_t)V*D*D, nh = (CK-1)*C;
+    double *shadow;
+    const uint64_t wo = arena_f32(a,C*CK,&shadow,-.1f,.1f);
+    free(shadow);
+    float *x = rand_vec(N*C,.1f), *initial = rand_vec(ns,.01f), *history = rand_vec(nh,.1f);
+    float av[N*V], bv[N*V];
+    for (unsigned i = 0; i < N*V; i++) { av[i] = .9f; bv[i] = .2f; }
+    ds4_gpu_tensor *ga = upload(av,N*V), *gb = upload(bv,N*V), *q[2], *out[2];
+    ds4_gpu_qwen4_gdn_row rows[2][3];
+    for (unsigned path = 0; path < 2; path++) {
+        q[path] = upload(x,N*C); out[path] = upload(NULL,N*V*D+guard);
+        require_ok(ds4_gpu_tensor_fill_f32(out[path],17.25f,N*V*D+guard),"GDN output guards");
+        for (unsigned r = 0; r < R; r++) {
+            rows[path][r] = (ds4_gpu_qwen4_gdn_row){upload(NULL,ns+guard),upload(NULL,nh+guard),
+                upload(NULL,ns+guard),upload(NULL,nh+guard),row0[r],nt[r]};
+            ds4_gpu_tensor *t[] = {rows[path][r].state,rows[path][r].hist,rows[path][r].snap_state,rows[path][r].snap_hist};
+            for (unsigned j = 0; j < 4; j++) require_ok(ds4_gpu_tensor_fill_f32(t[j],17.25f,(j%2 ? nh : ns)+guard),"GDN state guards");
+            require_ok(ds4_gpu_tensor_write(t[0],0,initial,ns*4) && ds4_gpu_tensor_write(t[1],0,history,nh*4),"GDN initial state");
+        }
+        if (!path) {
+            gdn_rows_reference(a,wo,q[0],out[0],ga,gb,rows[0],R,K,V,D,C,CK);
+        } else {
+            ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((R+2)*DS4_GPU_QWEN4_GDN_ROW_BYTES);
+            require_ok(ds4_gpu_qwen4_gdn_rows_stage(table,2,rows[1],R) &&
+                ds4_gpu_qwen4_conv_stream_rows2_tensor(q[1],a->base,a->size,wo,table,2,rows[1],R,N,C,CK,C,1) &&
+                ds4_gpu_qwen4_gdn_scan_rows2_tensor(out[1],q[1],ga,gb,table,2,rows[1],R,N,K,V,D,C,V*D),"ragged GDN rows");
+            ds4_gpu_tensor_free(table);
+        }
+        require_ok(ds4_gpu_synchronize(),"GDN row sync");
+    }
+    same_bytes("GDN qkv",0,q[0],0,q[1],0,N*C*4);
+    same_bytes("GDN output",0,out[0],0,out[1],0,(N*V*D+guard)*4);
+    for (unsigned r = 0; r < R; r++) {
+        ds4_gpu_tensor *t0[] = {rows[0][r].state,rows[0][r].hist,rows[0][r].snap_state,rows[0][r].snap_hist};
+        ds4_gpu_tensor *t1[] = {rows[1][r].state,rows[1][r].hist,rows[1][r].snap_state,rows[1][r].snap_hist};
+        for (unsigned j = 0; j < 4; j++) {
+            same_bytes("GDN state/snapshot",r,t0[j],0,t1[j],0,((j%2 ? nh : ns)+guard)*4);
+            ds4_gpu_tensor_free(t0[j]); ds4_gpu_tensor_free(t1[j]);
+        }
+    }
+    for (unsigned p = 0; p < 2; p++) { ds4_gpu_tensor_free(q[p]); ds4_gpu_tensor_free(out[p]); }
+    ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); free(x); free(initial); free(history);
+    puts("  GDN rows: reordered ragged sessions, first-token snapshots and guards byte-exact");
+}
 #endif
 
 /* ---- routed experts ---- */
@@ -2143,7 +2238,6 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
-#ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
 static void test_moe_grouped(arena_t *a) {
@@ -2184,8 +2278,6 @@ static void test_moe_grouped(arena_t *a) {
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
     free(sel); free(x);
 }
-
-#endif
 
 static void test_hc_pair_groups(arena_t *a) {
     const uint32_t types[] = {1u, 0u, 8u}, widths[] = {9u, 64u, 2560u};
@@ -3453,6 +3545,61 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
 }
 
 #ifndef __APPLE__
+/* Shared-input Q8 projections of one to three rows run in one launch per
+ * block geometry; each output must equal its separate projection byte for
+ * byte (MTP verify rows keep the one-token arithmetic), guards included. */
+static void test_multi_q8_exact(arena_t *a) {
+    const unsigned K = 2560, M[] = {512,1537,1536,64}, type[] = {8,8,8,8};
+    uint64_t offsets[4];
+    for (unsigned i = 0; i < 4; i++) { double *sh; offsets[i] = arena_q8_0(a,M[i],K,&sh,.1f); free(sh); }
+    for (unsigned T = 1; T <= 3; T++) {
+        float *input = rand_vec(T*K,.1f);
+        ds4_gpu_tensor *x = upload(input,T*K), *ref[4], *out[4];
+        for (unsigned i = 0; i < 4; i++) {
+            ref[i] = upload(NULL,T*M[i]+16); out[i] = upload(NULL,T*M[i]+16);
+            require_ok(ds4_gpu_tensor_fill_f32(ref[i],17.25f,T*M[i]+16) &&
+                ds4_gpu_tensor_fill_f32(out[i],17.25f,T*M[i]+16) &&
+                ds4_gpu_qwen4_dense_mm_tensor(ref[i],x,a->base,a->size,offsets[i],8,T,K,M[i]),"multi Q8 reference");
+        }
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,4,out,a->base,a->size,offsets,type,M),"multi Q8 fused");
+        for (unsigned i = 0; i < 4; i++) {
+            same_bytes("multi Q8 exact",i,ref[i],0,out[i],0,(T*M[i]+16)*4);
+            ds4_gpu_tensor_free(ref[i]); ds4_gpu_tensor_free(out[i]);
+        }
+        ds4_gpu_tensor_free(x); free(input);
+    }
+    puts("  multi Q8: mixed narrow/wide projections at T=1/2/3 byte-exact with guards");
+}
+/* Four to 32 rows: the projections share one activation pack and one
+ * tensor-core launch, whose K split follows the combined tile count.  The
+ * four-projection set (229 tiles) runs unsplit; the narrow pair (36 tiles)
+ * splits K two ways at 8 rows and four ways above 16, with a scratch plane
+ * set and a reduce per projection. */
+static void test_multi_q8_rows(arena_t *a, uint32_t T, uint32_t N, const uint32_t *M) {
+    const uint32_t K = 2560, type[] = {8,8,8,8};
+    uint64_t offsets[4];
+    double *sh[4];
+    for (unsigned i = 0; i < N; i++) offsets[i] = arena_q8_0(a,M[i],K,&sh[i],.1f);
+    float *input = rand_vec((uint64_t)T*K,.1f);
+    ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *out[4];
+    for (unsigned i = 0; i < N; i++) out[i] = upload(NULL,(uint64_t)T*M[i]);
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,N,out,a->base,a->size,offsets,type,M),"multi Q8 rows");
+    for (unsigned i = 0; i < N; i++) {
+        double *ref = malloc((uint64_t)T*M[i]*sizeof(double));
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t r = 0; r < M[i]; r++) {
+                double acc = 0.0;
+                for (uint32_t k = 0; k < K; k++) acc += sh[i][(uint64_t)r*K+k]*input[(uint64_t)t*K+k];
+                ref[(uint64_t)t*M[i]+r] = acc;
+            }
+        char name[96];
+        snprintf(name,sizeof(name),"multi Q8 rows out%u rows %u T=%u",i,M[i],T);
+        check_tensor(name,out[i],ref,(uint64_t)T*M[i],3e-5);
+        free(ref); free(sh[i]); ds4_gpu_tensor_free(out[i]);
+    }
+    ds4_gpu_tensor_free(x); free(input);
+}
+
 /* Check half-operand expert tiles independently at every CUDA tile width.
  * The existing tests above still bound their error versus unrounded weights. */
 static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype, uint32_t F) {
@@ -3626,6 +3773,117 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+#ifndef __APPLE__
+/* A speculative batch of S sessions runs S..2S rows (a row per session, one
+ * more per draft) with the kernel choices of the plain batch of S rows
+ * (ds4_gpu_qwen4_set_select_rows).  Every row must come out byte-identical
+ * to the plain batch's: greedy acceptance compares the two. */
+typedef int (*select_rows_fn)(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T);
+
+static void select_rows_case(const char *what, select_rows_fn fn, void *ctx, uint32_t K,
+                             uint32_t n_out, const uint32_t *out_width) {
+    static const uint32_t widths[] = { 2, 3, 4, 5, 8, 9, 12, 16 };
+    float *input = rand_vec((uint64_t)32 * K, 1.0f);
+    ds4_gpu_tensor *x = upload(input, (uint64_t)32 * K);
+    ds4_gpu_tensor *ref[4], *got[4];
+    for (uint32_t o = 0; o < n_out; o++) {
+        ref[o] = upload(NULL, (uint64_t)32 * out_width[o]);
+        got[o] = upload(NULL, (uint64_t)32 * out_width[o]);
+    }
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const uint32_t S = widths[wi];
+        /* the plain batch: S rows at a time, choices for S rows */
+        for (uint32_t r0 = 0; r0 < 2 * S; r0 += S) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, (uint64_t)r0 * K * 4, (uint64_t)S * K * 4), *ov[4];
+            for (uint32_t o = 0; o < n_out; o++)
+                ov[o] = ds4_gpu_tensor_view(ref[o], (uint64_t)r0 * out_width[o] * 4, (uint64_t)S * out_width[o] * 4);
+            require_ok(xv && fn(ctx, xv, ov, S), what);
+            for (uint32_t o = 0; o < n_out; o++) ds4_gpu_tensor_free(ov[o]);
+            ds4_gpu_tensor_free(xv);
+        }
+        /* the speculative batch: every draft count */
+        for (uint32_t T = S; T <= 2 * S; T++) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, 0, (uint64_t)T * K * 4), *ov[4];
+            for (uint32_t o = 0; o < n_out; o++) {
+                require_ok(ds4_gpu_tensor_fill_f32(got[o], 17.25f, (uint64_t)32 * out_width[o]), what);
+                ov[o] = ds4_gpu_tensor_view(got[o], 0, (uint64_t)T * out_width[o] * 4);
+            }
+            ds4_gpu_qwen4_set_select_rows(S);
+            const int ok = xv && fn(ctx, xv, ov, T);
+            ds4_gpu_qwen4_set_select_rows(0);
+            require_ok(ok, what);
+            for (uint32_t o = 0; o < n_out; o++) {
+                char name[128];
+                snprintf(name, sizeof(name), "%s out %u, %u sessions, %u rows", what, o, S, T);
+                same_bytes(name, T, ref[o], 0, got[o], 0, (uint64_t)T * out_width[o] * 4);
+                ds4_gpu_tensor_free(ov[o]);
+            }
+            ds4_gpu_tensor_free(xv);
+        }
+    }
+    for (uint32_t o = 0; o < n_out; o++) { ds4_gpu_tensor_free(ref[o]); ds4_gpu_tensor_free(got[o]); }
+    ds4_gpu_tensor_free(x);
+    free(input);
+}
+
+typedef struct { arena_t *a; uint64_t off[2]; uint32_t type, K, M[2], n; } select_rows_proj;
+
+static int select_rows_dense(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T) {
+    const select_rows_proj *p = ctx;
+    if (p->n == 1)
+        return ds4_gpu_qwen4_dense_mm_tensor(outs[0], x, p->a->base, p->a->size, p->off[0], p->type, T, p->K, p->M[0]);
+    const uint32_t types[2] = { p->type, p->type };
+    return ds4_gpu_qwen4_multi_gemv_tensor(x, T, p->K, 2, (ds4_gpu_tensor *const *)outs, p->a->base, p->a->size,
+                                           p->off, types, p->M);
+}
+
+typedef struct { arena_t *a; uint64_t gamma, inject; uint32_t E, hc; } select_rows_norm;
+
+static int select_rows_hc_norm(void *ctx, ds4_gpu_tensor *x, ds4_gpu_tensor *const *outs, uint32_t T) {
+    const select_rows_norm *p = ctx;
+    return ds4_gpu_qwen4_hc_norm_tensor(outs[0], outs[1], x, p->a->base, p->a->size, p->gamma, p->inject, 1u,
+                                        T, p->E, p->hc, p->hc, 1e-6f);
+}
+
+static void test_select_rows(arena_t *a) {
+    const uint64_t arena_used = a->used;   /* the weights below are this test's alone */
+    /* Q8 projections on both sides of the GEMV / tensor-core boundaries,
+     * the output head's rule (M >= 65536), the K split, pairs; the F16 HC
+     * down and up projections; the F32 router */
+    static const struct { uint32_t type, K, M; } dense[] = {
+        { 8, 2560, 6144 }, { 8, 6144, 2560 }, { 8, 640, 2560 }, { 8, 2560, 48 }, { 8, 1024, 65536 },
+        { 1, 10240, 320 }, { 1, 320, 1024 }, { 0, 2560, 512 },
+    };
+    for (size_t i = 0; i < sizeof(dense) / sizeof(dense[0]); i++) {
+        select_rows_proj p = { .a = a, .type = dense[i].type, .K = dense[i].K, .M = { dense[i].M, 0 }, .n = 1 };
+        double *sh;
+        p.off[0] = p.type == 8 ? arena_q8_0(a, p.M[0], p.K, &sh, 0.05f) :
+                   p.type == 1 ? arena_f16(a, (uint64_t)p.M[0] * p.K, &sh, 0.05f) :
+                                 arena_f32(a, (uint64_t)p.M[0] * p.K, &sh, -0.05f, 0.05f);
+        free(sh);
+        char what[64];
+        snprintf(what, sizeof(what), "select rows: dense type %u %ux%u", p.type, p.M[0], p.K);
+        select_rows_case(what, select_rows_dense, &p, p.K, 1, p.M);
+    }
+    static const uint32_t pairs[][2] = { { 48, 48 }, { 512, 512 }, { 10240, 6144 } };
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        select_rows_proj p = { .a = a, .type = 8, .K = 2560, .M = { pairs[i][0], pairs[i][1] }, .n = 2 };
+        for (int j = 0; j < 2; j++) { double *sh; p.off[j] = arena_q8_0(a, p.M[j], p.K, &sh, 0.05f); free(sh); }
+        char what[64];
+        snprintf(what, sizeof(what), "select rows: Q8 pair %u+%u", p.M[0], p.M[1]);
+        select_rows_case(what, select_rows_dense, &p, p.K, 2, p.M);
+    }
+    select_rows_norm n = { .a = a, .E = 2560, .hc = 4 };
+    double *sh;
+    n.gamma = arena_f32(a, (uint64_t)n.E * n.hc, &sh, 0.5f, 1.5f); free(sh);
+    n.inject = arena_f16(a, (uint64_t)n.hc * n.E * n.hc, &sh, 0.05f); free(sh);
+    const uint32_t norm_out[2] = { n.E * n.hc, n.hc * 8 * n.hc };
+    select_rows_case("select rows: HC norm", select_rows_hc_norm, &n, n.E * n.hc, 2, norm_out);
+    a->used = arena_used;
+    puts("  select rows: every row of a 2..16-session batch with its drafts byte-exact against the plain batch");
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3637,7 +3895,9 @@ int main(void) {
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
@@ -3656,6 +3916,7 @@ int main(void) {
     }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_GROUPED")) { test_moe_grouped(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
@@ -3696,11 +3957,12 @@ int main(void) {
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();
+#ifndef __APPLE__
+    test_select_rows(&arena);
+#endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
-#ifdef __APPLE__
     test_moe_grouped(&arena);
-#endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
@@ -3746,8 +4008,9 @@ int main(void) {
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
-#ifdef __APPLE__
     test_attention_rows(&arena);
+#ifndef __APPLE__
+    test_gdn_rows(&arena);
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
@@ -3792,6 +4055,12 @@ int main(void) {
     test_half_expert_tiles(&arena,2049,12,39,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
+    /* 4..32-row tensor-core projections: F16 from K = 1024 with K split over
+     * four slices (the HC down shape), Q8 narrow matrices split in two or
+     * four, and four Q8 rows of a long input on the GEMV */
+    for (uint32_t T = 4; T <= 25; T += 7) test_dense_mm(&arena, 10240, 320, T, 1u);
+    for (uint32_t T = 4; T <= 25; T += 7) test_dense_mm(&arena, 2560, 512, T, 8u);
+    test_dense_mm(&arena, 640, 2560, 16, 8u);
     test_dense_mm_large(&arena, 1u);
     test_dense_mm_large(&arena, 8u);
     test_dense_mm(&arena, 67, 97, 35, 1u);
@@ -3810,6 +4079,16 @@ int main(void) {
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
+#ifndef __APPLE__
+    test_multi_q8_exact(&arena);
+    {
+        static const uint32_t wide[] = {512,1537,1536,64}, narrow[] = {512,64};
+        test_multi_q8_rows(&arena, 8, 4, wide);
+        test_multi_q8_rows(&arena, 25, 4, wide);
+        test_multi_q8_rows(&arena, 8, 2, narrow);
+        test_multi_q8_rows(&arena, 25, 2, narrow);
+    }
+#endif
     printf("mtp\n");
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
