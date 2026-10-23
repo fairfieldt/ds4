@@ -3492,6 +3492,16 @@ int ds4_gpu_qwen4_argmax_rows_host_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tenso
  * source 16-byte aligned).  It loads the host data before its dependency
  * wait, hiding the transfer. */
 int ds4_gpu_qwen4_stage_host_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+/* R[t][s] = embedding row ids[t] (int32, in vocabulary) for each of the hc
+ * streams, widened as the host widens it; 0 before any launch unless the
+ * table is BF16 (type 30). */
+int ds4_gpu_qwen4_embed_rows_tensor(ds4_gpu_tensor *R, const ds4_gpu_tensor *ids,
+                                    const void *map, uint64_t size, uint64_t off, uint32_t type,
+                                    uint32_t vocab, uint32_t T, uint32_t E, uint32_t hc);
+/* H2D copy from page-locked memory queued on the decode stream; the wait
+ * returns once the last such copy has read its source. */
+int ds4_gpu_qwen4_upload_tensor(ds4_gpu_tensor *dst, uint64_t off, const void *src, uint64_t bytes);
+int ds4_gpu_qwen4_upload_wait(void);
 /* D2D copy queued on the decode stream without a host wait. */
 int ds4_gpu_tensor_copy_queued(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes);
@@ -3719,6 +3729,22 @@ int ds4_gpu_qwen4_hc_lo_act_tensor(ds4_gpu_tensor *lo_act, const ds4_gpu_tensor 
                                    uint32_t n_tokens, uint32_t n_hc, uint32_t n_rank);
 int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *u, const ds4_gpu_tensor *xn,
                                      uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
+/* CUDA: the prefill HC up projection (F16 weights) and hc_mix_rows in one
+ * kernel; 0 where it does not apply (then run the two). */
+int ds4_gpu_qwen4_hc_up_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *act, const ds4_gpu_tensor *xn,
+                                    const void *model_map, uint64_t model_size, uint64_t up_offset, uint32_t up_type,
+                                    uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank);
+/* CUDA: a prefill HC mix (norm, down, activation, up, mix) of F16 down and
+ * up weights in four launches, xn not kept (hilo and scales are scratch);
+ * with comb, hc_combine_tensor(R, comb, inj) first in the norm's launch.
+ * 0 before any launch where it does not apply. */
+int ds4_gpu_qwen4_hc_mix_prefill_tensor(ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *lo,
+                                        ds4_gpu_tensor *lo_act, ds4_gpu_tensor *hilo, ds4_gpu_tensor *scales,
+                                        ds4_gpu_tensor *R, const void *model_map, uint64_t model_size,
+                                        uint64_t norm_offset, uint64_t inject_offset, uint32_t inject_type,
+                                        uint64_t down_offset, uint64_t up_offset, uint32_t n_tokens, uint32_t n_embd,
+                                        uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps,
+                                        const ds4_gpu_tensor *comb);
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
