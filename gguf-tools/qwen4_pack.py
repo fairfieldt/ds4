@@ -113,6 +113,7 @@ ARTIFACT_TENSOR_COUNTS = {
 
 QTYPE_F32 = 0
 QTYPE_F16 = 1
+QTYPE_Q4_0 = 2
 QTYPE_Q4_1 = 3
 QTYPE_Q8_0 = 8
 QTYPE_Q2_K = 10
@@ -125,6 +126,7 @@ QTYPE_BF16 = 30
 DTYPE_TO_QTYPE = {
     "F32": QTYPE_F32,
     "F16": QTYPE_F16,
+    "Q4_0": QTYPE_Q4_0,
     "Q4_1": QTYPE_Q4_1,
     "Q8_0": QTYPE_Q8_0,
     "Q2_K": QTYPE_Q2_K,
@@ -145,6 +147,7 @@ DTYPE_TO_NUMPY = {
 }
 DTYPE_BYTES = {key: value.itemsize for key, value in DTYPE_TO_NUMPY.items()}
 QTYPE_LAYOUT = {
+    "Q4_0": (32, 18),
     "Q4_1": (32, 20),
     "Q8_0": (32, 34),
     "Q2_K": (256, 84),

@@ -907,6 +907,32 @@ class Qwen4PackTests(unittest.TestCase):
             "d0cfb11a385c38c5b64f576f81c02fcbf616eecf2553a83b232500a29877546b",
         )
 
+    def test_q4_0_matches_ggml_reference_rounding(self):
+        # quantize_row_q4_0_ref: d = signed absmax / -8 (first index wins a
+        # tie), q = min(15, trunc(x / d + 8.5)), low nibble j, high j + 16.
+        rng = np.random.default_rng(7)
+        rows = rng.standard_normal((6, 64)).astype(np.float32)
+        rows[1, :32] = 0.0
+        rows[2, :32] = np.linspace(-0.5, 0.25, 32, dtype=np.float32)
+        rows[3, :32] = np.linspace(-0.25, 0.5, 32, dtype=np.float32)
+        rows[4, 32:] = 1.0
+        rows[4, 32] = -1.0
+        rows[5, :32] = 1e-6 * rows[5, :32]
+        blocks = rows.reshape(-1, 32)
+        index = np.abs(blocks).argmax(axis=1)
+        d = blocks[np.arange(len(blocks)), index] / np.float32(-8)
+        inv = np.zeros_like(d)
+        np.divide(np.float32(1), d, out=inv, where=d != 0)
+        q = np.minimum(15, np.trunc(
+            blocks * inv[:, None] + np.float32(8.5))).astype(np.uint8)
+        expected = np.empty((len(blocks), 18), dtype=np.uint8)
+        expected[:, :2] = d.astype("<f2").view(np.uint8).reshape(-1, 2)
+        expected[:, 2:] = q[:, :16] | (q[:, 16:] << 4)
+        encoded = self.quantizer.encode(rows, "Q4_0")
+        self.assertEqual(encoded, expected.tobytes())
+        # An all-zero block keeps ggml's -0.0 scale (0 / -8).
+        self.assertEqual(encoded[36:54], b"\x00\x80" + b"\x88" * 16)
+
     def test_q2_weighted_expert_encoding_is_ordered_across_thread_counts(self):
         class FakeImatrix:
             def expert_weights(self, name, expert, values):
