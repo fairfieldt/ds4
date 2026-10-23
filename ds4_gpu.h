@@ -3622,6 +3622,16 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t in_dim, uint32_t ff_dim,
         uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
+/* CUDA only: as ds4_gpu_qwen4_moe_mid_tensor, and the shared-expert blocks
+ * prefetch the shared down matrix (in_dim rows of ff_dim, type
+ * shared_down_type; UINT32_MAX for none) into L2 for the down launch. */
+int ds4_gpu_qwen4_moe_mid_prefetch_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type,
+        uint64_t shared_down_offset, uint32_t shared_down_type);
 int ds4_gpu_qwen4_moe_down_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t down_offset,
@@ -3669,6 +3679,19 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         const void *model_map, uint64_t model_size, uint64_t conv_offset,
         uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* CUDA only.  Decode (n_tokens <= 3) GDN front: the qkv/gate Q8 projections
+ * with alpha/beta and the causal conv folded into their launch, then the
+ * q/k norm, in place of the qkv/gate pair plus gdn_front_tensor.  Returns 0
+ * when it does not apply (nothing launched), 1 when the front ran, -1 on
+ * error. */
+int ds4_gpu_qwen4_gdn_proj_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *conv_state, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,
+        uint64_t qkv_offset, uint64_t gate_offset, uint64_t conv_offset, uint64_t alpha_offset,
+        uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset, uint32_t alpha_type,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the

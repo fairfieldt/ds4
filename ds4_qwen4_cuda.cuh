@@ -16,15 +16,177 @@ __device__ __forceinline__ void pdl_enter() {
 #endif
 }
 
+/* The two halves of pdl_enter(), for kernels that load weights before the
+ * wait.  No kernel in the stream writes weights, so those loads may overlap
+ * the predecessor; activations are still read after the wait. */
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+}
+
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+/* Small single-wave kernels on the critical path trigger their dependents
+ * before their own wait, so a bulk-staged projection a few launches behind
+ * them is resident, and streaming its weights, while they run.  Dependents
+ * still wait for this kernel's completion before reading what it wrote. */
+__device__ __forceinline__ void pdl_enter_early() {
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+#endif
+}
+
+/* Weight loads issued before pdl_wait().  The compiler sinks invariant
+ * __ldg loads below griddepcontrol.wait; volatile PTX keeps their order.
+ * ptxas also hoists the wait to the top of its basic block, so callers keep
+ * these loads in a block of their own (behind a branch). */
+__device__ __forceinline__ float4 ldg_pre(const float4 *p) {
+    float4 v;
+    asm volatile("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ float ldg_pre(const float *p) {
+    float v;
+    asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ float ldg_pre_half(const void *p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return __half2float(__ushort_as_half(v));
+}
+
+/* One-shot bulk (TMA) copy of weights into shared memory before the wait.
+ * Unlike per-thread loads it holds no load slots of the SM, so the kernel
+ * still running there keeps its memory latency.  Thread 0 starts it; all
+ * threads wait for phase 0 after a __syncthreads().  The host launches these
+ * kernels only on sm_90+ (bulk_supported()). */
+__device__ __forceinline__ unsigned smem_addr(const void *p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+
+/* Destination state space of the bulk copies.  On sm_120 the .shared::cluster
+ * form compiles to a driver syscall, and the first launch of a kernel with one
+ * raises the stack limit from 1 KiB to 14 KiB for every thread slot of the
+ * device (3.9 GiB on 188 SMs) for the rest of the process.  The .shared::cta
+ * form (PTX 8.6, CUDA 12.8) is a native copy.  These kernels run without
+ * clusters, so the two address the same shared memory. */
+#if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8)
+#define BULK_DST "shared::cta"
+#else
+#define BULK_DST "shared::cluster"
+#endif
+
+__device__ __forceinline__ void bulk_start(uint64_t *bar, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(smem_addr(bar)) : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(smem_addr(bar)), "r"(bytes) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void bulk_copy(void *dst, const void *src, unsigned bytes, uint64_t *bar) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk." BULK_DST ".global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(smem_addr(dst)), "l"(src), "r"(bytes), "r"(smem_addr(bar)) : "memory");
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void bulk_wait(uint64_t *bar) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("{\n\t.reg .pred p;\n"
+                 "WAIT%=:\n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n\t"
+                 "@!p bra WAIT%=;\n}" :: "r"(smem_addr(bar)) : "memory");
+#endif
+}
+
+/* Further phases of a barrier bulk_start() initialized: each phase expects
+ * one more copy's bytes, and bulk_wait_phase(bar, i) waits for phase i. */
+__device__ __forceinline__ void bulk_expect(uint64_t *bar, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(smem_addr(bar)), "r"(bytes) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void bulk_wait_phase(uint64_t *bar, unsigned phase) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("{\n\t.reg .pred p;\n"
+                 "WAIT%=:\n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+                 "@!p bra WAIT%=;\n}" :: "r"(smem_addr(bar)), "r"(phase & 1u) : "memory");
+#endif
+}
+
+/* Dynamic shared memory a launch may request without opting in through
+ * cudaFuncSetAttribute(MaxDynamicSharedMemorySize) is 48 KiB less the
+ * kernel's static shared memory.  SPLIT_BULK_STATIC_SMEM bounds that of
+ * matvec_split_f16_bulk (part[8][ROWS <= 8] floats and an 8-byte barrier,
+ * 264 B).  hc_mix_f16_bulk (2056 B static, at most 16 KiB of weights for
+ * hc <= 4 and rank <= 512) always fits. */
+constexpr unsigned BULK_DYN_SMEM_LIMIT = 48u * 1024u;
+constexpr unsigned SPLIT_BULK_STATIC_SMEM = 512u;
+
+static bool bulk_supported() {
+    static int on = -1;
+    if (on < 0) {
+        int device = 0, major = 0;
+        on = cudaGetDevice(&device) == cudaSuccess &&
+             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+             major >= 9;
+        (void)cudaGetLastError();
+    }
+    return on;
+}
+
+/* Decode rows (a token, or the 2/3-row MTP verify) load the HC, router and
+ * gate weights before the dependency wait.  Batched sessions (4+ rows) keep
+ * the plain kernels: there the extra shared memory of the bulk copies costs
+ * occupancy across several waves.  The tests-only *_ref_tensor entry points
+ * run the plain kernels at every T as the byte-exact reference. */
+static bool presync_load(unsigned T) { return T <= 3; }
+
+/* Pieces each matvec_q8_bulk block's copy goes out in: one row at a time
+ * (2) by default, so at most half of a projection's 16.7 MB is in flight
+ * at once and the latency-bound kernels running under it keep their
+ * memory latency; DS4_QWEN4_BULK_PHASES=1 or 4 overrides (4 is slower). */
+static unsigned bulk_phases() {
+    static int phases = -1;
+    if (phases < 0) {
+        const char *env = getenv("DS4_QWEN4_BULK_PHASES");
+        const int v = env && env[0] ? atoi(env) : 2;
+        phases = v == 1 || v == 4 ? v : 2;
+    }
+    return (unsigned)phases;
+}
+
+/* Single-token decode lets the HC down projection after hc_norm launch only
+ * after the norm reduction (the MTP verify rows gained nothing from it). */
+static unsigned hc_norm_late(unsigned T) { return T == 1; }
+
 /* A speculative session batch has a row per session plus a row per draft,
  * so its width moves with the drafts, while the plain batch of the same
  * sessions has exactly one row each.  The dispatchers below pick kernels by
  * width (GEMV or tensor cores and their K split, the decode or prefill HC
- * norm), and a row rounds as its kernel does, so the drafts would be
- * verified against logits the plain batch does not compute.  ds4.c sets
- * g_select_rows to the session count for such a batch: every choice is then
- * made for that width, and each kernel computes a row the same way at any
- * row count, so every row rounds as in the plain batch.  0: the row count. */
+ * norm, the BF16 gate copies), and a row rounds as its kernel does, so the
+ * drafts would be verified against logits the plain batch does not
+ * compute.  ds4.c sets g_select_rows to the session count for such a batch:
+ * every choice is then made for that width, and each kernel computes a row
+ * the same way at any row count, so every row rounds as in the plain batch.
+ * 0: the row count. */
 static unsigned g_select_rows;
 static unsigned select_rows(unsigned T) { return g_select_rows ? g_select_rows : T; }
 
@@ -99,10 +261,23 @@ __device__ void apply_rope(float *row, const uint32_t *pos, rope_args r) {
     __syncwarp();
 }
 
+/* The block's norm weights (gamma, D or Di values: lane + 32 m, m < 8). */
+__device__ __forceinline__ void attn_prep_gamma(float (&g)[8], const float *gq, const float *gk, const float *giq,
+        unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di) {
+    const unsigned slot = blockIdx.x, lane = threadIdx.x;
+    if (slot >= H + Hkv + Hi) return;
+    const bool isq = slot < H, isk = !isq && slot < H + Hkv;
+    const unsigned dim = isq || isk ? D : Di;
+    const float *gamma = isq ? gq : isk ? gk : giq;
+    #pragma unroll
+    for (unsigned m = 0; m < 8; m++) if (lane + 32 * m < dim) g[m] = ldg_pre(gamma + lane + 32 * m);
+}
+
+/* g: the norm weights from attn_prep_gamma (lane + 32 m); NULL gq reads them here. */
 __device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half *kc, __half *vc,
         float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
         const float *iq, const float *ik, const uint32_t *pos3,
-        const float *gq, const float *gk, const float *giq,
+        const float *gq, const float *gk, const float *giq, const float (&g)[8],
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
         unsigned pos0, float eps, rope_args rp, unsigned t) {
     const unsigned slot = blockIdx.x, pos = pos0 + t, lane = threadIdx.x;
@@ -121,7 +296,11 @@ __device__ __forceinline__ void attn_prep_body(float *qout, float *gate, __half 
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) { const float v = src[lane * npt + i]; ss += v * v; }
     const float inv = rsqrtf(sum(ss) / dim + eps);
-    for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
+    #pragma unroll
+    for (unsigned m = 0; m < 8; m++) if (lane + 32 * m < dim) {
+        const unsigned i = lane + 32 * m;
+        row[i] = src[i] * inv * (gq ? gamma[i] : g[m]);
+    }
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)pos * 4, rp);
     for (unsigned i = lane; i < dim; i += 32) {
@@ -141,8 +320,13 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
         unsigned pos0, float eps, rope_args rp) {
-    pdl_enter();
-    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,gq,gk,giq,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
+    /* gamma before the wait: during this kernel the staged attention output
+     * projection streams its rows, and a dependent DRAM read would queue
+     * behind them */
+    float g[8] = {};
+    attn_prep_gamma(g,gq,gk,giq,H,Hkv,D,Hi,Di);
+    pdl_enter_early();
+    attn_prep_body(qout,gate,kc,vc,iqout,ikc,qg,kp,vp,iq,ik,pos3,NULL,NULL,NULL,g,H,Hkv,D,Hi,Di,pos0,eps,rp,blockIdx.y);
 }
 
 __device__ __forceinline__ void block_key_body(__half *out, const float *ik, const uint32_t *pos3,
@@ -165,7 +349,7 @@ __device__ __forceinline__ void block_key_body(__half *out, const float *ik, con
 
 __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
         const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
-    pdl_enter();
+    pdl_enter_early();
     block_key_body(out,ik,pos3,gamma,block0,ratio,D,eps,rp);
 }
 
@@ -186,7 +370,7 @@ __device__ __forceinline__ void idx_score_body(float *out, const float *q, const
 
 __global__ void idx_score(float *out, const float *q, const __half *key,
         unsigned N, unsigned H, unsigned D, unsigned pos0, unsigned ratio) {
-    pdl_enter();
+    pdl_enter_early();
     idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
 }
 
@@ -248,7 +432,7 @@ __device__ __forceinline__ void idx_select_body(int *out, const float *score, un
 }
 
 __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
-    pdl_enter();
+    pdl_enter_early();
     idx_select_body(out,score,N,K,blockIdx.x);
 }
 
@@ -264,7 +448,7 @@ __device__ __forceinline__ void idx_expand_body(int *out, unsigned *count, const
 
 __global__ void idx_expand(int *out, unsigned *count, const int *blocks,
         unsigned K, unsigned ratio, unsigned pos0, unsigned stride) {
-    pdl_enter();
+    pdl_enter_early();
     idx_expand_body(out,count,blocks,K,ratio,pos0,stride,blockIdx.x);
 }
 
@@ -342,7 +526,7 @@ template<unsigned D>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, keys = attn_keys(sparse,stride,pos0+t), splits = partial ? attn_splits(keys) : 1;
     if (blockIdx.z >= splits) return;
     attention_body<D>(out+(uint64_t)t*H*D,partial ? partial+(uint64_t)t*H*64*(D+2) : nullptr,
@@ -350,17 +534,33 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
         sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,splits,(keys+splits-1)/splits,scale,0);
 }
 
+/* The split maxima, sums and this thread's partial values are requested
+ * sixteen splits at a time; the running sums keep their split order. */
 __device__ __forceinline__ void attn_merge_body(float *out, const float *partial, const float *gate,
         unsigned H, unsigned D, unsigned splits, unsigned t) {
     const unsigned h = blockIdx.x, d = threadIdx.x;
     if (d >= D) return;
     const float *p = partial + ((uint64_t)t * H + h) * splits * (D + 2);
     float m = -3e38f, denom = 0, acc = 0;
-    for (unsigned s = 0; s < splits; s++) m = fmaxf(m, p[s * (D + 2)]);
-    for (unsigned s = 0; s < splits; s++) {
-        const float *row = p + s * (D + 2);
-        const float w = row[1] > 0 ? expf(row[0] - m) : 0;
-        denom += row[1] * w; acc += row[2 + d] * w;
+    for (unsigned s0 = 0; s0 < splits; s0 += 16) {
+        float mv[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) mv[j] = s0 + j < splits ? p[(s0 + j) * (D + 2)] : -3e38f;
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) m = fmaxf(m, mv[j]);
+    }
+    for (unsigned s0 = 0; s0 < splits; s0 += 16) {
+        float r0[16], r1[16], rd[16];
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) {
+            const float *row = p + (s0 + j) * (D + 2);
+            r0[j] = row[0]; r1[j] = row[1]; rd[j] = row[2 + d];
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (s0 + j < splits) {
+            const float w = r1[j] > 0 ? expf(r0[j] - m) : 0;
+            denom += r1[j] * w; acc += rd[j] * w;
+        }
     }
     const uint64_t i = ((uint64_t)t * H + h) * D + d;
     out[i] = (denom > 0 ? acc / denom : 0) * sigmoid(gate[i]);
@@ -368,7 +568,7 @@ __device__ __forceinline__ void attn_merge_body(float *out, const float *partial
 
 __global__ void attn_merge(float *out, const float *partial, const float *gate,
         unsigned H, unsigned D, unsigned pos0, unsigned stride, bool sparse) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, splits = attn_splits(attn_keys(sparse,stride,pos0+t));
     if (splits > 1) attn_merge_body(out+(uint64_t)t*H*D,partial+(uint64_t)t*H*64*(D+2),
         gate+(uint64_t)t*H*D,H,D,splits,0);
@@ -511,7 +711,7 @@ __device__ __forceinline__ void attention_group_body(float *out, float *partial,
 __global__ void attention_group(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned t = blockIdx.y, D = 256, keys = attn_keys(sparse,stride,pos0+t),
         splits = partial ? attn_splits(keys) : 1;
     if (blockIdx.z >= splits) return;
@@ -651,6 +851,10 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         out = make_float4(a.x,a.y,b.x,b.y);
     } else if (TYPE == 0) {
         out = *(const float4 *)(row+i*4);
+    } else if (TYPE == 30) {
+        const uint2 bits = *(const uint2 *)(row+i*2);
+        out = make_float4(__uint_as_float(bits.x<<16),__uint_as_float(bits.x&0xffff0000u),
+                          __uint_as_float(bits.y<<16),__uint_as_float(bits.y&0xffff0000u));
     } else if (TYPE == 8) {
         const char *b = row+(i/32)*34;
         const float scale = __half2float(*(const __half *)b);
@@ -788,6 +992,117 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
 }
 
+/* Warp-wide maximum and minimum of unsigned values (one redux on sm_80+). */
+__device__ __forceinline__ unsigned warp_max_u32(unsigned v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_max_sync(0xffffffffu, v);
+#else
+    for (unsigned off = 16; off; off /= 2) v = max(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+#endif
+}
+
+__device__ __forceinline__ unsigned warp_min_u32(unsigned v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(0xffffffffu, v);
+#else
+    for (unsigned off = 16; off; off /= 2) v = min(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+#endif
+}
+
+/* router()'s selection of NS experts from the softmax row p[NE] (NE <= 512)
+ * by warp 0, on integer keys: each pick is the greatest probability, ties
+ * to the lowest expert, NaN never, and expert s with weight 0 when nothing
+ * is left.  The key of p is its bits plus one (p is in [0, 1], so the key
+ * order is the float order), 0 for NaN or no expert; the winner's
+ * probability and expert come from one max and one min reduction instead
+ * of a compare-and-swap shuffle round per level, with the same result. */
+__device__ __forceinline__ void router_select_keys(int *selected, float *weights, const float *p,
+        unsigned NE, unsigned NS, unsigned t) {
+    const unsigned tid = threadIdx.x;
+    unsigned key[16];
+    #pragma unroll
+    for (unsigned j = 0; j < 16; j++) {
+        const float v = tid + 32 * j < NE ? p[tid + 32 * j] : -1;
+        key[j] = v >= 0 ? __float_as_uint(v) + 1 : 0;
+    }
+    for (unsigned s = 0; s < NS; s++) {
+        unsigned best = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) best = max(best, key[j]);
+        best = warp_max_u32(best);
+        unsigned id = UINT_MAX;
+        #pragma unroll
+        for (unsigned j = 16; j-- > 0;) if (key[j] == best) id = tid + 32 * j;
+        id = warp_min_u32(id);
+        float w = __uint_as_float(best - 1);
+        if (!best) { id = s; w = 0; }
+        #pragma unroll
+        for (unsigned j = 0; j < 16; j++) if (tid + 32 * j == id) key[j] = 0;
+        if (!tid) {
+            selected[(uint64_t)t * NS + s] = id;
+            weights[(uint64_t)t * NS + s] = w;
+        }
+    }
+}
+
+/* router() with an F32 shared gate of K = 256 * KPT. Each thread's KPT gate
+ * values are loaded before the dependency wait (the weights are immutable),
+ * so the cold 10 KB row no longer arrives from DRAM one dependent load at a
+ * time after the router GEMV. Every value rounds as in router(): the gate
+ * dot keeps its per-thread order and block_sum, the maximum is exact in any
+ * order, and the softmax sum, division and selection are router()'s.
+ * Other gate types and widths keep router(). */
+template<unsigned KPT>
+__global__ void __launch_bounds__(256) router_pre(int *selected, float *weights, const float *logits,
+        const float *x, const float *gate, float *shared_gate, unsigned NE, unsigned NS) {
+    const unsigned t = blockIdx.x, tid = threadIdx.x;
+    float g[KPT];
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) g[j] = gate[tid + 256 * j];
+    pdl_enter();
+    __shared__ float p[512], red[32];
+    float l[2], xv[KPT];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        l[j] = tid + 256 * j < NE ? logits[(uint64_t)t * NE + tid + 256 * j] : -FLT_MAX;
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) xv[j] = x[(uint64_t)t * KPT * 256 + tid + 256 * j];
+    float sg = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < KPT; j++) sg += g[j] * xv[j];
+    sg = block_sum(sg, red);
+    if (!tid) shared_gate[t] = sg;
+    float mx = fmaxf(fmaxf(-FLT_MAX, l[0]), l[1]);
+    for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
+    if (!(tid & 31)) red[tid / 32] = mx;
+    __syncthreads();
+    mx = red[0];
+    #pragma unroll
+    for (unsigned w = 1; w < 8; w++) mx = fmaxf(mx, red[w]);
+    __syncthreads();
+    float ps = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) {
+        const unsigned e = tid + 256 * j;
+        if (e < NE) { p[e] = expf(l[j] - mx); ps += p[e]; }
+    }
+    const float total = block_sum(ps, red);
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) if (tid + 256 * j < NE) p[tid + 256 * j] /= total;
+    __syncthreads();
+    if (tid < 32) router_select_keys(selected, weights, p, NE, NS, t);
+    __syncthreads();
+    if (tid < NS) {
+        float denom = 0;
+        for (unsigned s = 0; s < NS; s++) denom += weights[(uint64_t)t * NS + s];
+        red[tid] = denom;
+    }
+    __syncthreads();
+    if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
+}
+
 /* SH is the shared expert's type when known at compile time, or SH_ANY. */
 enum : unsigned { SH_ANY = 255 };
 
@@ -915,9 +1230,29 @@ __device__ __forceinline__ float q4k_dot8(unsigned q, float s0, float o0, float 
     return a;
 }
 
+__device__ __forceinline__ void l2_prefetch(const void *p, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p), "r"(bytes) : "memory");
+#endif
+}
+
+/* With pd set, the shared-expert blocks first ask L2 for their own gate and
+ * up rows and for a 1/gridDim.x slice of the shared down matrix pd (pdb
+ * bytes). They do it before the dependency wait: these are weights, and
+ * under programmatic launch this grid is resident while the one-block router
+ * runs, when DRAM is otherwise idle. Addresses and sizes are 16-byte
+ * multiples (checked by the caller). */
 __global__ void moe_gate_up_q4k(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
-        unsigned NE, unsigned NS, unsigned stride, unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+        unsigned NE, unsigned NS, unsigned stride, unsigned K, unsigned M, uint64_t rb, uint64_t srb,
+        const char *pd, uint64_t pdb) {
+    if (pd && blockIdx.y == NS && !blockIdx.z && !threadIdx.x && blockIdx.x * 4 < M) {
+        const unsigned r0 = blockIdx.x * 4, nr = min(4u, M - r0);
+        l2_prefetch(sh0 + r0 * srb, (unsigned)(nr * srb));
+        l2_prefetch(sh1 + r0 * srb, (unsigned)(nr * srb));
+        const uint64_t chunk = (pdb / gridDim.x + 15) & ~(uint64_t)15, at = blockIdx.x * chunk;
+        if (at < pdb) l2_prefetch(pd + at, (unsigned)min(chunk, pdb - at));
+    }
     pdl_enter();
     const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
     if (row >= M) return;
@@ -1016,6 +1351,85 @@ __global__ void moe_down_mxfp4(float *out, const float *x, const int *selected,
     }
 }
 
+/* moe_down_mxfp4 for the decode shape (two rows of at most 96 words and at
+ * most 24 MXFP4 blocks per row, i.e. K <= 768), with the latency taken out
+ * of each warp's path. The activation loads go out first, as they do not
+ * depend on the expert id; each lane then loads all of its weight words in
+ * one batch instead of two dependent ones; and the shared expert, whose
+ * Q8_0 rows are twice as long as a routed row, runs both of its rows in one
+ * pass and is dispatched as blockIdx.y == 0, so it lands in the first wave
+ * instead of the tail of the second. Each row's arithmetic and lane order
+ * are those of moe_down_mxfp4, so the results are identical. */
+__global__ void __launch_bounds__(128, 10) moe_down_mxfp4_lat(float *out, const float *x, const int *selected,
+        const char *w0, const char *sh0, unsigned NE, unsigned NS, unsigned stride,
+        unsigned K, unsigned M, uint64_t rb, uint64_t srb) {
+    pdl_enter();
+    extern __shared__ __align__(16) unsigned moe_stage[];
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) {
+        const unsigned mag = threadIdx.x & 7;
+        const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+        lut[threadIdx.x] = threadIdx.x & 8 ? -level : level;
+    }
+    __syncthreads();
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, rw = (unsigned)(rb / 4);
+    const unsigned row0 = (blockIdx.x * 4 + warp) * 2, t = blockIdx.z;
+    const unsigned slot = stride > NS ? (blockIdx.y ? blockIdx.y - 1 : NS) : blockIdx.y;
+    if (row0 >= M) return;
+    const unsigned rows = min(2u, M - row0), words = rows * rw;
+    const uint64_t pair = (uint64_t)t * stride + slot;
+    const float *xt = x + pair * K;
+    float acc[2] = {};
+    if (slot == NS) {
+        moe_q8_row(acc[0], acc[1], sh0 + row0 * srb, sh0 + (row0 + 1) * srb, xt, K, rows > 1);
+    } else {
+        const unsigned sub = lane % 4, nb = K / 32;
+        float4 xv[3][2];
+        #pragma unroll
+        for (unsigned j = 0; j < 3; j++) if (lane / 4 + 8 * j < nb) {
+            const float *xs = xt + (lane / 4 + 8 * j) * 32 + 4 * sub;
+            xv[j][0] = *(const float4 *)xs;
+            xv[j][1] = *(const float4 *)(xs + 16);
+        }
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const unsigned *src = (const unsigned *)(w0 + ((uint64_t)e * M + row0) * rb);
+            unsigned r[6];
+            #pragma unroll
+            for (unsigned k = 0; k < 6; k++) if (lane + 32 * k < words) r[k] = src[lane + 32 * k];
+            unsigned *stage = moe_stage + warp * (2 * rw + 1);
+            #pragma unroll
+            for (unsigned k = 0; k < 6; k++) if (lane + 32 * k < words) stage[lane + 32 * k] = r[k];
+            __syncwarp();
+            #pragma unroll
+            for (unsigned j = 0; j < 3; j++) {
+                const unsigned blk = lane / 4 + 8 * j;
+                if (blk >= nb) break;
+                const float4 x0 = xv[j][0], x1 = xv[j][1];
+                for (unsigned rr = 0; rr < rows; rr++) {
+                    const unsigned *sw = stage + rr * rw, at = blk * 17 + 1 + 4 * sub;
+                    const unsigned q = __funnelshift_r(sw[at / 4], sw[at / 4 + 1], (at & 3) * 8);
+                    const unsigned eb = ((const uint8_t *)sw)[blk * 17];
+                    const float scale = eb == 0 ? 0x1p-127f : __uint_as_float(eb << 23);
+                    float p = lut[q & 15] * x0.x;
+                    p += lut[(q >> 8) & 15] * x0.y;
+                    p += lut[(q >> 16) & 15] * x0.z;
+                    p += lut[(q >> 24) & 15] * x0.w;
+                    p += lut[(q >> 4) & 15] * x1.x;
+                    p += lut[(q >> 12) & 15] * x1.y;
+                    p += lut[(q >> 20) & 15] * x1.z;
+                    p += lut[q >> 28] * x1.w;
+                    acc[rr] += p * scale;
+                }
+            }
+        }
+    }
+    for (unsigned rr = 0; rr < rows; rr++) {
+        const float v = sum(acc[rr]);
+        if (!lane) out[pair * M + row0 + rr] = v;
+    }
+}
+
 /* A block belongs to a selected (token,slot), but only the first occurrence
  * of that expert runs. Each pass reuses its unpacked weights across four
  * tokens. The per-token K and warp reduction orders match the decode path. */
@@ -1109,20 +1523,30 @@ __global__ void moe_grouped(float *out, const float *x, const int *selected,
 
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
-        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
+        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down,
+        const char *pd = NULL, uint64_t pdb = 0, bool ref = false) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
     const unsigned stride = NS + (st != UINT_MAX);
     const bool xa = !((uintptr_t)x & 15), sha = st == UINT_MAX || (st == 8 && !(K % 128) && !((uintptr_t)s0 & 1) && !(srb & 1));
     if (xa && sha && !down && type == 12 && !(K % 256) && !(rb & 15) &&
         !((uintptr_t)w0 & 15) && !((uintptr_t)w1 & 15)) {
-        launch(moe_gate_up_q4k, grid, 128, 0, out, x, sel, w0, w1, s0, s1, NE, NS, stride, K, M, rb, srb);
+        /* the shared-expert L2 prefetch needs 16-byte rows and ranges */
+        const bool pf = pd && st == 8 && !(srb & 15) && !((uintptr_t)s0 & 15) && !((uintptr_t)s1 & 15) &&
+            !((uintptr_t)pd & 15) && !(pdb & 15) && 4 * srb < (1u << 20);
+        launch(moe_gate_up_q4k, grid, 128, 0, out, x, sel, w0, w1, s0, s1, NE, NS, stride, K, M, rb, srb,
+               pf ? pd : (const char *)NULL, pf ? pdb : (uint64_t)0);
         return launched();
     }
     if (xa && sha && down && type == 39 && !(K % 32) && !(rb & 3) && rb <= 4096 &&
         !((uintptr_t)w0 & 3)) {
         const dim3 g2((M + 7) / 8, grid.y, T);
-        launch(moe_down_mxfp4, g2, 128, (size_t)4 * (2 * (rb / 4) + 1) * 4, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        const size_t smem = (size_t)4 * (2 * (rb / 4) + 1) * 4;
+        /* ref (tests) keeps the original kernel as the byte-exact reference. */
+        if (rb <= 384 && K <= 768 && !ref)
+            launch(moe_down_mxfp4_lat, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
+        else
+            launch(moe_down_mxfp4, g2, 128, smem, out, x, sel, w0, s0, NE, NS, stride, K, M, rb, srb);
         return launched();
     }
 #define QWEN_MOE_SH(TYPE, SH) \
@@ -1617,13 +2041,12 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
     }
 }
 
+/* One warp's lane partials of a Q8_0 row: the single-warp Q8 GEMV rows
+ * and the GDN projection with its conv epilogue share this loop. */
 template<unsigned ROWS>
-__device__ __forceinline__ void matvec_q8_body(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+__device__ __forceinline__ void q8_row_acc(float (&acc)[ROWS], const char *wr, const float *x,
+        unsigned T, unsigned K) {
     const unsigned lane = threadIdx.x&31;
-    if (row >= M) return;
-    const char *wr = w+(uint64_t)row*stride;
-    float acc[ROWS] = {};
     #pragma unroll 4
     for (unsigned i = lane*4; i < K; i += 128) {
         const char *b = wr+(i/32)*34;
@@ -1640,6 +2063,15 @@ __device__ __forceinline__ void matvec_q8_body(float *out, const char *w, const 
             acc[t] += part*scale;
         }
     }
+}
+
+template<unsigned ROWS>
+__device__ __forceinline__ void matvec_q8_body(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+    const unsigned lane = threadIdx.x&31;
+    if (row >= M) return;
+    float acc[ROWS] = {};
+    q8_row_acc<ROWS>(acc,w+(uint64_t)row*stride,x,T,K);
     #pragma unroll
     for (unsigned t = 0; t < ROWS; t++) if (t < T) {
         const float v = sum(acc[t]);
@@ -1654,19 +2086,59 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     matvec_q8_body<ROWS>(out,w,x,T,K,M,stride,blockIdx.x*4+threadIdx.x/32);
 }
 
+/* matvec_q8 with the block's two weight rows bulk-copied to shared memory
+ * before the dependency wait.  Launched behind kernels that trigger their
+ * dependents early (the GDN scan chain before the GDN output projection,
+ * the attention core before the attention output projection), its blocks
+ * are resident, and its rows stream, while those latency-bound kernels run.
+ * Two rows per block keep every block of a 2560-row projection resident
+ * at once.  Same per-lane order and fused multiply-adds as matvec_q8.
+ * 2 * stride bytes of dynamic shared memory; rows are 16-byte multiples.
+ * The copy goes out in `phases` sequential pieces (each issued when the
+ * previous one has landed) when that divides it into 16-byte multiples,
+ * which bounds the bytes the whole grid has in flight at once. */
+template<unsigned ROWS>
+__global__ void __launch_bounds__(64) matvec_q8_bulk(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned phases) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    __shared__ __align__(8) uint64_t bar;
+    const unsigned row0 = blockIdx.x * 2, nr = min(2u, M - row0), lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const unsigned bytes = (unsigned)(nr * stride);
+    unsigned ph = phases;
+    while (ph > 1 && bytes % (16u * ph)) ph >>= 1;
+    if (!threadIdx.x) {
+        const unsigned chunk = bytes / ph;
+        bulk_start(&bar, chunk);
+        bulk_copy(wsm, w + (uint64_t)row0 * stride, chunk, &bar);
+        for (unsigned i = 1; i < ph; i++) {
+            bulk_wait_phase(&bar, i - 1);
+            bulk_expect(&bar, chunk);
+            bulk_copy(wsm + i * chunk, w + (uint64_t)row0 * stride + i * chunk, chunk, &bar);
+        }
+    }
+    pdl_enter();
+    __syncthreads();
+    bulk_wait_phase(&bar, ph - 1);
+    if (warp >= nr) return;
+    float acc[ROWS] = {};
+    q8_row_acc<ROWS>(acc, (const char *)wsm + warp * stride, x, T, K);
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) out[(uint64_t)t * M + row0 + warp] = v;
+    }
+}
+
 /* Decode projections with few output rows (the HC down projections, the
  * router, the linear-attention gates) cannot fill the GPU at one warp per
  * row. Split each row's K across the eight warps of a block instead. The
  * per-row arithmetic is the same for every T, so MTP verify rows keep
  * matching single-token decode. */
+/* Lane partials of one warp's split-K part, groups [g0, g1) of 128. */
 template<unsigned TYPE, unsigned ROWS>
-__device__ __forceinline__ void matvec_split_body(float *out, const char *w, const float *x,
-        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
-    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    __shared__ float part[8][ROWS];
-    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
-    const char *wr = w + (uint64_t)row * stride;
-    float acc[ROWS] = {};
+__device__ __forceinline__ void split_row_acc(float (&acc)[ROWS], const char *wr, const float *x,
+        unsigned T, unsigned K, unsigned g0, unsigned g1) {
+    const unsigned lane = threadIdx.x & 31;
     #pragma unroll 4
     for (unsigned g = g0; g < g1; g++) {
         const unsigned i = g * 128 + lane * 4;
@@ -1693,6 +2165,16 @@ __device__ __forceinline__ void matvec_split_body(float *out, const char *w, con
             }
         }
     }
+}
+
+template<unsigned TYPE, unsigned ROWS>
+__device__ __forceinline__ void matvec_split_body(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride, unsigned row) {
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    __shared__ float part[8][ROWS];
+    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
+    float acc[ROWS] = {};
+    split_row_acc<TYPE,ROWS>(acc, w + (uint64_t)row * stride, x, T, K, g0, g1);
     #pragma unroll
     for (unsigned t = 0; t < ROWS; t++) if (t < T) {
         const float v = sum(acc[t]);
@@ -1712,6 +2194,133 @@ __global__ void matvec_split(float *out, const char *w, const float *x,
         unsigned T, unsigned K, unsigned M, uint64_t stride) {
     pdl_enter();
     matvec_split_body<TYPE,ROWS>(out,w,x,T,K,M,stride,blockIdx.x);
+}
+
+/* Pre-wait weight words of the F32 split GEMVs: a float4 of F32, or the
+ * uint2 of four BF16 values of the exact BF16 copy (TYPE 30, see
+ * bf16_copy), widened exactly as value4<30>. */
+template<unsigned TYPE> struct split_pre_word { typedef float4 type; };
+template<> struct split_pre_word<30> { typedef uint2 type; };
+
+__device__ __forceinline__ uint2 ldg_pre(const uint2 *p) {
+    uint2 v;
+    asm volatile("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ float4 split_pre_value(float4 v) { return v; }
+
+__device__ __forceinline__ float4 split_pre_value(uint2 bits) {
+    return make_float4(__uint_as_float(bits.x<<16),__uint_as_float(bits.x&0xffff0000u),
+                       __uint_as_float(bits.y<<16),__uint_as_float(bits.y&0xffff0000u));
+}
+
+/* The F32 split GEMVs (router, linear-attention alpha/beta: TYPE 0, or
+ * TYPE 30 when they read their exact BF16 copies) with each warp's first
+ * four weight groups in registers before the dependency wait, which covers
+ * K = 2560.  Same groups, order and fused multiply-adds as
+ * matvec_split_body. */
+template<unsigned TYPE, unsigned ROWS>
+__global__ void matvec_split_f32_pre(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    typedef typename split_pre_word<TYPE>::type word;
+    constexpr unsigned PRE = 4;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, row = blockIdx.x;
+    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
+    const word *wr = (const word *)(w + (uint64_t)row * stride) + lane;
+    word pw[PRE] = {};
+    if (g0 + PRE <= g1) {
+        #pragma unroll
+        for (unsigned p = 0; p < PRE; p++) pw[p] = ldg_pre(wr + (g0 + p) * 32);
+    } else {
+        #pragma unroll
+        for (unsigned p = 0; p < PRE; p++) if (g0 + p < g1) pw[p] = ldg_pre(wr + (g0 + p) * 32);
+    }
+    pdl_enter();
+    __shared__ float part[8][ROWS];
+    float acc[ROWS] = {};
+    #pragma unroll
+    for (unsigned p = 0; p < PRE; p++) if (g0 + p < g1) {
+        const unsigned i = (g0 + p) * 128 + lane * 4;
+        const float4 v = split_pre_value(pw[p]);
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 xv = *(const float4 *)(x + (uint64_t)t * K + i);
+            acc[t] += v.x * xv.x; acc[t] += v.y * xv.y; acc[t] += v.z * xv.z; acc[t] += v.w * xv.w;
+        }
+    }
+    #pragma unroll 4
+    for (unsigned g = g0 + PRE; g < g1; g++) {
+        const unsigned i = g * 128 + lane * 4;
+        const float4 v = split_pre_value(wr[g * 32]);
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 xv = *(const float4 *)(x + (uint64_t)t * K + i);
+            acc[t] += v.x * xv.x; acc[t] += v.y * xv.y; acc[t] += v.z * xv.z; acc[t] += v.w * xv.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) part[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < ROWS && threadIdx.x < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) v += part[j][threadIdx.x];
+        out[(uint64_t)threadIdx.x * M + row] = v;
+    }
+}
+
+__device__ __forceinline__ float4 half4(uint2 bits) {
+    const float2 a = __half22float2(*(__half2 *)&bits.x), b = __half22float2(*(__half2 *)&bits.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+/* The F16 split GEMVs (the HC down projections, 320 rows x 10240) with the
+ * block's weight row bulk-copied to shared memory before the dependency
+ * wait: its blocks are resident while the HC normalization before it runs
+ * and leaves DRAM idle.  K * 2 bytes of dynamic shared memory; same groups,
+ * order and fused multiply-adds as matvec_split_body. */
+template<unsigned ROWS>
+__global__ void matvec_split_f16_bulk(float *out, const char *w, const float *x,
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    __shared__ __align__(8) uint64_t bar;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32, row = blockIdx.x;
+    if (!threadIdx.x) {
+        bulk_start(&bar, K * 2);
+        bulk_copy(wsm, w + (uint64_t)row * stride, K * 2, &bar);
+    }
+    pdl_enter();
+    __shared__ float part[8][ROWS];
+    const unsigned groups = K / 128, g0 = groups * warp / 8, g1 = groups * (warp + 1) / 8;
+    float acc[ROWS] = {};
+    __syncthreads();
+    bulk_wait(&bar);
+    #pragma unroll 10
+    for (unsigned g = g0; g < g1; g++) {
+        const unsigned i = g * 128 + lane * 4;
+        const float4 v = half4(*(const uint2 *)(wsm + (uint64_t)i * 2));
+        #pragma unroll
+        for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+            const float4 xv = *(const float4 *)(x + (uint64_t)t * K + i);
+            acc[t] += v.x * xv.x; acc[t] += v.y * xv.y; acc[t] += v.z * xv.z; acc[t] += v.w * xv.w;
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float v = sum(acc[t]);
+        if (!lane) part[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < ROWS && threadIdx.x < T) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 8; j++) v += part[j][threadIdx.x];
+        out[(uint64_t)threadIdx.x * M + row] = v;
+    }
 }
 
 /* Decode batches of 4..32 rows (several sessions, or sessions with drafts)
@@ -1897,24 +2506,53 @@ static int rows_tc_dispatch(rows_projections projections, const float *x, unsign
 }
 
 static int matvec_dispatch(float *out, const char *w, const float *x,
-                           unsigned type, unsigned T, unsigned K, unsigned M) {
+                           unsigned type, unsigned T, unsigned K, unsigned M, bool ref = false) {
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
     if (T <= 8 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15) &&
-        (type == 8 || ((type == 0 || type == 1) && !((uintptr_t)w & 15) && !(stride & 15)))) {
+        (type == 8 || ((type == 0 || type == 1 || type == 30) && !((uintptr_t)w & 15) && !(stride & 15)))) {
+#define QWEN_SPLIT_K(KERNEL, SMEM) \
+        if (T == 1) { launch(KERNEL<1>, M, 256, SMEM, out, w, x, T, K, M, stride); } \
+        else if (T == 2) { launch(KERNEL<2>, M, 256, SMEM, out, w, x, T, K, M, stride); } \
+        else if (T <= 4) { launch(KERNEL<4>, M, 256, SMEM, out, w, x, T, K, M, stride); } \
+        else { launch(KERNEL<8>, M, 256, SMEM, out, w, x, T, K, M, stride); }
+#define QWEN_SPLIT_PRE(TYPE) \
+        if (T == 1) { launch(matvec_split_f32_pre<TYPE, 1>, M, 256, 0, out, w, x, T, K, M, stride); } \
+        else if (T == 2) { launch(matvec_split_f32_pre<TYPE, 2>, M, 256, 0, out, w, x, T, K, M, stride); } \
+        else if (T <= 4) { launch(matvec_split_f32_pre<TYPE, 4>, M, 256, 0, out, w, x, T, K, M, stride); } \
+        else { launch(matvec_split_f32_pre<TYPE, 8>, M, 256, 0, out, w, x, T, K, M, stride); }
 #define QWEN_SPLIT(TYPE, N) launch(matvec_split<TYPE, N>, M, 256, 0, out, w, x, T, K, M, stride)
 #define QWEN_SPLIT_T(TYPE) \
         if (T == 1) { QWEN_SPLIT(TYPE, 1); } else if (T == 2) { QWEN_SPLIT(TYPE, 2); } \
         else if (T <= 4) { QWEN_SPLIT(TYPE, 4); } else { QWEN_SPLIT(TYPE, 8); }
-        if (type == 0) { QWEN_SPLIT_T(0) }
+        const bool pre = !ref && presync_load(T);
+        if (type == 0 && pre) { QWEN_SPLIT_PRE(0) }
+        else if (type == 0) { QWEN_SPLIT_T(0) }
+        else if (type == 30 && pre) { QWEN_SPLIT_PRE(30) }
+        else if (type == 30) { QWEN_SPLIT_T(30) }
+        else if (type == 1 && pre && bulk_supported() &&
+                 (uint64_t)K * 2u + SPLIT_BULK_STATIC_SMEM <= BULK_DYN_SMEM_LIMIT) { QWEN_SPLIT_K(matvec_split_f16_bulk, K * 2) }
         else if (type == 1) { QWEN_SPLIT_T(1) }
         else { QWEN_SPLIT_T(8) }
 #undef QWEN_SPLIT_T
 #undef QWEN_SPLIT
+#undef QWEN_SPLIT_K
+#undef QWEN_SPLIT_PRE
         return launched();
     }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
+        /* decode rows of the layer projections stage their rows; the output
+         * head (330 waves of blocks) keeps the plain kernel */
+        if (!ref && presync_load(T) && M < 65536 && bulk_supported() && !(stride & 15) && !((uintptr_t)w & 15) &&
+            2 * stride + 64 <= BULK_DYN_SMEM_LIMIT) {
+#define QWEN_Q8_BULK(N) launch(matvec_q8_bulk<N>, (M+1)/2, 64, (size_t)stride * 2, out,w,x,T,K,M,stride,bulk_phases())
+            if (T == 1) { QWEN_Q8_BULK(1); }
+            else if (T == 2) { QWEN_Q8_BULK(2); }
+            else { QWEN_Q8_BULK(4); }
+#undef QWEN_Q8_BULK
+            return launched();
+        }
 #define QWEN_Q8_ROWS(N) launch(matvec_q8<N>, (M+3)/4, 128, 0, out,w,x,T,K,M,stride)
         if (T == 1) { QWEN_Q8_ROWS(1); }
         else if (T == 2) { QWEN_Q8_ROWS(2); }
@@ -1935,6 +2573,61 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     }
 #undef QWEN_MV
     return launched();
+}
+
+/* The router and GDN gate projections (ffn_gate_inp, ssm_alpha, ssm_beta)
+ * are stored as F32 but hold widened BF16 values: every element's low 16
+ * bits are zero. The split GEMV reads them from a BF16 copy made on first
+ * use, half the bytes for the same values and the same arithmetic. The
+ * conversion checks every element, and a tensor with any nonzero low bits
+ * keeps its F32 path. Copies are keyed by the resolved device weight and
+ * released with the model's other derived weights; none is made while a
+ * decode graph is being captured. */
+struct qwen_bf16_copy { uint64_t n; char *dst; };
+static std::unordered_map<const char *, qwen_bf16_copy> g_qwen_bf16;
+static int *g_qwen_bf16_inexact;
+
+__global__ void f32_to_bf16_exact(unsigned *out, const uint2 *in, uint64_t pairs, int *inexact) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < pairs;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint2 v = in[i];
+        if ((v.x | v.y) & 0xffffu) *inexact = 1;
+        out[i] = (v.x >> 16) | (v.y & 0xffff0000u);
+    }
+}
+
+static void qwen4_bf16_cache_release(void) {
+    for (auto &c : g_qwen_bf16) if (c.second.dst) (void)cudaFree(c.second.dst);
+    g_qwen_bf16.clear();
+}
+
+static const char *bf16_copy(const char *w, uint64_t n) {
+    if ((n & 1) || ((uintptr_t)w & 7)) return NULL;
+    const auto it = g_qwen_bf16.find(w);
+    if (it != g_qwen_bf16.end()) return it->second.n == n ? it->second.dst : NULL;
+    if (g_decode_graph_capturing) return NULL;
+    const cudaStream_t stream = cuda_decode_stream();
+    char *dst = NULL;
+    int inexact = 1;
+    if ((g_qwen_bf16_inexact || cudaMalloc(&g_qwen_bf16_inexact, sizeof(int)) == cudaSuccess) &&
+        cudaMalloc(&dst, n * 2) == cudaSuccess &&
+        cudaMemsetAsync(g_qwen_bf16_inexact, 0, sizeof(int), stream) == cudaSuccess) {
+        const uint64_t pairs = n / 2;
+        f32_to_bf16_exact<<<(unsigned)std::min<uint64_t>((pairs + 255) / 256, 4096), 256, 0, stream>>>(
+            (unsigned *)dst, (const uint2 *)w, pairs, g_qwen_bf16_inexact);
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaMemcpyAsync(&inexact, g_qwen_bf16_inexact, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) inexact = 1;
+    }
+    (void)cudaGetLastError();
+    if (inexact && dst) { (void)cudaFree(dst); dst = NULL; }
+    g_qwen_bf16[w] = {n, dst};
+    return dst;
+}
+
+/* Whether dense_mm_tensor runs this shape through the split GEMV. */
+static bool split_shape(unsigned T, unsigned K, unsigned M, const float *x) {
+    return T < 32 && M <= 1536 && K >= 1024 && !(K % 128) && !((uintptr_t)x & 15);
 }
 
 template<unsigned TYPE>
@@ -2272,6 +2965,10 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
     x[i] = t;
 }
 
+/* The decode kernels (T <= 8 rows): 8 chunk blocks per stream, each
+ * normalizing the whole stream row and then producing its chunk of xn and
+ * the chunk's ni injection partials.  This one is the reference (and the
+ * fallback for rows too wide for hc_norm_pre's shared memory). */
 template<unsigned TYPE, bool COMBINE = false>
 __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
                         const char *wi, unsigned E, unsigned hc,
@@ -2279,6 +2976,7 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     pdl_enter();
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
+    const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per), first = chunk * per + tid;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
     __shared__ float red[32];
     __shared__ float add_weight;
@@ -2304,8 +3002,7 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     }
     const float inv = rsqrtf(block_sum(ss, red) / E + eps);
     float acc[4] = {};
-    const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per);
-    for (unsigned i0 = chunk * per + tid; i0 < end; i0 += 4 * nt) {
+    for (unsigned i0 = first; i0 < end; i0 += 4 * nt) {
         float r[4], g[4], w[4][4];
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) {
@@ -2334,6 +3031,130 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     for (unsigned j = 0; j < ni; j++) {
         const float v = block_sum(acc[j], red);
         if (!tid) inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + j] = v;
+    }
+}
+
+/* hc_norm for decode rows (T <= 3), with the same arithmetic in the same
+ * order and less latency on the dependency chain.  Gamma and the injection
+ * weights of the first chunk iteration load before the wait, so they are not
+ * queued behind the weight copies of the HC down projection that follows;
+ * the first batches of R (and blk) are requested before the injection
+ * barrier instead of after it; and the ni injection partials take one block
+ * reduction instead of ni.  The chunk pass rereads its R and blk elements,
+ * which the first pass left in L1.  With late, the HC down projection
+ * launches only after the norm reduction, so its weight copies overlap the
+ * second pass instead of both. */
+template<unsigned TYPE, bool COMBINE>
+__global__ void __launch_bounds__(128) hc_norm_pre(float *xn, float *inj, const float *R, const float *gamma,
+        const char *wi, unsigned E, unsigned hc, unsigned ni, float eps,
+        float *next, const float *blk, const float *oldinj, unsigned late) {
+    const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
+    const unsigned tid = threadIdx.x, nt = blockDim.x, dim = E * hc;
+    const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per), first = chunk * per + tid;
+    float gp[4] = {}, wp[4][4] = {};
+    #pragma unroll
+    for (unsigned k = 0; k < 4; k++) {
+        const unsigned i = first + k * nt;
+        if (i < end) {
+            gp[k] = ldg_pre(gamma + stream * E + i);
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni) {
+                const uint64_t at = (uint64_t)j * dim + stream * E + i;
+                wp[k][j] = TYPE == 1 ? ldg_pre_half(wi + at * 2) :
+                           TYPE == 0 ? ldg_pre((const float *)wi + at) : value<TYPE>(wi, at);
+            }
+        }
+    }
+    pdl_wait();
+    if (!late) pdl_trigger();
+    const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    __shared__ float red[32], part[4][4];
+    __shared__ float add_weight;
+    /* the first three batches (all of a row up to 3072 wide) go out before
+     * the injection barrier; the same batches, element order and fused
+     * multiply-adds as hc_norm */
+    enum { B = 3 };
+    float r[B][8], bk[B][8];
+    #pragma unroll
+    for (unsigned b = 0; b < B; b++) {
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = tid + (b * 8 + k) * nt;
+            r[b][k] = i < E ? R[base + i] : 0;
+            if (COMBINE) bk[b][k] = i < E ? blk[(uint64_t)tok * E + i] : 0;
+        }
+    }
+    if (COMBINE) {
+        if (!tid) add_weight = injection(oldinj + (uint64_t)tok * hc * hc * 8, hc, stream);
+        __syncthreads();
+    }
+    float ss = 0;
+    #pragma unroll
+    for (unsigned b = 0; b < B; b++) {
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = tid + (b * 8 + k) * nt;
+            if (COMBINE && i < E) r[b][k] = __fmaf_rn(add_weight, bk[b][k], r[b][k]);
+            if (i < E) ss = __fmaf_rn(r[b][k], r[b][k], ss);
+        }
+    }
+    for (unsigned i0 = tid + B * 8 * nt; i0 < E; i0 += 8 * nt) {
+        float v[8];
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) {
+            const unsigned i = i0 + k * nt;
+            v[k] = i < E ? R[base + i] : 0;
+            if (COMBINE && i < E) v[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], v[k]);
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < 8; k++) if (i0 + k * nt < E) ss = __fmaf_rn(v[k], v[k], ss);
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    if (late) pdl_trigger();
+    float acc[4] = {};
+    for (unsigned i0 = first; i0 < end; i0 += 4 * nt) {
+        float rv[4], g[4], w[4][4];
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i < end) {
+                rv[k] = R[base + i];
+                if (COMBINE) {
+                    rv[k] = __fmaf_rn(add_weight, blk[(uint64_t)tok * E + i], rv[k]);
+                    next[base + i] = rv[k];
+                }
+                if (i0 == first) {
+                    g[k] = gp[k];
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) w[k][j] = wp[k][j];
+                } else {
+                    g[k] = gamma[stream * E + i];
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; j++) if (j < ni) w[k][j] = value<TYPE>(wi, j * dim + stream * E + i);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned i = i0 + k * nt;
+            if (i >= end) break;
+            const float v = rv[k] * inv * g[k];
+            xn[base + i] = v;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni) acc[j] = __fmaf_rn(w[k][j], v, acc[j]);
+        }
+    }
+    /* block_sum of each partial: warp sums, then the warps in order */
+    #pragma unroll
+    for (unsigned j = 0; j < 4; j++) if (j < ni) {
+        const float v = sum(acc[j]);
+        if (!(tid & 31)) part[j][tid / 32] = v;
+    }
+    __syncthreads();
+    if (tid < ni) {
+        float v = 0;
+        for (unsigned w = 0; w < nt / 32; w++) v += part[tid][w];
+        inj[((uint64_t)tok * hc * 8 + stream * 8 + chunk) * ni + tid] = v;
     }
 }
 
@@ -2410,9 +3231,50 @@ __global__ void hc_mix(float *out, const float *xn, const float *lo,
     if (!lane) out[(uint64_t)tok * E + d] = v / hc;
 }
 
+/* F16 gate/mix with the block's hc streams x 4 rows of up weights
+ * bulk-copied to shared memory before the dependency wait, while the HC
+ * down projection that produces lo still runs.  Needs E % 4 == 0 and rank
+ * % 8 == 0, rank <= 512; same arithmetic as hc_mix's vector path. */
+__global__ void hc_mix_f16_bulk(float *out, const float *xn, const float *lo,
+                                const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    __shared__ __align__(8) uint64_t bar;
+    const unsigned warp = threadIdx.x / 32, d0 = blockIdx.x * 4, d = d0 + warp, tok = blockIdx.y;
+    if (!threadIdx.x) {
+        bulk_start(&bar, (unsigned)(hc * 4 * rb));
+        for (unsigned s = 0; s < hc; s++)
+            bulk_copy(wsm + s * 4 * rb, up + ((uint64_t)s * E + d0) * rb, (unsigned)(4 * rb), &bar);
+    }
+    pdl_enter();
+    __shared__ __align__(16) float activated[512];
+    for (unsigned r = threadIdx.x; r < rank; r += blockDim.x)
+        activated[r] = silu(lo[(uint64_t)tok*rank+r]/hc);
+    __syncthreads();
+    bulk_wait(&bar);
+    const unsigned lane = threadIdx.x & 31, stream = lane / 8, l = lane % 8;
+    float a = 0;
+    if (stream < hc) {
+        const unsigned char *row = wsm + (stream * 4 + warp) * rb;
+        for (unsigned r = l*4; r < rank; r += 32) {
+            const float4 w = half4(*(const uint2 *)(row + r * 2)), v = *(const float4 *)(activated+r);
+            a += w.x*v.x; a += w.y*v.y; a += w.z*v.z; a += w.w*v.w;
+        }
+    }
+    for (unsigned off = 1; off <= 4; off *= 2) a += __shfl_xor_sync(0xffffffff, a, off);
+    float v = stream < hc ? sigmoid(a) * xn[((uint64_t)tok * hc + stream) * E + d] : 0;
+    v += __shfl_xor_sync(0xffffffff, v, 8);
+    v += __shfl_xor_sync(0xffffffff, v, 16);
+    if (!lane) out[(uint64_t)tok * E + d] = v / hc;
+}
+
+/* 2 * sigmoid of the mean of the hc * 8 injection partials of a stream.
+ * The loads go out together (hc <= 8) and the sum keeps its order. */
 __device__ float injection(const float *inj, unsigned hc, unsigned stream) {
-    float v = 0;
-    for (unsigned i = 0; i < hc * 8; i++) v += inj[i * hc + stream];
+    float p[64], v = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 64; i++) p[i] = i < hc * 8 ? inj[i * hc + stream] : 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 64; i++) if (i < hc * 8) v += p[i];
     return 2 * sigmoid(v / hc);
 }
 
@@ -2468,9 +3330,10 @@ __global__ void attn_prep_rows(float *q, float *gate, float *iqn, const float *q
     pdl_enter();
     const unsigned r = blockIdx.y;
     const attn_row row = rows[r];
+    const float g[8] = {};
     attn_prep_body(q+(uint64_t)r*H*D,gate+(uint64_t)r*H*D,row.k,row.v,iqn+(uint64_t)r*Hi*Di,row.ik,
         qg+(uint64_t)r*H*D*2,kp+(uint64_t)r*Hkv*D,vp+(uint64_t)r*Hkv*D,
-        iq+(uint64_t)r*Hi*Di,ik+(uint64_t)r*Di,row.pos3,gq,gk,giq,H,Hkv,D,Hi,Di,row.pos,eps,rp,0);
+        iq+(uint64_t)r*Hi*Di,ik+(uint64_t)r*Di,row.pos3,gq,gk,giq,g,H,Hkv,D,Hi,Di,row.pos,eps,rp,0);
 }
 
 __global__ void block_key_rows(const attn_row *rows, const float *gamma, unsigned ratio,
@@ -2589,9 +3452,14 @@ __global__ void conv_slots(float *x, float *history, const float *w, row_slots s
     conv_body(x+(uint64_t)r*C,history+(uint64_t)slots.slot[r]*state_stride,w,1,C,K,activate,NULL,0,NULL,0);
 }
 
+/* Shared by gdn_prep and the fused decode projection, so both round alike. */
+__device__ __forceinline__ float gdn_decay(float a, float A, float bias) { return expf(A * softplus(a + bias)); }
+
+/* ACT = false: the decode projection already activated alpha/beta. */
+template<bool ACT>
 __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const float *bias,
                          unsigned Hk, unsigned Hv, unsigned D) {
-    pdl_enter();
+    pdl_enter_early();
     const unsigned h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
     const unsigned C = (2 * Hk + Hv) * D, npt = D / 32;
     float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
@@ -2600,9 +3468,9 @@ __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const f
     qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
     ks = rsqrtf(sum(ks) + 1e-6f);
     for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
-    if (!h) for (unsigned j = lane; j < Hv; j += 32) {
+    if (ACT && !h) for (unsigned j = lane; j < Hv; j += 32) {
         const uint64_t p = (uint64_t)t * Hv + j;
-        a[p] = expf(A[j] * softplus(a[p] + bias[j]));
+        a[p] = gdn_decay(a[p], A[j], bias[j]);
         b[p] = sigmoid(b[p]);
     }
 }
@@ -2652,7 +3520,7 @@ __device__ __forceinline__ void gdn_scan_body(float *out, float *state, const fl
 template<unsigned ROWS, unsigned D>
 __global__ void gdn_scan(float *out, float *state, const float *qkv, const float *a, const float *b,
         unsigned T, unsigned Hk, unsigned Hv, float *snap, unsigned st, float *snap2, unsigned st2) {
-    pdl_enter();
+    pdl_enter_early();
     gdn_scan_body<ROWS,D>(out,state,qkv,a,b,T,Hk,Hv,snap,st,snap2,st2);
 }
 
@@ -2674,14 +3542,113 @@ __global__ void gdn_scan_slots(float *out, float *state, const float *qkv, const
         qkv+(uint64_t)r*(2*Hk+Hv)*D,a+(uint64_t)r*Hv,b+(uint64_t)r*Hv,1,Hk,Hv,NULL,0,NULL,0);
 }
 
+/* The norm weights load before the wait (D <= 128): the staged GDN output
+ * projection streams its rows meanwhile, and a dependent DRAM read would
+ * queue behind them. */
 __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
-    pdl_enter();
     const unsigned h = blockIdx.x, t = blockIdx.y, npt = D / 32, k0 = threadIdx.x * npt;
+    float wp[4] = {};
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) if (i < npt) wp[i] = ldg_pre(w + k0 + i);
+    pdl_enter_early();
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) ss += o[idx + i] * o[idx + i];
     const float r = rsqrtf(sum(ss) / D + eps);
-    for (unsigned i = 0; i < npt; i++) o[idx + i] = o[idx + i] * r * w[k0 + i] * sigmoid(z[idx + i]);
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) if (i < npt) o[idx + i] = o[idx + i] * r * wp[i] * sigmoid(z[idx + i]);
+}
+
+/* The decode (T <= 3: a token, or the MTP verify rows) GDN projections in
+ * one launch.  Blocks run, in order:
+ * - ab_tiles (0 or 2*Hv) F32 alpha/beta rows, split-K exactly like
+ *   matvec_split<0,ROWS> (each of the four warps runs two of its eight
+ *   parts, in order), activated as gdn_prep does;
+ * - the qkv Q8 rows, one warp per channel; with CONV the warp that computed
+ *   channel c also applies its causal conv (K = 4) and SiLU, advances the
+ *   history and writes the MTP snapshots, as the conv kernel does (its
+ *   compiled chain: fmul by the newest tap, then fma of taps 0..2);
+ * - the gate Q8 rows.
+ * Every output rounds as with the separate launches, at any T, so verify
+ * rows keep matching single-token decode. */
+struct gdn_proj_args {
+    const char *wqkv, *wz, *walpha, *wbeta;
+    float *qkv, *z, *ga, *gb, *hist, *snap, *snap2;
+    const float *conv_w, *A, *bias;
+    unsigned C, Mz, Hv, ab_tiles, st, st2;
+};
+
+template<unsigned ROWS, bool CONV>
+__global__ void gdn_proj(const __grid_constant__ gdn_proj_args p, const float *x, unsigned T, unsigned K) {
+    pdl_enter();
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    unsigned b = blockIdx.x;
+    if (b < p.ab_tiles) {
+        __shared__ float part[8][ROWS];
+        const bool beta = b >= p.Hv;
+        const unsigned row = beta ? b - p.Hv : b, groups = K / 128;
+        const char *wr = (beta ? p.wbeta : p.walpha) + (uint64_t)row * K * 4;
+        #pragma unroll 1
+        for (unsigned j = warp; j < 8; j += 4) {
+            float acc[ROWS] = {};
+            split_row_acc<0,ROWS>(acc, wr, x, T, K, groups * j / 8, groups * (j + 1) / 8);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float v = sum(acc[t]);
+                if (!lane) part[j][t] = v;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < ROWS && threadIdx.x < T) {
+            float v = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) v += part[j][threadIdx.x];
+            const uint64_t o = (uint64_t)threadIdx.x * p.Hv + row;
+            if (beta) p.gb[o] = sigmoid(v);
+            else p.ga[o] = gdn_decay(v, p.A[row], p.bias[row]);
+        }
+        return;
+    }
+    b -= p.ab_tiles;
+    const uint64_t stride = (uint64_t)K / 32 * 34;
+    const unsigned qkv_tiles = (p.C + 3) / 4;
+    if (b >= qkv_tiles) {
+        matvec_q8_body<ROWS>(p.z, p.wz, x, T, K, p.Mz, stride, (b - qkv_tiles) * 4 + warp);
+        return;
+    }
+    const unsigned c = b * 4 + warp;
+    if (!CONV) {
+        matvec_q8_body<ROWS>(p.qkv, p.wqkv, x, T, K, p.C, stride, c);
+        return;
+    }
+    if (c >= p.C) return;
+    /* lanes 0..2 fetch the history and lanes 3..6 the taps before the dot */
+    float side = 0;
+    if (lane < 3) side = p.hist[(uint64_t)lane * p.C + c];
+    else if (lane < 7) side = p.conv_w[(uint64_t)c * 4 + lane - 3];
+    float acc[ROWS] = {};
+    q8_row_acc<ROWS>(acc, p.wqkv + (uint64_t)c * stride, x, T, K);
+    float win[3], taps[4];
+    #pragma unroll
+    for (unsigned i = 0; i < 3; i++) win[i] = __shfl_sync(0xffffffffu, side, i);
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) taps[i] = __shfl_sync(0xffffffffu, side, 3 + i);
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+        const float raw = sum(acc[t]);
+        float v = __fmul_rn(taps[3], raw);
+        #pragma unroll
+        for (unsigned i = 0; i < 3; i++) v = __fmaf_rn(taps[i], win[i], v);
+        win[0] = win[1]; win[1] = win[2]; win[2] = raw;
+        if (!lane) {
+            p.qkv[(uint64_t)t * p.C + c] = silu(v);
+            if (p.snap && t == p.st)
+                for (unsigned i = 0; i < 3; i++) p.snap[(uint64_t)i * p.C + c] = win[i];
+            if (p.snap2 && t == p.st2)
+                for (unsigned i = 0; i < 3; i++) p.snap2[(uint64_t)i * p.C + c] = win[i];
+        }
+    }
+    if (lane < 3) p.hist[(uint64_t)lane * p.C + c] = lane == 0 ? win[0] : lane == 1 ? win[1] : win[2];
 }
 
 __global__ void ngram_gate(float *gated, float *normed, const float *R, const float *key,
@@ -2756,7 +3723,7 @@ extern "C" int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4)) return 0;
     const char *A = weight(map, size, ao, (uint64_t)Hv * 4), *bias = weight(map, size, bo, (uint64_t)Hv * 4);
     if (!A || !bias) return 0;
-    launch(gdn_prep, dim3(Hk, T), 32, 0, (float *)qkv->ptr,
+    launch(gdn_prep<true>, dim3(Hk, T), 32, 0, (float *)qkv->ptr,
         (float *)a->ptr, (float *)b->ptr, (const float *)A, (const float *)bias, Hk, Hv, D);
     return launched();
 }
@@ -2830,9 +3797,10 @@ extern "C" int ds4_gpu_qwen4_ple_conv_tensor(ds4_gpu_tensor *R, const ds4_gpu_te
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
+/* ref: the kernels that load their weights after the wait (tests). */
+static int qwen4_hc_norm(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
         const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t go, uint64_t io,
-        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps, bool ref) {
     using namespace qwen4_cuda;
     const uint64_t n = (uint64_t)T * E * hc;
     if (!T || !E || !hc || hc > 8 || ni > 4 ||
@@ -2850,19 +3818,37 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
 #undef QWEN_HC_NORM
         return launched();
     }
-#define QWEN_HC_NORM(TYPE) launch(hc_norm<TYPE>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
+#define QWEN_HC_NORM(TYPE) launch(hc_norm<TYPE, false>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
         ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
         (float *)nullptr, (const float *)nullptr, (const float *)nullptr)
-    if (type == 0) { QWEN_HC_NORM(0); }
-    else if (type == 1) { QWEN_HC_NORM(1); }
-    else { QWEN_HC_NORM(8); }
+#define QWEN_HC_NORM_PRE(TYPE) launch(hc_norm_pre<TYPE, false>, dim3(hc * 8, T), 128, 0, (float *)xn->ptr, \
+        ni ? (float *)inj->ptr : nullptr, (const float *)R->ptr, (const float *)gamma, wi, E, hc, ni, eps, \
+        (float *)nullptr, (const float *)nullptr, (const float *)nullptr, hc_norm_late(T))
+    const bool pre = !ref && presync_load(T);
+    if (type == 0) { if (pre) { QWEN_HC_NORM_PRE(0); } else { QWEN_HC_NORM(0); } }
+    else if (type == 1) { if (pre) { QWEN_HC_NORM_PRE(1); } else { QWEN_HC_NORM(1); } }
+    else { if (pre) { QWEN_HC_NORM_PRE(8); } else { QWEN_HC_NORM(8); } }
+#undef QWEN_HC_NORM_PRE
 #undef QWEN_HC_NORM
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
+extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
+        const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t go, uint64_t io,
+        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+    return qwen4_hc_norm(xn, inj, R, map, size, go, io, type, T, E, hc, ni, eps, false);
+}
+
+/* Tests only: hc_norm_tensor with the post-wait kernels. */
+extern "C" int ds4_gpu_qwen4_hc_norm_ref_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
+        const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t go, uint64_t io,
+        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+    return qwen4_hc_norm(xn, inj, R, map, size, go, io, type, T, E, hc, ni, eps, true);
+}
+
+static int qwen4_hc_gate_mix(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo, const void *map, uint64_t size,
-        uint64_t offset, uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t rank) {
+        uint64_t offset, uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t rank, bool ref) {
     using namespace qwen4_cuda;
     if (!T || !E || !hc || hc > 4 || !rank || !tensor(out, (uint64_t)T * E * 4) ||
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
@@ -2870,11 +3856,31 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
     if (!w || (type != 0 && type != 1 && type != 8)) return 0;
 #define QWEN_HC(TYPE) launch(hc_mix<TYPE>, dim3((E + 3) / 4, T), 128, 0, (float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
+    const uint64_t rb = row_bytes(type, rank);
+    if (type == 1 && !ref && presync_load(T) && bulk_supported() && !(E % 4) && !(rank % 8) && rank <= 512 &&
+        !((uintptr_t)w & 15)) {
+        launch(hc_mix_f16_bulk, dim3(E / 4, T), 128, hc * 4 * rb, (float *)out->ptr,
+            (const float *)xn->ptr, (const float *)lo->ptr, w, E, hc, rank, rb);
+        return launched();
+    }
     if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
     else { QWEN_HC(8); }
 #undef QWEN_HC
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo, const void *map, uint64_t size,
+        uint64_t offset, uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t rank) {
+    return qwen4_hc_gate_mix(out, xn, lo, map, size, offset, type, T, E, hc, rank, false);
+}
+
+/* Tests only: hc_gate_mix_tensor with the post-wait kernels. */
+extern "C" int ds4_gpu_qwen4_hc_gate_mix_ref_tensor(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo, const void *map, uint64_t size,
+        uint64_t offset, uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t rank) {
+    return qwen4_hc_gate_mix(out, xn, lo, map, size, offset, type, T, E, hc, rank, true);
 }
 
 extern "C" int ds4_gpu_qwen4_hc_combine_tensor(ds4_gpu_tensor *R,
@@ -2993,8 +3999,10 @@ extern "C" uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t T, uint32_t H, uint3
     return (uint64_t)T * H * 64 * (D + 2);
 }
 
-extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+/* ref: the weight as stored (no BF16 copy) and the kernels that load it
+ * after the dependency wait, for the tests' reference. */
+static int qwen4_dense_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M, bool ref) {
     using namespace qwen4_cuda;
     if (!T || !K || !M || !tensor(x, (uint64_t)T*K*4) || !tensor(out, (uint64_t)T*M*4)) return 0;
     const uint64_t rb = row_bytes(type,K);
@@ -3002,6 +4010,8 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
     const unsigned S = select_rows(T);
+    if (!ref && type == 0 && split_shape(S,K,M,(const float *)x->ptr))
+        if (const char *b = bf16_copy(w,(uint64_t)K*M)) { w = b; type = 30; }
     if (rows_tc_shape(type,S,K) && T <= 32 && !((uintptr_t)x->ptr & 15) && (type == 8 || !((uintptr_t)w & 15))) {
         rows_projections p = {};
         p.n = 1; p.p[0] = {w,(float *)out->ptr,M,(M+15)/16};
@@ -3014,7 +4024,7 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (S < 32) {
         for (uint32_t t0 = 0; t0 < T; t0 += 8) {
             if (!matvec_dispatch((float *)out->ptr + (uint64_t)t0 * M, w, (const float *)x->ptr + (uint64_t)t0 * K,
-                                 type, T - t0 < 8 ? T - t0 : 8, K, M)) return 0;
+                                 type, T - t0 < 8 ? T - t0 : 8, K, M, ref)) return 0;
         }
         return 1;
     }
@@ -3028,6 +4038,19 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);
+}
+
+extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return qwen4_dense_mm(out, x, map, size, off, type, T, K, M, false);
+}
+
+/* Tests only: dense_mm_tensor on the weight as stored with the post-wait
+ * kernels, the byte-exact reference for the BF16 gate copies and the
+ * pre-wait weight loads. */
+extern "C" int ds4_gpu_qwen4_dense_mm_ref_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    return qwen4_dense_mm(out, x, map, size, off, type, T, K, M, true);
 }
 
 extern "C" int ds4_gpu_qwen4_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *map,
@@ -3109,23 +4132,46 @@ extern "C" int ds4_gpu_qwen4_q8_pair_tensor(ds4_gpu_tensor *o0, ds4_gpu_tensor *
     return ds4_gpu_qwen4_multi_gemv_tensor(x,T,K,2,outs,map,size,offsets,types,rows);
 }
 
-extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+/* pre: an F32 shared gate of K = 2560 takes router_pre<10>. */
+static int qwen4_router_topk(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
-        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS,
+        bool pre) {
     using namespace qwen4_cuda;
     if (!T || !NE || NE > 512 || !NS || NS > NE || NS > 32 ||
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    launch(router, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
-        K ? (const float *)x->ptr : nullptr, wg, K ? (float *)sg->ptr : nullptr, NE, NS, K, type);
+    if (pre && K == 2560 && type == 0)
+        launch(router_pre<10>, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            (const float *)x->ptr, (const float *)wg, (float *)sg->ptr, NE, NS);
+    else
+        launch(router, T, 256, 0, (int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            K ? (const float *)x->ptr : nullptr, wg, K ? (float *)sg->ptr : nullptr, NE, NS, K, type);
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+    return qwen4_router_topk(sel, weights, logits, x, map, size, off, type, K, sg, T, NE, NS, true);
+}
+
+/* Tests only: the same top-k through router() for every gate, the reference
+ * that router_pre must match byte for byte. */
+extern "C" int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS) {
+    return qwen4_router_topk(sel, weights, logits, x, map, size, off, type, K, sg, T, NE, NS, false);
+}
+
+/* As ds4_gpu_qwen4_moe_mid_tensor; sdo/sdt name the shared expert's down
+ * matrix (K rows of M), which the kernel may prefetch into L2 for the down
+ * launch that follows. sdt == UINT32_MAX gives no prefetch. */
+extern "C" int ds4_gpu_qwen4_moe_mid_prefetch_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t go, uint64_t uo,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
-        uint64_t sgo, uint64_t suo, uint32_t st) {
+        uint64_t sgo, uint64_t suo, uint32_t st, uint64_t sdo, uint32_t sdt) {
     using namespace qwen4_cuda;
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(mid, (uint64_t)T*NO*M*4) ||
@@ -3135,14 +4181,24 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_t
     const char *sg = st != UINT_MAX ? weight(map,size,sgo,sb) : NULL;
     const char *su = st != UINT_MAX ? weight(map,size,suo,sb) : NULL;
     if (!g || !u || (st != UINT_MAX && (!sg || !su))) return 0;
+    const uint64_t pdb = st != UINT_MAX && sdt != UINT32_MAX ? row_bytes(sdt, M)*K : 0;
+    const char *pd = pdb ? weight(map,size,sdo,pdb) : NULL;
     return moe_mv_dispatch((float *)mid->ptr,(const float *)x->ptr,(const int *)sel->ptr,
-                           g,u,sg,su,type,st,NE,T,NS,K,M,false);
+                           g,u,sg,su,type,st,NE,T,NS,K,M,false,pd,pd ? pdb : 0);
 }
 
-extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t go, uint64_t uo,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t sgo, uint64_t suo, uint32_t st) {
+    return ds4_gpu_qwen4_moe_mid_prefetch_tensor(mid, x, sel, map, size, go, uo, type, NE, T, NS, K, M,
+                                                 sgo, suo, st, 0, UINT32_MAX);
+}
+
+static int qwen4_moe_down(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
-        uint64_t so, uint32_t st) {
+        uint64_t so, uint32_t st, bool ref) {
     using namespace qwen4_cuda;
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(part,(uint64_t)T*NO*M*4) ||
@@ -3151,7 +4207,22 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     const char *sw = st != UINT_MAX ? weight(map,size,so,row_bytes(st,K)*M) : NULL;
     if (!w || (st != UINT_MAX && !sw)) return 0;
     return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,(const int *)sel->ptr,
-                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true);
+                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true,NULL,0,ref);
+}
+
+extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st) {
+    return qwen4_moe_down(part, mid, sel, map, size, off, type, NE, T, NS, K, M, so, st, false);
+}
+
+/* Tests only: moe_down_tensor with the original MXFP4 down kernel. */
+extern "C" int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st) {
+    return qwen4_moe_down(part, mid, sel, map, size, off, type, NE, T, NS, K, M, so, st, true);
 }
 
 extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
@@ -3260,12 +4331,73 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
 }
 
+/* Decode GDN front for T <= 3 (a token or the MTP verify rows), in place of
+ * the qkv+gate pair and gdn_front_tensor: the alpha/beta projections (F32)
+ * run as extra blocks of the qkv+gate launch and come out activated, and
+ * the causal conv (K = 4) runs in the qkv rows' epilogue.  Returns 0
+ * without launching when neither applies (the caller runs the separate
+ * kernels), 1 when the front ran, -1 on a launch error. */
+extern "C" int ds4_gpu_qwen4_gdn_proj_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *hist, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *map, uint64_t size,
+        uint64_t qkv_off, uint64_t gate_off, uint64_t conv_off, uint64_t alpha_off, uint64_t beta_off,
+        uint64_t ssm_a_off, uint64_t dt_off, uint32_t ab_type,
+        uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
+        ds4_gpu_tensor *snap, uint32_t st, ds4_gpu_tensor *snap2, uint32_t st2) {
+    using namespace qwen4_cuda;
+    const uint64_t C = ((uint64_t)2*Hk+Hv)*D, Mz = (uint64_t)Hv*D, rb = row_bytes(8,K), hb = (uint64_t)(CK-1)*C*4;
+    /* the qkv/gate rows must be the single-warp Q8 rows multi_q8 runs */
+    if (!T || T > 3 || !Hk || !Hv || D < 32 || D > 128 || D%32 || !K || K%128 || !rb || CK < 2 || CK > 4 ||
+        C > UINT_MAX || C <= 1536 || Mz <= 1536 ||
+        !tensor(mixed,(uint64_t)T*K*4) || ((uintptr_t)mixed->ptr & 15) ||
+        !tensor(qkv,(uint64_t)T*C*4) || !tensor(z,(uint64_t)T*Mz*4) || !tensor(hist,hb) ||
+        !tensor(ga,(uint64_t)T*Hv*4) || !tensor(gb,(uint64_t)T*Hv*4) ||
+        (snap && (st >= T || !tensor(snap,hb))) || (snap2 && (st2 >= T || !tensor(snap2,hb)))) return 0;
+    const char *wqkv = weight(map,size,qkv_off,rb*C), *wz = weight(map,size,gate_off,rb*Mz);
+    const char *cw = weight(map,size,conv_off,C*CK*4);
+    const char *A = weight(map,size,ssm_a_off,(uint64_t)Hv*4), *bias = weight(map,size,dt_off,(uint64_t)Hv*4);
+    const uint64_t ab_rb = row_bytes(ab_type,K);
+    const char *wa = ab_rb ? weight(map,size,alpha_off,ab_rb*Hv) : NULL;
+    const char *wb = ab_rb ? weight(map,size,beta_off,ab_rb*Hv) : NULL;
+    if (!wqkv || !wz || !cw || !A || !bias || !wa || !wb) return 0;
+    /* only where matvec_dispatch would run alpha/beta as matvec_split<0,ROWS> */
+    const bool fold_ab = ab_type == 0 &&
+        Hv <= 1536 && K >= 1024 && !((uintptr_t)wa & 15) && !((uintptr_t)wb & 15) && !(ab_rb & 15);
+    const bool fold_conv = CK == 4;
+    if (!fold_ab && !fold_conv) return 0;
+    gdn_proj_args p = {};
+    p.wqkv = wqkv; p.wz = wz; p.walpha = wa; p.wbeta = wb;
+    p.qkv = (float *)qkv->ptr; p.z = (float *)z->ptr; p.ga = (float *)ga->ptr; p.gb = (float *)gb->ptr;
+    p.hist = (float *)hist->ptr;
+    p.snap = snap ? (float *)snap->ptr : nullptr; p.snap2 = snap2 ? (float *)snap2->ptr : nullptr;
+    p.conv_w = (const float *)cw; p.A = (const float *)A; p.bias = (const float *)bias;
+    p.C = (unsigned)C; p.Mz = (unsigned)Mz; p.Hv = Hv; p.ab_tiles = fold_ab ? 2*Hv : 0;
+    p.st = snap ? st : UINT_MAX; p.st2 = snap2 ? st2 : UINT_MAX;
+    const unsigned grid = p.ab_tiles + (unsigned)((C+3)/4 + (Mz+3)/4);
+    const float *x = (const float *)mixed->ptr;
+#define QWEN_PROJ(R) if (fold_conv) launch(gdn_proj<R,true>,grid,128,0,p,x,T,K); \
+                     else launch(gdn_proj<R,false>,grid,128,0,p,x,T,K)
+    if (T == 1) { QWEN_PROJ(1); } else if (T == 2) { QWEN_PROJ(2); } else { QWEN_PROJ(4); }
+#undef QWEN_PROJ
+    if (!launched()) return -1;
+    if (!fold_ab && (!ds4_gpu_qwen4_dense_mm_tensor(ga,mixed,map,size,alpha_off,ab_type,T,K,Hv) ||
+                     !ds4_gpu_qwen4_dense_mm_tensor(gb,mixed,map,size,beta_off,ab_type,T,K,Hv))) return -1;
+    if (!fold_conv)
+        launch(conv, (unsigned)((C+255)/256), 256, 0, (float *)qkv->ptr,(float *)hist->ptr,(const float *)cw,
+            T,(unsigned)C,CK,true,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2);
+    if (fold_ab) launch(gdn_prep<false>,dim3(Hk,T),32,0,(float *)qkv->ptr,
+        (float *)ga->ptr,(float *)gb->ptr,(const float *)A,(const float *)bias,Hk,Hv,D);
+    else launch(gdn_prep<true>,dim3(Hk,T),32,0,(float *)qkv->ptr,
+        (float *)ga->ptr,(float *)gb->ptr,(const float *)A,(const float *)bias,Hk,Hv,D);
+    return launched() ? 1 : -1;
+}
+
 extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
 
-extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
+static int qwen4_hc_combine_norm(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
         const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
         const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
-        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps, bool ref) {
     using namespace qwen4_cuda;
     const uint64_t bytes = (uint64_t)T*E*hc*4;
     if (!qwen4_cuda::tensor(next,bytes) || !qwen4_cuda::tensor(R,bytes) || next->ptr == R->ptr ||
@@ -3279,14 +4411,36 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
         /* Every chunk reads the old residual, then writes its disjoint piece
          * of next. This folds the copy and combine into normalization without
          * a grid barrier or an in-place read/write race. */
-        launch(hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
-            (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
-            (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr);
+        if (!ref && presync_load(T))
+            launch(hc_norm_pre<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
+                (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
+                (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr,hc_norm_late(T));
+        else
+            launch(hc_norm<1,true>, dim3(hc*8,T), 128, 0, (float *)xn->ptr,(float *)inj->ptr,
+                (const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps,
+                (float *)next->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr);
         return launched();
     }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
     return ds4_gpu_qwen4_hc_combine_tensor(next,blk,oldinj,T,E,hc) &&
-           ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
+           qwen4_hc_norm(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps,ref);
+}
+
+extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
+        const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
+        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+    return qwen4_hc_combine_norm(next, blk, oldinj, xn, inj, R, map, size, go, io, type, T, E, hc, ni, eps,
+                                    false);
+}
+
+/* Tests only: hc_combine_norm_tensor with the post-wait kernels. */
+extern "C" int ds4_gpu_qwen4_hc_combine_norm_ref_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
+        const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
+        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+    return qwen4_hc_combine_norm(next, blk, oldinj, xn, inj, R, map, size, go, io, type, T, E, hc, ni, eps,
+                                    true);
 }
 
 extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu_tensor *e,

@@ -1721,6 +1721,180 @@ static void test_gdn_rows(arena_t *a) {
     ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); free(x); free(initial); free(history);
     puts("  GDN rows: reordered ragged sessions, first-token snapshots and guards byte-exact");
 }
+
+static void gdn_front_buffers(ds4_gpu_tensor **t, const uint64_t *n, uint32_t guard,
+                              const float *hist0, const float *state0) {
+    for (unsigned i = 0; i < 11; i++) {
+        t[i] = upload(NULL, n[i] + guard);
+        require_ok(ds4_gpu_tensor_fill_f32(t[i], 17.25f, n[i] + guard), "GDN front guards");
+    }
+    require_ok(ds4_gpu_tensor_write(t[4], 0, hist0, n[4] * 4) && ds4_gpu_tensor_write(t[7], 0, state0, n[7] * 4),
+               "GDN front initial state");
+}
+
+/* The fused decode GDN front against the separate kernels (Q8 pair,
+ * alpha/beta, conv, prep, then the scan), byte for byte including guards,
+ * at T = 1/2/3 with the MTP snapshots.  F32 alpha/beta fold into the
+ * projection launch and a K = 4 conv into its epilogue; F16 alpha/beta and
+ * a K = 3 conv keep their own launches, and with neither fold the front must
+ * decline so the caller runs the separate kernels. */
+static void test_gdn_front_exact(arena_t *a) {
+    const uint32_t Hk = 16, Hv = 48, D = 128, E = 2560, C = (2 * Hk + Hv) * D, Mz = Hv * D, guard = 16;
+    const uint64_t ns = (uint64_t)Hv * D * D;
+    double *sh;
+    const uint64_t wqkv = arena_q8_0(a, C, E, &sh, .05f); free(sh);
+    const uint64_t wz = arena_q8_0(a, Mz, E, &sh, .05f); free(sh);
+    uint64_t wal[2], wbe[2], wconv[2];
+    wal[0] = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
+    wbe[0] = arena_f32(a, (uint64_t)Hv * E, &sh, -.03f, .03f); free(sh);
+    wal[1] = arena_f16(a, (uint64_t)Hv * E, &sh, .03f); free(sh);
+    wbe[1] = arena_f16(a, (uint64_t)Hv * E, &sh, .03f); free(sh);
+    wconv[0] = arena_f32(a, (uint64_t)C * 4, &sh, -.5f, .5f); free(sh);
+    wconv[1] = arena_f32(a, (uint64_t)C * 3, &sh, -.5f, .5f); free(sh);
+    const uint64_t wA = arena_f32(a, Hv, &sh, -8.f, -.1f); free(sh);
+    const uint64_t wdt = arena_f32(a, Hv, &sh, .2f, 1.5f); free(sh);
+    float *state0 = rand_vec(ns, .1f), *hist0 = rand_vec((uint64_t)3 * C, 1.f);
+    for (uint32_t T = 1; T <= 3; T++) for (uint32_t abt = 0; abt < 2; abt++) for (uint32_t ci = 0; ci < 2; ci++) {
+        const uint32_t CK = 4 - ci;
+        const uint64_t nh = (uint64_t)(CK - 1) * C;
+        float *mixed = rand_vec((uint64_t)T * E, 1.f);
+        ds4_gpu_tensor *x = upload(mixed, (uint64_t)T * E);
+        /* qkv, z, alpha, beta, conv history, 2 history snapshots, state, 2 state snapshots, output */
+        const uint64_t n[11] = {(uint64_t)T * C, (uint64_t)T * Mz, (uint64_t)T * Hv, (uint64_t)T * Hv,
+                                nh, nh, nh, ns, ns, ns, (uint64_t)T * Mz};
+        ds4_gpu_tensor *ref[11], *got[11];
+        gdn_front_buffers(ref, n, guard, hist0, state0);
+        require_ok(ds4_gpu_qwen4_q8_pair_tensor(ref[0], ref[1], a->base, a->size, wqkv, wz, E, C, Mz, x, T) &&
+            ds4_gpu_qwen4_gdn_front_tensor(ref[0], ref[4], x, ref[2], ref[3], a->base, a->size, wconv[ci],
+                wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? ref[5] : NULL, 0u,
+                T > 2 ? ref[6] : NULL, 1u) &&
+            ds4_gpu_qwen4_gdn_scan_tensor(ref[10], ref[7], ref[0], ref[2], ref[3], T, Hk, Hv, D,
+                T > 1 ? ref[8] : NULL, 0u, T > 2 ? ref[9] : NULL, 1u), "GDN front reference");
+        gdn_front_buffers(got, n, guard, hist0, state0);
+        const int front = ds4_gpu_qwen4_gdn_proj_tensor(got[0], got[1], got[4], x, got[2], got[3], a->base, a->size,
+            wqkv, wz, wconv[ci], wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E,
+            T > 1 ? got[5] : NULL, 0u, T > 2 ? got[6] : NULL, 1u);
+        require_ok(front == (abt == 0 || CK == 4 ? 1 : 0), "GDN front dispatch");
+        if (!front)
+            require_ok(ds4_gpu_qwen4_q8_pair_tensor(got[0], got[1], a->base, a->size, wqkv, wz, E, C, Mz, x, T) &&
+                ds4_gpu_qwen4_gdn_front_tensor(got[0], got[4], x, got[2], got[3], a->base, a->size, wconv[ci],
+                    wal[abt], wbe[abt], wA, wdt, abt, T, Hk, Hv, D, CK, E, T > 1 ? got[5] : NULL, 0u,
+                    T > 2 ? got[6] : NULL, 1u),
+                "GDN front separate kernels");
+        require_ok(ds4_gpu_qwen4_gdn_scan_tensor(got[10], got[7], got[0], got[2], got[3], T, Hk, Hv, D,
+            T > 1 ? got[8] : NULL, 0u, T > 2 ? got[9] : NULL, 1u), "GDN front scan");
+        char what[96];
+        for (unsigned i = 0; i < 11; i++) {
+            snprintf(what, sizeof(what), "GDN front T=%u alpha/beta type=%u conv K=%u buffer %u", T, abt, CK, i);
+            same_bytes(what, 0, ref[i], 0, got[i], 0, (n[i] + guard) * 4);
+            ds4_gpu_tensor_free(got[i]);
+        }
+        for (unsigned i = 0; i < 11; i++) ds4_gpu_tensor_free(ref[i]);
+        ds4_gpu_tensor_free(x);
+        free(mixed);
+    }
+    free(state0); free(hist0);
+    puts("  GDN decode front: fused projections and conv byte-exact at T=1/2/3 with snapshots");
+}
+
+/* ds4_qwen4_cuda.cuh, tests only: the top-k through router() at every
+ * shape, and dense_mm on the weight as stored (no BF16 copy). */
+int ds4_gpu_qwen4_router_topk_ref_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t K, ds4_gpu_tensor *sg, uint32_t T, uint32_t NE, uint32_t NS);
+int ds4_gpu_qwen4_dense_mm_ref_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M);
+
+/* The router paths must reproduce the original router GEMV + router() byte
+ * for byte (logits, experts, weights, shared gate), taken through the
+ * reference entry points: router_pre (mode 1) and the BF16 copy of an F32
+ * weight whose low bits are zero (mode 2). An F32 weight with low bits set
+ * keeps its F32 path. */
+static void router_paths_run(arena_t *a, uint64_t woff, uint64_t goff, ds4_gpu_tensor *x, unsigned T,
+                             ds4_gpu_tensor *const *o, unsigned mode) {
+    const unsigned K = 2560, NE = 512, NS = 10;
+    require_ok((mode < 2 ? ds4_gpu_qwen4_dense_mm_ref_tensor : ds4_gpu_qwen4_dense_mm_tensor)(
+                   o[0],x,a->base,a->size,woff,0u,T,K,NE) &&
+               (mode ? ds4_gpu_qwen4_router_topk_tensor : ds4_gpu_qwen4_router_topk_ref_tensor)(
+                   o[1],o[2],o[0],x,a->base,a->size,goff,0u,K,o[3],T,NE,NS),
+               "router");
+}
+
+static void test_router_paths(arena_t *a) {
+    const unsigned K = 2560, NE = 512, NS = 10, G = 48;
+    double *sh;
+    const uint64_t exact_off = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t inexact_off = arena_f32(a,(uint64_t)K*NE,&sh,-.08f,.08f); free(sh);
+    const uint64_t gdn_off = arena_f32(a,(uint64_t)K*G,&sh,-.08f,.08f); free(sh);
+    const uint64_t goff = arena_f32(a,K,&sh,-.05f,.05f); free(sh);
+    uint32_t *bits = (uint32_t *)(a->base + exact_off);
+    for (uint64_t i = 0; i < (uint64_t)K*NE; i++) bits[i] &= 0xffff0000u;
+    bits = (uint32_t *)(a->base + gdn_off);
+    for (uint64_t i = 0; i < (uint64_t)K*G; i++) bits[i] &= 0xffff0000u;
+    const uint64_t offs[2] = {exact_off,inexact_off};
+    const unsigned Ts[] = {1,2,3,5,8,13};
+    for (unsigned wi = 0; wi < 2; wi++) for (unsigned ti = 0; ti < 6; ti++) {
+        const unsigned T = Ts[ti];
+        const uint64_t n[4] = {(uint64_t)T*NE,(uint64_t)T*NS,(uint64_t)T*NS,T};
+        float *input = rand_vec((uint64_t)T*K,1.0f);
+        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *o[3][4];
+        for (unsigned v = 0; v < 3; v++) for (unsigned j = 0; j < 4; j++) o[v][j] = upload(NULL,n[j]);
+        for (unsigned v = 0; v < 3; v++) router_paths_run(a,offs[wi],goff,x,T,o[v],v);
+        for (unsigned v = 1; v < 3; v++) for (unsigned j = 0; j < 4; j++)
+            same_bytes(v == 1 ? "router preload" : "router bf16",T,o[0][j],0,o[v][j],0,n[j]*4);
+        for (unsigned v = 0; v < 3; v++) for (unsigned j = 0; j < 4; j++) ds4_gpu_tensor_free(o[v][j]);
+        ds4_gpu_tensor_free(x); free(input);
+    }
+    const unsigned Tg[] = {1,2,3,4,8,9,31};
+    for (unsigned ti = 0; ti < 7; ti++) {
+        const unsigned T = Tg[ti];
+        float *input = rand_vec((uint64_t)T*K,1.0f);
+        ds4_gpu_tensor *x = upload(input,(uint64_t)T*K), *ref = upload(NULL,(uint64_t)T*G), *out = upload(NULL,(uint64_t)T*G);
+        require_ok(ds4_gpu_qwen4_dense_mm_ref_tensor(ref,x,a->base,a->size,gdn_off,0u,T,K,G),"GDN gate F32");
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out,x,a->base,a->size,gdn_off,0u,T,K,G),"GDN gate BF16");
+        same_bytes("GDN gate bf16",T,ref,0,out,0,(uint64_t)T*G*4);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(x); free(input);
+    }
+    /* Ties and non-finite rows through the preload selection: the top
+     * probability shared by a fifth of the experts, every expert equal,
+     * three experts above a floor of zeros, -inf logits at every even
+     * expert, and a row that is all NaN (one NaN logit makes the softmax
+     * sum NaN, so a NaN row selects experts 0..NS-1 with weight 0). */
+    {
+        const unsigned T = 5;
+        float *logits = malloc((uint64_t)T * NE * sizeof(float));
+        for (unsigned e = 0; e < NE; e++) {
+            logits[e] = (float)(e % 5) * 0.75f;
+            logits[NE + e] = 0.5f;
+            logits[2 * NE + e] = e == 7 || e == 300 || e == 511 ? 2.0f : -1e30f;
+            logits[3 * NE + e] = e % 2 ? (float)(e % 13) : -INFINITY;
+            logits[4 * NE + e] = nanf("");
+        }
+        float *input = rand_vec((uint64_t)T * K, 1.0f);
+        ds4_gpu_tensor *x = upload(input, (uint64_t)T * K), *gl = upload(logits, (uint64_t)T * NE), *o[2][3];
+        for (unsigned v = 0; v < 2; v++) {
+            o[v][0] = upload(NULL, (uint64_t)T * NS); o[v][1] = upload(NULL, (uint64_t)T * NS); o[v][2] = upload(NULL, T);
+            require_ok((v ? ds4_gpu_qwen4_router_topk_tensor : ds4_gpu_qwen4_router_topk_ref_tensor)(
+                           o[v][0], o[v][1], gl, x, a->base, a->size, goff, 0u, K, o[v][2], T, NE, NS), "router ties");
+        }
+        same_bytes("router ties: experts", T, o[0][0], 0, o[1][0], 0, (uint64_t)T * NS * 4);
+        same_bytes("router ties: weights", T, o[0][1], 0, o[1][1], 0, (uint64_t)T * NS * 4);
+        same_bytes("router ties: shared gate", T, o[0][2], 0, o[1][2], 0, (uint64_t)T * 4);
+        int32_t sel[5 * 10];
+        require_ok(NS == 10 && ds4_gpu_tensor_read(o[1][0], 0, sel, sizeof(sel)), "router ties read");
+        for (unsigned i = 0; i < NS; i++) {
+            require_ok(sel[i] == (int32_t)(4 + 5 * i), "router ties: lowest experts among equals");
+            require_ok(sel[NS + i] == (int32_t)i, "router ties: all equal picks the first experts");
+            require_ok(sel[3 * NS + i] % 2 == 1, "router ties: zero probabilities after the finite ones");
+            require_ok(sel[4 * NS + i] == (int32_t)i, "router ties: all NaN falls back to the slot");
+        }
+        require_ok(sel[2 * NS] == 7 && sel[2 * NS + 1] == 300 && sel[2 * NS + 2] == 511 && sel[2 * NS + 3] == 0,
+                   "router ties: zeros after the finite experts");
+        for (unsigned v = 0; v < 2; v++) for (unsigned j = 0; j < 3; j++) ds4_gpu_tensor_free(o[v][j]);
+        ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(x); free(input); free(logits);
+    }
+    puts("  router: preload and BF16 gates byte-exact at T=1..13; GDN gates BF16 at T=1..31; ties and NaN rows exact");
+}
 #endif
 
 /* ---- routed experts ---- */
@@ -1834,6 +2008,15 @@ static void test_idx_prefilter(void) {
 
 /* Routed gate/up and down types can differ; shared experts stay Q8_0
  * for quantized cases and F32 for the F32 case. */
+#ifndef __APPLE__
+/* ds4_qwen4_cuda.cuh, tests only: moe_down_tensor with the original MXFP4
+ * down kernel. */
+int ds4_gpu_qwen4_moe_down_ref_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t off,
+        uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
+        uint64_t so, uint32_t st);
+#endif
+
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
                            uint32_t T, uint32_t wtype, uint32_t dtype) {
     /* Nonzero random padding ensures kernels ignore the physical tail. */
@@ -1959,6 +2142,40 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         unsetenv("DS4_QWEN4_MOE_DOWN_PREFETCH");
         free(bp); free(ap);
     }
+#ifndef __APPLE__
+    if (wtype == 12u && dtype == 39u) {
+        /* The shared-expert L2 prefetch must leave gate/up untouched (against
+         * moe_mid_tensor, which does not prefetch), and the latency-ordered
+         * MXFP4 down kernel must match the original one
+         * (ds4_gpu_qwen4_moe_down_ref_tensor) bit for bit, shared slot
+         * included. */
+        const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
+        float *bm = malloc(nm * sizeof(float)), *am = malloc(nm * sizeof(float));
+        float *bp = malloc(np * sizeof(float)), *ap = malloc(np * sizeof(float));
+        require_ok(bm && am && bp && ap, "MoE switch allocation");
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T,
+                                                slots, E, F, sg_off, su_off, shared_type) &&
+                   ds4_gpu_qwen4_moe_down_ref_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T,
+                                                     slots, F, E, sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, bm, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_read(gpart, 0, bp, np * sizeof(float)), "MoE original kernels");
+        memset(am, 0, nm * sizeof(float));
+        memset(ap, 0, np * sizeof(float));
+        require_ok(ds4_gpu_tensor_write(gmid, 0, am, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_write(gpart, 0, ap, np * sizeof(float)), "MoE switch clear");
+        require_ok(ds4_gpu_qwen4_moe_mid_prefetch_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off,
+                                                         wtype, NE, T, slots, E, F, sg_off, su_off, shared_type,
+                                                         sd_off, shared_type) &&
+                   ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T,
+                                                 slots, F, E, sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
+                   ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "MoE new kernels");
+        check_exact_f32("Q4K gate/up with shared L2 prefetch", am, bm, nm);
+        check_exact_f32("MXFP4 down, latency order", ap, bp, np);
+        printf("  moe T=%u: shared prefetch and latency-ordered MXFP4 down byte-exact\n", T);
+        free(bm); free(am); free(bp); free(ap);
+    }
+#endif
     if (dtype == 10u) {
         require_ok(!ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off,
                     dtype, NE, T, slots, F + 1u, E, 0, UINT32_MAX),
@@ -3856,6 +4073,154 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 #endif
 
 #ifndef __APPLE__
+/* ds4_qwen4_cuda.cuh, tests only: the HC entry points with the kernels that
+ * load their weights after the dependency wait. */
+int ds4_gpu_qwen4_hc_norm_ref_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
+        const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t go, uint64_t io,
+        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps);
+int ds4_gpu_qwen4_hc_gate_mix_ref_tensor(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo, const void *map, uint64_t size,
+        uint64_t offset, uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t rank);
+int ds4_gpu_qwen4_hc_combine_norm_ref_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
+        const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
+        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
+        uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps);
+
+/* Weights loaded before the PDL dependency wait (split F16/F32 GEMVs, the
+ * F16 HC mixer, HC normalization and its combine fusion) must reproduce the
+ * kernels that load after it (the *_ref_tensor entry points, mode 1) byte
+ * for byte, on the production shapes and on shapes whose groups or ranks
+ * run past the preloaded registers. */
+static void test_presync_load(arena_t *a) {
+    const uint32_t guard = 13u;
+    /* split GEMV: {type, K, M}; type 30 marks an F32 weight holding BF16
+     * values, which the router/gate path reads from its exact BF16 copy and
+     * the reference reads as stored */
+    const uint32_t mv[][3] = {
+        {1u, 10240u, 320u}, {1u, 16384u, 64u}, {1u, 1152u, 33u}, {1u, 1024u, 7u},
+        {1u, 24320u, 9u}, {1u, 24448u, 9u},   /* the largest bulk row, then the fallback */
+        {0u, 2560u, 512u}, {0u, 2560u, 48u}, {0u, 8192u, 40u}, {0u, 1152u, 9u},
+        {30u, 2560u, 512u}, {30u, 2560u, 48u}, {30u, 1152u, 9u},
+        {8u, 6144u, 2560u}, {8u, 2560u, 12288u}, {8u, 2560u, 1537u}, {8u, 2560u, 2561u},  /* staged Q8 rows, odd M */
+    };
+    const uint32_t tokens[] = {1u, 2u, 3u, 5u, 8u};
+    for (uint32_t s = 0; s < sizeof(mv) / sizeof(mv[0]); s++) {
+        const uint32_t type = mv[s][0] == 30u ? 0u : mv[s][0], K = mv[s][1], M = mv[s][2];
+        double *shadow = NULL;
+        const uint64_t off = type == 8u ? arena_q8_0(a, M, K, &shadow, 0.1f)
+                           : type ? arena_f16(a, (uint64_t)M * K, &shadow, 0.05f)
+                                  : arena_f32(a, (uint64_t)M * K, &shadow, -0.05f, 0.05f);
+        free(shadow);
+        if (mv[s][0] == 30u) {
+            uint32_t *bits = (uint32_t *)(a->base + off);
+            for (uint64_t i = 0; i < (uint64_t)M * K; i++) bits[i] &= 0xffff0000u;
+        }
+        for (uint32_t it = 0; it < sizeof(tokens) / sizeof(tokens[0]); it++) {
+            const uint32_t T = tokens[it];
+            const uint64_t n = (uint64_t)T * M;
+            float *x = rand_vec((uint64_t)T * K, 1.0f);
+            float *ref = malloc((n + guard) * sizeof(float)), *got = malloc((n + guard) * sizeof(float));
+            require_ok(ref && got, "presync GEMV allocation");
+            ds4_gpu_tensor *gx = upload(x, (uint64_t)T * K), *go = upload(NULL, n + guard);
+            for (uint32_t mode = 0; mode < 2u; mode++) {
+                require_ok(ds4_gpu_tensor_fill_f32(go, 127.25f, n + guard) &&
+                    (mode ? ds4_gpu_qwen4_dense_mm_ref_tensor : ds4_gpu_qwen4_dense_mm_tensor)(
+                        go, gx, a->base, a->size, off, type, T, K, M) &&
+                    ds4_gpu_tensor_read(go, 0, mode ? ref : got, (n + guard) * sizeof(float)), "presync GEMV");
+            }
+            check_exact_f32("presync GEMV reference finite", ref, ref, n);
+            check_exact_f32("presync split GEMV and guard", got, ref, n + guard);
+            ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gx);
+            free(got); free(ref); free(x);
+        }
+    }
+    /* F16 gate/mix: {E, rank} */
+    const uint32_t mix[][2] = {{2560u, 320u}, {96u, 72u}, {96u, 480u}, {64u, 8u}, {33u, 36u}};
+    for (uint32_t s = 0; s < sizeof(mix) / sizeof(mix[0]); s++) {
+        const uint32_t E = mix[s][0], rank = mix[s][1];
+        double *shadow = NULL;
+        const uint64_t off = arena_f16(a, (uint64_t)4u * E * rank, &shadow, 0.3f);
+        free(shadow);
+        for (uint32_t T = 1; T <= 3u; T++) {
+            const uint64_t n = (uint64_t)T * E;
+            float *xn = rand_vec((uint64_t)T * 4u * E, 1.0f), *lo = rand_vec((uint64_t)T * rank, 6.0f);
+            float *ref = malloc((n + guard) * sizeof(float)), *got = malloc((n + guard) * sizeof(float));
+            require_ok(ref && got, "presync mix allocation");
+            ds4_gpu_tensor *gx = upload(xn, (uint64_t)T * 4u * E), *gl = upload(lo, (uint64_t)T * rank);
+            ds4_gpu_tensor *go = upload(NULL, n + guard);
+            for (uint32_t mode = 0; mode < 2u; mode++) {
+                require_ok(ds4_gpu_tensor_fill_f32(go, 127.25f, n + guard) &&
+                    (mode ? ds4_gpu_qwen4_hc_gate_mix_ref_tensor : ds4_gpu_qwen4_hc_gate_mix_tensor)(
+                        go, gx, gl, a->base, a->size, off, 1u, T, E, 4u, rank) &&
+                    ds4_gpu_tensor_read(go, 0, mode ? ref : got, (n + guard) * sizeof(float)), "presync mix");
+            }
+            check_exact_f32("presync mix reference finite", ref, ref, n);
+            check_exact_f32("presync HC mix and guard", got, ref, n + guard);
+            ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(gx);
+            free(got); free(ref); free(lo); free(xn);
+        }
+    }
+    /* HC normalization with and without injection partials, and the fused
+     * combine: {inject type, E, ni} (E = 5000 takes two chunk iterations) */
+    const uint32_t hc = 4u, CH = DS4_QWEN4_HC_CHUNKS;
+    const uint32_t norm[][3] = {{1u, 2560u, 4u}, {1u, 2560u, 0u}, {0u, 2560u, 4u}, {1u, 64u, 4u}, {1u, 5000u, 4u}};
+    for (uint32_t s = 0; s < sizeof(norm) / sizeof(norm[0]); s++) {
+        const uint32_t type = norm[s][0], E = norm[s][1], ni = norm[s][2], dim = E * hc;
+        double *shadow = NULL;
+        const uint64_t gamma = arena_f32(a, dim, &shadow, .8f, 1.2f); free(shadow);
+        const uint64_t inject = type ? arena_f16(a, (uint64_t)hc * dim, &shadow, .1f)
+                                     : arena_f32(a, (uint64_t)hc * dim, &shadow, -.1f, .1f);
+        free(shadow);
+        for (uint32_t T = 1; T <= 2u; T++) {
+            const uint64_t nx = (uint64_t)T * dim, nj = (uint64_t)T * hc * CH * (ni ? ni : 1u);
+            float *r = rand_vec(nx, 1.f);
+            ds4_gpu_tensor *gR = upload(r, nx), *gx = upload(NULL, nx + guard), *gi = upload(NULL, nj + guard);
+            float *xr = malloc((nx + guard) * 4u), *xg = malloc((nx + guard) * 4u);
+            float *ir = malloc((nj + guard) * 4u), *ig = malloc((nj + guard) * 4u);
+            require_ok(xr && xg && ir && ig, "presync norm allocation");
+            for (uint32_t mode = 0; mode < 2u; mode++) {
+                require_ok(ds4_gpu_tensor_fill_f32(gx, 127.25f, nx + guard) &&
+                    ds4_gpu_tensor_fill_f32(gi, 127.25f, nj + guard) &&
+                    (mode ? ds4_gpu_qwen4_hc_norm_ref_tensor : ds4_gpu_qwen4_hc_norm_tensor)(
+                        gx, gi, gR, a->base, a->size, gamma, inject, type, T, E, hc, ni, 1.e-6f) &&
+                    ds4_gpu_tensor_read(gx, 0, mode ? xr : xg, (nx + guard) * 4u) &&
+                    ds4_gpu_tensor_read(gi, 0, mode ? ir : ig, (nj + guard) * 4u), "presync norm");
+            }
+            check_exact_f32("presync norm reference finite", xr, xr, nx);
+            check_exact_f32("presync HC norm output and guard", xg, xr, nx + guard);
+            check_exact_f32("presync HC norm injection and guard", ig, ir, nj + guard);
+            ds4_gpu_tensor_free(gi); ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gR);
+            free(ig); free(ir); free(xg); free(xr); free(r);
+        }
+        if (type != 1u || ni != hc) continue;
+        const uint32_t nio = hc * CH * hc;
+        float *r = rand_vec(dim, 1.f), *blk = rand_vec(E, 1.f), *inj = rand_vec(nio, .1f);
+        ds4_gpu_tensor *old = upload(r, dim), *block = upload(blk, E), *oldinj = upload(inj, nio);
+        ds4_gpu_tensor *next = upload(NULL, dim + guard), *gx = upload(NULL, dim + guard), *gi = upload(NULL, nio + guard);
+        float *buf[2][3];
+        for (uint32_t mode = 0; mode < 2u; mode++) {
+            ds4_gpu_tensor *outs[3] = {next, gx, gi};
+            for (uint32_t i = 0; i < 3u; i++)
+                require_ok(ds4_gpu_tensor_fill_f32(outs[i], 127.25f, (i == 2 ? nio : dim) + guard), "presync combine fill");
+            require_ok((mode ? ds4_gpu_qwen4_hc_combine_norm_ref_tensor : ds4_gpu_qwen4_hc_combine_norm_tensor)(
+                next, block, oldinj, gx, gi, old, a->base, a->size,
+                gamma, inject, 1, 1, E, hc, hc, 1.e-6f), "presync combine norm");
+            for (uint32_t i = 0; i < 3u; i++) buf[mode][i] = download(outs[i], (i == 2 ? nio : dim) + guard);
+        }
+        for (uint32_t i = 0; i < 3u; i++) {
+            check_exact_f32("presync combine reference finite", buf[1][i], buf[1][i], i == 2 ? nio : dim);
+            check_exact_f32("presync HC combine norm and guard", buf[0][i], buf[1][i], (i == 2 ? nio : dim) + guard);
+            free(buf[0][i]); free(buf[1][i]);
+        }
+        ds4_gpu_tensor *all[] = {old, block, oldinj, next, gx, gi};
+        for (uint32_t i = 0; i < 6u; i++) ds4_gpu_tensor_free(all[i]);
+        free(r); free(blk); free(inj);
+    }
+    printf("pre-wait weight loads: F32, BF16-copy and F16 split GEMVs, F16 HC mix, HC norm and combine exact against the post-wait kernels\n");
+}
+#endif
+
+#ifndef __APPLE__
 /* A speculative batch of S sessions runs S..2S rows (a row per session, one
  * more per draft) with the kernel choices of the plain batch of S rows
  * (ds4_gpu_qwen4_set_select_rows).  Every row must come out byte-identical
@@ -3931,7 +4296,7 @@ static void test_select_rows(arena_t *a) {
     const uint64_t arena_used = a->used;   /* the weights below are this test's alone */
     /* Q8 projections on both sides of the GEMV / tensor-core boundaries,
      * the output head's rule (M >= 65536), the K split, pairs; the F16 HC
-     * down and up projections; the F32 router */
+     * down and up projections; the F32 router (a BF16 copy below 32 rows) */
     static const struct { uint32_t type, K, M; } dense[] = {
         { 8, 2560, 6144 }, { 8, 6144, 2560 }, { 8, 640, 2560 }, { 8, 2560, 48 }, { 8, 1024, 65536 },
         { 1, 10240, 320 }, { 1, 320, 1024 }, { 0, 2560, 512 },
@@ -3978,8 +4343,11 @@ int main(void) {
 
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ROWS")) { test_attn_decode_rows(); test_attention_rows(&arena); test_gdn_rows(&arena); test_multi_q8_exact(&arena); test_argmax_rows(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_GDN_FRONT")) { test_gdn_front_exact(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_SELECT_ROWS")) { test_select_rows(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ROUTER")) { test_router_paths(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN4_PRESYNC")) { test_presync_load(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
@@ -4044,6 +4412,7 @@ int main(void) {
     test_select_rows(&arena);
     test_host_argmax();
     test_host_staging();
+    test_presync_load(&arena);
 #endif
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
@@ -4090,18 +4459,24 @@ int main(void) {
 #endif
     test_router(&arena, 512, 10, 3);
     test_router(&arena, 32, 10, 5);
+#ifndef __APPLE__
+    test_router_paths(&arena);
+#endif
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
     test_attention_rows(&arena);
 #ifndef __APPLE__
     test_gdn_rows(&arena);
+    test_gdn_front_exact(&arena);
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
