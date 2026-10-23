@@ -811,6 +811,93 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
     free(got); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq); free(ref); free(keyh); free(keyf); free(q);
 }
 
+#ifndef __APPLE__
+/* The indexer score as idx_score_body computes it: lane l's products of
+ * dims l, l+32, l+64, l+96 as fused multiply-adds, the 32 lane values added
+ * as a butterfly, the relu'd heads added in order. */
+static float idx_score_cpu(const float *q, const float *key) {
+    float score = 0.0f;
+    for (uint32_t h = 0; h < 4; h++) {
+        float x[32], y[32];
+        for (uint32_t l = 0; l < 32; l++) {
+            float a = fmaf(q[h * 128 + l], key[l], 0.0f);
+            for (uint32_t i = 1; i < 4; i++) a = fmaf(q[h * 128 + l + 32 * i], key[l + 32 * i], a);
+            x[l] = a;
+        }
+        for (uint32_t d = 16; d; d >>= 1) {
+            for (uint32_t l = 0; l < 32; l++) y[l] = x[l] + x[l ^ d];
+            memcpy(x, y, sizeof(x));
+        }
+        score += x[0] > 0.0f ? x[0] : 0.0f;
+    }
+    return score;
+}
+
+/* Prefill-sized launches take idx_score_mm: its scores and tile maxima
+ * equal the per-warp kernels' bit for bit (DS4_QWEN4_IDX_SCORE_MM=0), and
+ * the visible scores equal idx_score_cpu.  Query rows get scales from 2^-6
+ * to 2^6 so products of every magnitude round. */
+static void test_idx_score_exact(uint32_t T, uint32_t n, uint32_t pos0, bool with_tiles) {
+    const uint32_t Hi = 4, Di = 128, ratio = 4, nt = (n + 7) / 8;
+    float *q = rand_vec((uint64_t)T * Hi * Di, 1.0f);
+    for (uint32_t t = 0; t < T; t++) {
+        const float s = ldexpf(1.0f, (int)(t % 13) - 6);
+        for (uint32_t i = 0; i < Hi * Di; i++) q[(uint64_t)t * Hi * Di + i] *= s;
+    }
+    float *keyf = rand_vec((uint64_t)n * Di, 1.0f);
+    uint16_t *keyh = malloc((uint64_t)n * Di * 2);
+    for (uint64_t i = 0; i < (uint64_t)n * Di; i++) { keyh[i] = f32_to_f16(keyf[i]); keyf[i] = f16_to_f32(keyh[i]); }
+    ds4_gpu_tensor *gq = upload(q, (uint64_t)T * Hi * Di);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc((uint64_t)n * Di * 2);
+    ds4_gpu_tensor *gs[2] = { upload(NULL, (uint64_t)T * n), upload(NULL, (uint64_t)T * n) };
+    ds4_gpu_tensor *gt[2] = { ds4_gpu_tensor_alloc((uint64_t)T * nt * 4), ds4_gpu_tensor_alloc((uint64_t)T * nt * 4) };
+    require_ok(gq && gk && gs[0] && gs[1] && gt[0] && gt[1] && ds4_gpu_tensor_write(gk, 0, keyh, (uint64_t)n * Di * 2),
+               "idx score exact alloc");
+    for (int mm = 0; mm < 2; mm++) {
+        setenv("DS4_QWEN4_IDX_SCORE_MM", mm ? "1" : "0", 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gt[mm], 1.0f, (uint64_t)T * nt) &&
+                   ds4_gpu_qwen4_idx_score_tensor(gs[mm], with_tiles ? gt[mm] : NULL, gq, gk, T, n, Hi, Di, pos0, ratio),
+                   "idx score exact");
+    }
+    unsetenv("DS4_QWEN4_IDX_SCORE_MM");
+    float *ref = download(gs[0], (uint64_t)T * n), *got = download(gs[1], (uint64_t)T * n);
+    char name[96];
+    snprintf(name, sizeof(name), "idx score exact T=%u n=%u pos0=%u%s", T, n, pos0, with_tiles ? " tiles" : "");
+    require_ok(memcmp(ref, got, (uint64_t)T * n * 4) == 0, name);
+    if (with_tiles) {
+        uint32_t *ta = malloc((uint64_t)T * nt * 4), *tb = malloc((uint64_t)T * nt * 4);
+        require_ok(ta && tb && ds4_gpu_tensor_read(gt[0], 0, ta, (uint64_t)T * nt * 4) &&
+                   ds4_gpu_tensor_read(gt[1], 0, tb, (uint64_t)T * nt * 4) &&
+                   memcmp(ta, tb, (uint64_t)T * nt * 4) == 0, "idx score exact tile maxima");
+        free(ta); free(tb);
+    }
+    for (uint32_t t = 0; t < T; t += (T > 64 ? 7 : 1)) {
+        const uint32_t visible = (pos0 + t + 1) / ratio;
+        for (uint32_t b = 0; b < n; b++) {
+            const float want = b < visible ? idx_score_cpu(q + (uint64_t)t * Hi * Di, keyf + (uint64_t)b * Di) : -3e38f;
+            if (memcmp(&want, &got[(uint64_t)t * n + b], 4) != 0) {
+                fprintf(stderr, "%s: row %u block %u got %.9g want %.9g\n", name, t, b, got[(uint64_t)t * n + b], want);
+                exit(1);
+            }
+        }
+    }
+    printf("  %-44s ok\n", name);
+    free(ref); free(got);
+    for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gs[i]); ds4_gpu_tensor_free(gt[i]); }
+    ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq); free(keyh); free(keyf); free(q);
+}
+
+static void test_idx_score_exact_all(void) {
+    test_idx_score_exact(16, 257, 1000, false);
+    test_idx_score_exact(33, 130, 400, false);
+    test_idx_score_exact(32, 1000, 1000, true);      /* tiles past every row's blocks */
+    test_idx_score_exact(100, 2050, 8000, true);
+    test_idx_score_exact(40, 9001, 9001 * 4 - 40, true);
+    test_idx_score_exact(300, 4100, 4100 * 4 - 300, true);
+    test_idx_score_exact(64, 70001, 70001 * 4 - 64, true);
+}
+#endif
+
 /* ---- indexer radix select ---- */
 
 #ifdef __APPLE__
@@ -1004,6 +1091,278 @@ static void test_idx_select_exact_all(void) {
 #endif
 }
 
+#ifndef __APPLE__
+/* ---- tensor-core indexer scores with exact rescoring ---- */
+
+static uint32_t sel_key(float v) {
+    v = v > 0.0f ? v : 0.0f;
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    return u;
+}
+
+static uint16_t *keys_to_half(float *keyf, uint64_t n) {
+    uint16_t *keyh = malloc(n * 2);
+    require_ok(keyh != NULL, "half keys alloc");
+    for (uint64_t i = 0; i < n; i++) { keyh[i] = f32_to_f16(keyf[i]); keyf[i] = f16_to_f32(keyh[i]); }
+    return keyh;
+}
+
+/* Long prefill rows take the tensor-core scorer with exact rescoring
+ * (ds4_gpu_qwen4_idx_score_topk_tensor).  Against the exact scores: the k
+ * selected blocks match slot for slot, every key at or above a row's k-th
+ * largest exact key is exact, every other key stays below it, and every
+ * tile maximum is the largest key of its tile. */
+static void test_idx_score_topk(const char *what, uint32_t T, uint32_t n, uint32_t pos0, const float *q,
+                                const uint16_t *keyh) {
+    const uint32_t Hi = 4, Di = 128, ratio = 4, K = 512, nt = (n + 7) / 8;
+    ds4_gpu_tensor *gq = upload(q, (uint64_t)T * Hi * Di), *gk = ds4_gpu_tensor_alloc((uint64_t)n * Di * 2);
+    ds4_gpu_tensor *gs[2], *gt[2], *gsel[2];
+    for (int i = 0; i < 2; i++) {
+        gs[i] = upload(NULL, (uint64_t)T * n);
+        gt[i] = ds4_gpu_tensor_alloc((uint64_t)T * nt * 4);
+        gsel[i] = ds4_gpu_tensor_alloc((uint64_t)T * K * 4);
+        require_ok(gt[i] && gsel[i], "idx topk alloc");
+    }
+    require_ok(gk && ds4_gpu_tensor_write(gk, 0, keyh, (uint64_t)n * Di * 2), "idx topk keys");
+    setenv("DS4_QWEN4_IDX_TC_MIN", "1", 1);
+    require_ok(ds4_gpu_qwen4_idx_score_tensor(gs[0], gt[0], gq, gk, T, n, Hi, Di, pos0, ratio) &&
+               ds4_gpu_qwen4_idx_score_topk_tensor(gs[1], gt[1], gq, gk, T, n, Hi, Di, pos0, ratio, K) &&
+               ds4_gpu_qwen4_idx_select_tensor(gsel[0], gs[0], gt[0], n, T, K) &&
+               ds4_gpu_qwen4_idx_select_tensor(gsel[1], gs[1], gt[1], n, T, K), "idx topk score and select");
+    unsetenv("DS4_QWEN4_IDX_TC_MIN");
+    float *s0 = download(gs[0], (uint64_t)T * n), *s1 = download(gs[1], (uint64_t)T * n);
+    uint32_t *t1 = malloc((uint64_t)T * nt * 4), *keys = malloc((uint64_t)n * 4);
+    int32_t *sel0 = malloc((uint64_t)T * K * 4), *sel1 = malloc((uint64_t)T * K * 4);
+    require_ok(t1 && keys && sel0 && sel1 && ds4_gpu_tensor_read(gt[1], 0, t1, (uint64_t)T * nt * 4) &&
+               ds4_gpu_tensor_read(gsel[0], 0, sel0, (uint64_t)T * K * 4) &&
+               ds4_gpu_tensor_read(gsel[1], 0, sel1, (uint64_t)T * K * 4), "idx topk read");
+    char name[128];
+    snprintf(name, sizeof(name), "idx topk %s T=%u n=%u pos0=%u", what, T, n, pos0);
+    uint64_t same_n = 0, vis_n = 0;
+    for (uint32_t t = 0; t < T; t++) {
+        const float *a = s0 + (uint64_t)t * n, *b = s1 + (uint64_t)t * n;
+        const uint32_t vis = (pos0 + t + 1) / ratio < n ? (pos0 + t + 1) / ratio : n;
+        for (uint32_t i = 0; i < n; i++) keys[i] = sel_key(a[i]);
+        qsort(keys, n, 4, cmp_u32_desc);
+        const uint32_t thr = keys[K - 1];
+        for (uint32_t i = 0; i < n; i++) {
+            const bool same = memcmp(&a[i], &b[i], 4) == 0;
+            same_n += same && i < vis;
+            if (sel_key(a[i]) >= thr ? !same : sel_key(b[i]) >= thr) {
+                fprintf(stderr, "%s: row %u block %u exact %.9g got %.9g (k-th key %08x)\n", name, t, i, a[i], b[i], thr);
+                exit(1);
+            }
+        }
+        vis_n += vis;
+        for (uint32_t i = 0; i < nt; i++) {
+            uint32_t m = 0;
+            for (uint32_t j = 8 * i; j < n && j < 8 * i + 8; j++) if (sel_key(b[j]) > m) m = sel_key(b[j]);
+            if (t1[(uint64_t)t * nt + i] != m) {
+                fprintf(stderr, "%s: row %u tile %u maximum %08x, its keys %08x\n", name, t, i, t1[(uint64_t)t * nt + i], m);
+                exit(1);
+            }
+        }
+    }
+    require_ok(memcmp(sel0, sel1, (uint64_t)T * K * 4) == 0, name);
+    printf("  %-60s ok  %.1f%% of visible scores exact\n", name, 100.0 * (double)same_n / (double)(vis_n ? vis_n : 1));
+    free(sel0); free(sel1); free(keys); free(t1); free(s0); free(s1);
+    for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gs[i]); ds4_gpu_tensor_free(gt[i]); ds4_gpu_tensor_free(gsel[i]); }
+    ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq);
+}
+
+/* The tensor-core pass alone (DS4_QWEN4_IDX_TC_APPROX=1) against exact
+ * scores, every block visible: |a - s| <= delta = max |k| sum_h (|r_h| +
+ * 2^-11 |q_h|), r_h the rounding error of the scaled half queries, and
+ * |a - sum_h relu(qh_h . k)| <= 2^-12 sum_h |qh_h| . |k| with qh_h the
+ * half queries the tensor cores multiplied (delta's assumption on their
+ * accumulation; the largest seen is printed in units of 2^-24). */
+static void test_idx_tc_bound(const char *what, uint32_t T, uint32_t n, const float *q, const uint16_t *keyh,
+                              const float *keyf) {
+    const uint32_t Hi = 4, Di = 128, ratio = 4, nt = (n + 7) / 8, pos0 = 4 * n;
+    ds4_gpu_tensor *gq = upload(q, (uint64_t)T * Hi * Di), *gk = ds4_gpu_tensor_alloc((uint64_t)n * Di * 2);
+    ds4_gpu_tensor *gs[2] = { upload(NULL, (uint64_t)T * n), upload(NULL, (uint64_t)T * n) };
+    ds4_gpu_tensor *gt = ds4_gpu_tensor_alloc((uint64_t)T * nt * 4);
+    require_ok(gk && gt && ds4_gpu_tensor_write(gk, 0, keyh, (uint64_t)n * Di * 2), "idx tc bound alloc");
+    setenv("DS4_QWEN4_IDX_TC_MIN", "1", 1);
+    setenv("DS4_QWEN4_IDX_TC_APPROX", "1", 1);
+    require_ok(ds4_gpu_qwen4_idx_score_tensor(gs[0], gt, gq, gk, T, n, Hi, Di, pos0, ratio) &&
+               ds4_gpu_qwen4_idx_score_topk_tensor(gs[1], gt, gq, gk, T, n, Hi, Di, pos0, ratio, 512), "idx tc bound score");
+    unsetenv("DS4_QWEN4_IDX_TC_APPROX");
+    unsetenv("DS4_QWEN4_IDX_TC_MIN");
+    float *s = download(gs[0], (uint64_t)T * n), *a = download(gs[1], (uint64_t)T * n);
+    double kmax = 0.0;
+    for (uint32_t b = 0; b < n; b++) {
+        double k2 = 0.0;
+        for (uint32_t x = 0; x < Di; x++) k2 += (double)keyf[(uint64_t)b * Di + x] * keyf[(uint64_t)b * Di + x];
+        if (sqrt(k2) > kmax) kmax = sqrt(k2);
+    }
+    double worst_delta = 0.0, worst_acc = 0.0;
+    float *qh = malloc((size_t)Hi * Di * 4);
+    require_ok(qh != NULL, "idx tc bound alloc");
+    for (uint32_t t = 0; t < T; t++) {
+        const float *qt = q + (uint64_t)t * Hi * Di;
+        float mx = 0.0f;
+        for (uint32_t i = 0; i < Hi * Di; i++) if (fabsf(qt[i]) > mx) mx = fabsf(qt[i]);
+        int ex = 15;
+        if (mx > 0.0f) frexpf(mx, &ex);
+        const int e = 15 - ex < -126 ? -126 : 15 - ex > 127 ? 127 : 15 - ex;
+        double coef = 0.0;
+        for (uint32_t h = 0; h < Hi; h++) {
+            double qq = 0.0, rr = 0.0;
+            for (uint32_t x = 0; x < Di; x++) {
+                const float v = qt[h * Di + x], hv = (float)(_Float16)ldexpf(v, e);
+                qh[h * Di + x] = hv;
+                const double r = (double)v - ldexp((double)hv, -e);
+                qq += (double)v * v;
+                rr += r * r;
+            }
+            coef += sqrt(rr) + ldexp(sqrt(qq), -11);
+        }
+        const double delta = coef * kmax;
+        for (uint32_t b = 0; b < n; b++) {
+            const float *k = keyf + (uint64_t)b * Di;
+            double want = 0.0, mass = 0.0;
+            for (uint32_t h = 0; h < Hi; h++) {
+                double d = 0.0;
+                for (uint32_t x = 0; x < Di; x++) {
+                    d += (double)qh[h * Di + x] * k[x];
+                    mass += fabs((double)qh[h * Di + x] * k[x]);
+                }
+                want += d > 0.0 ? d : 0.0;
+            }
+            want = ldexp(want, -e);
+            mass = ldexp(mass, -e);
+            const double got = a[(uint64_t)t * n + b], ds = fabs(got - s[(uint64_t)t * n + b]), dacc = fabs(got - want);
+            if (ds > delta || dacc > ldexp(mass, -12)) {
+                fprintf(stderr, "idx tc bound %s: row %u block %u approx %.9g exact %.9g tc-ideal %.9g delta %.3g mass %.3g\n",
+                        what, t, b, got, s[(uint64_t)t * n + b], want, delta, mass);
+                exit(1);
+            }
+            if (delta > 0.0 && ds / delta > worst_delta) worst_delta = ds / delta;
+            if (mass > 0.0 && dacc / mass > worst_acc) worst_acc = dacc / mass;
+        }
+    }
+    char name[128];
+    snprintf(name, sizeof(name), "idx tc bound %s T=%u n=%u", what, T, n);
+    printf("  %-60s ok  |a-s|/delta <= %.4f, accumulation <= %.2f x 2^-24 of sum|q k|\n", name, worst_delta,
+           ldexp(worst_acc, 24));
+    free(qh); free(a); free(s);
+    ds4_gpu_tensor_free(gs[0]); ds4_gpu_tensor_free(gs[1]); ds4_gpu_tensor_free(gt); ds4_gpu_tensor_free(gk);
+    ds4_gpu_tensor_free(gq);
+}
+
+/* Query or key values m 2^e, m an 11-bit mantissa and e in [lo, hi]: halves
+ * that stay exact through the queries' power-of-two scaling. */
+static float exact_half_value(int lo, int hi) {
+    const float m = 1.0f + (float)((g_rng = g_rng * 1664525u + 1013904223u) >> 22) / 1024.0f;
+    const int e = lo + (int)((g_rng = g_rng * 1664525u + 1013904223u) >> 16) % (hi - lo + 1);
+    return ((g_rng >> 9) & 1 ? -1.0f : 1.0f) * ldexpf(m, e);
+}
+
+static void test_idx_score_topk_all(void) {
+    const uint32_t Di = 128;
+    /* random rows: just past the tiles' threshold, every block visible to
+     * the latest row, half the blocks visible (tiles past every row's), and
+     * selection groups of two tiles; row scales 2^-6 .. 2^6 */
+    const uint32_t shapes[][3] = { { 100, 9001, 9001 * 4 - 100 }, { 64, 33001, 33001 * 4 - 64 },
+                                   { 70, 20000, 40000 }, { 48, 70001, 70001 * 4 - 48 } };
+    for (unsigned i = 0; i < 4; i++) {
+        const uint32_t T = shapes[i][0], n = shapes[i][1];
+        float *q = rand_vec((uint64_t)T * 4 * Di, 1.0f), *keyf = rand_vec((uint64_t)n * Di, 1.0f);
+        for (uint32_t t = 0; t < T && i == 1; t++)
+            for (uint32_t x = 0; x < 4 * Di; x++) q[(uint64_t)t * 4 * Di + x] *= ldexpf(1.0f, (int)(t % 13) - 6);
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        test_idx_score_topk(i == 1 ? "random, row scales" : "random", T, n, shapes[i][2], q, keyh);
+        free(keyh); free(keyf); free(q);
+    }
+    /* heavy ties: 40 distinct keys, so most rows tie at their k-th key */
+    {
+        const uint32_t T = 64, n = 12000;
+        float *q = rand_vec((uint64_t)T * 4 * Di, 1.0f), *base = rand_vec(40 * Di, 1.0f), *keyf = malloc((uint64_t)n * Di * 4);
+        require_ok(keyf != NULL, "ties alloc");
+        for (uint32_t b = 0; b < n; b++) memcpy(keyf + (uint64_t)b * Di, base + (b * 7u % 40u) * Di, Di * 4);
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        test_idx_score_topk("heavy ties", T, n, 4 * n - T, q, keyh);
+        free(keyh); free(keyf); free(base); free(q);
+    }
+    /* clusters straddling the threshold: 3000 keys (each in its own tile)
+     * within a few half ulps of one key that every query favours, so the
+     * approximate scores cannot order them and several batches of tiles
+     * are rescored */
+    {
+        const uint32_t T = 40, n = 40000;
+        float *u = rand_vec(Di, 1.0f), *keyf = rand_vec((uint64_t)n * Di, 0.5f), *q = rand_vec((uint64_t)T * 4 * Di, 0.1f);
+        for (uint32_t b = 0; b < n; b += 13)
+            for (uint32_t x = 0; x < Di; x++) keyf[(uint64_t)b * Di + x] = u[x] * (1.0f + ldexpf(frand(), -9));
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t x = 0; x < 4 * Di; x++) q[(uint64_t)t * 4 * Di + x] += 0.5f * u[x % Di];
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        test_idx_score_topk("threshold cluster", T, n, 4 * n - T, q, keyh);
+        free(keyh); free(keyf); free(q); free(u);
+    }
+    /* rows with 509 .. 525 positive scores: keys +-u (plus noise), queries
+     * along u; the last 16 blocks, one more visible every four rows, are
+     * positive */
+    {
+        const uint32_t T = 64, n = 30000;
+        float *u = rand_vec(Di, 1.0f), *keyf = rand_vec((uint64_t)n * Di, 0.3f), *q = rand_vec((uint64_t)T * 4 * Di, 0.05f);
+        for (uint32_t b = 0; b < n; b++) {
+            const float sgn = b >= n - 16 || b % 59 == 7 ? 1.0f : -1.0f;
+            for (uint32_t x = 0; x < Di; x++) keyf[(uint64_t)b * Di + x] += sgn * u[x];
+        }
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t x = 0; x < 4 * Di; x++) q[(uint64_t)t * 4 * Di + x] += 0.2f * u[x % Di];
+        uint32_t pos = 0;
+        for (uint32_t b = 0; b < n - 16; b++) pos += b % 59 == 7;
+        require_ok(pos < 512 && pos + 16 > 512, "positive-score layout");   /* rows see 509 .. 525 */
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        test_idx_score_topk("near 512 positive", T, n, 4 * n - T, q, keyh);
+        free(keyh); free(keyf); free(q); free(u);
+    }
+    /* zero queries (every score 0) and rows with an infinite or NaN query */
+    {
+        const uint32_t T = 32, n = 9100;
+        float *q = rand_vec((uint64_t)T * 4 * Di, 1.0f), *keyf = rand_vec((uint64_t)n * Di, 1.0f);
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        memset(q, 0, (uint64_t)T * 4 * Di * 4);
+        test_idx_score_topk("zero queries", T, n, 4 * n - T, q, keyh);
+        free(q);
+        q = rand_vec((uint64_t)T * 4 * Di, 1.0f);
+        q[5 * 4 * Di + 3] = INFINITY;
+        q[9 * 4 * Di + 200] = NAN;
+        test_idx_score_topk("non-finite rows", T, n, 4 * n - T, q, keyh);
+        free(keyh); free(keyf); free(q);
+    }
+    /* the bound itself: random rows, and exact half values whose products
+     * span 25 binades, with and without cancellation */
+    {
+        const uint32_t T = 48, n = 4100;
+        float *q = rand_vec((uint64_t)T * 4 * Di, 1.0f), *keyf = rand_vec((uint64_t)n * Di, 1.0f);
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t x = 0; x < 4 * Di; x++) q[(uint64_t)t * 4 * Di + x] *= ldexpf(1.0f, (int)(t % 13) - 6);
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)n * Di);
+        test_idx_tc_bound("random", T, n, q, keyh, keyf);
+        for (int cancel = 0; cancel < 2; cancel++) {
+            for (uint64_t i = 0; i < (uint64_t)T * 4 * Di; i++) q[i] = exact_half_value(-10, 0);
+            for (uint64_t i = 0; i < (uint64_t)n * Di; i++) keyf[i] = exact_half_value(-12, 3);
+            for (uint32_t t = 0; t < T; t++)
+                for (uint32_t h = 0; h < 4; h++) q[((uint64_t)t * 4 + h) * Di + (t + h) % Di] = 1.0f;
+            for (uint32_t b = 0; b < n; b++) {
+                float *k = keyf + (uint64_t)b * Di;
+                if (cancel)   /* dims 64 .. 127 undo dims 0 .. 63 for the queries of row 0 */
+                    for (uint32_t x = 64; x < Di; x++) k[x] = -k[x - 64] * q[x - 64] / q[x];
+                k[b % Di] = 32.0f;
+            }
+            free(keyh);
+            keyh = keys_to_half(keyf, (uint64_t)n * Di);
+            test_idx_tc_bound(cancel ? "25 binades, cancelling" : "25 binades", T, n, q, keyh, keyf);
+        }
+        free(keyh); free(keyf); free(q);
+    }
+}
+#endif
+
 /* Prefill and split attention against scalar attention on the same inputs. */
 static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
@@ -1117,6 +1476,67 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
     ds4_gpu_tensor_free(partial);
 }
+
+#ifndef __APPLE__
+/* Prefill rows (no partial scratch, 32+ rows) take attention_group_pipe:
+ * its outputs equal attention_group's bit for bit (DS4_QWEN4_ATTN_PIPE=0),
+ * with empty rows, invalid and future positions among the selections. */
+static void test_attn_pipe_exact(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks) {
+    const uint32_t H = 24, Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio, cap = pos0 + T;
+    const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
+    float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
+    _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2);
+    for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(frand() - 0.5f); vc[i] = (_Float16)(frand() - 0.5f); }
+    int32_t *sel = calloc((uint64_t)T * sel_stride, 4);
+    uint32_t *cnt = malloc((uint64_t)T * 4);
+    require_ok(kc && vc && sel && cnt, "attn pipe alloc");
+    for (uint32_t t = 0; t < T; t++) {
+        const uint32_t pos = pos0 + t, nb = (pos + 1) / ratio, take = nb < k_blocks ? nb : k_blocks;
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < take; i++) {
+            const uint32_t b = (uint32_t)((uint64_t)i * nb / take) + (t % 3 == 0 && i + 1 < take ? 1u : 0u);
+            for (uint32_t r = 0; r < ratio; r++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)(b * ratio + r);
+        }
+        for (uint32_t k = nb * ratio; k <= pos; k++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)k;
+        cnt[t] = n;
+        const float amplitude = t % 3 == 0 ? 64 : t % 3 == 1 ? 0.00001f : 1;
+        for (uint32_t i = 0; i < H * D; i++) q[(uint64_t)t * H * D + i] *= amplitude;
+        if (sparse && t % 7 == 0) cnt[t] = 0;
+        else if (sparse && t % 11 == 1) { cnt[t] = 1; sel[(uint64_t)t * sel_stride] = -1; }
+        else if (sparse && t % 5 == 2) sel[(uint64_t)t * sel_stride + n / 2] = (int32_t)(pos + 1);   /* a future key */
+    }
+    ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc((uint64_t)T * 4);
+    ds4_gpu_tensor *go[2] = { upload(NULL, qn), upload(NULL, qn) };
+    require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
+               ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, (uint64_t)T * 4),
+               "attn pipe setup");
+    for (int pipe = 0; pipe < 2; pipe++) {
+        setenv("DS4_QWEN4_ATTN_PIPE", pipe ? "1" : "0", 1);
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(go[pipe], gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse,
+                                                    sel_stride, 0.0625f), "attn pipe");
+    }
+    unsetenv("DS4_QWEN4_ATTN_PIPE");
+    float *a = download(go[0], qn), *b = download(go[1], qn);
+    char name[96];
+    snprintf(name, sizeof(name), "attn pipe exact T=%u pos0=%u %s k=%u", T, pos0, sparse ? "sparse" : "dense", k_blocks);
+    require_ok(memcmp(a, b, qn * 4) == 0, name);
+    printf("  %-44s ok\n", name);
+    free(a); free(b); ds4_gpu_tensor_free(go[0]); ds4_gpu_tensor_free(go[1]);
+    ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
+    ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
+}
+
+static void test_attn_pipe_exact_all(void) {
+    test_attn_pipe_exact(32, 100, false, 512);
+    test_attn_pipe_exact(45, 3000, false, 512);
+    test_attn_pipe_exact(40, 9000, true, 512);
+    test_attn_pipe_exact(77, 2040, true, 512);       /* rows of 2041.. keys around one tile boundary */
+    test_attn_pipe_exact(33, 500, true, 16);
+}
+
+#endif
 
 static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
@@ -4518,6 +4938,160 @@ static void bench_idx_score(void) {
     }
 }
 
+#ifndef __APPLE__
+/* DS4_TEST_QWEN4_IDX_SCORE_BENCH=1: one prefill chunk's scores (8192 rows)
+ * against n blocks, the last row seeing them all, per kernel
+ * (DS4_QWEN4_IDX_SCORE_MM=0 for the per-warp ones) */
+static int bench_score_prefill(void *ud) {
+    score_bench *c = ud;
+    return ds4_gpu_qwen4_idx_score_tensor(c->score, c->n > 8192 ? c->tiles : NULL, c->q, c->key, c->T, c->n, 4, 128,
+                                          c->n * 4 - c->T, 4);
+}
+
+static void bench_idx_score_prefill(void) {
+    const uint32_t ns[] = { 2048, 8192, 32768, 63488 };
+    const uint32_t T = 8192;
+    for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        const uint32_t n = ns[i];
+        float *q = rand_vec((uint64_t)T * 4 * 128, 1.0f);
+        score_bench c = { upload(NULL, (uint64_t)T * n), ds4_gpu_tensor_alloc((uint64_t)T * ((n + 7) / 8) * 4),
+                          upload(q, (uint64_t)T * 4 * 128), ds4_gpu_tensor_alloc((uint64_t)n * 128 * 2), {0}, n, T, 0 };
+        require_ok(c.score && c.tiles && c.q && c.key && ds4_gpu_tensor_fill_f32(c.key, 0.01f, (uint64_t)n * 64),
+                   "score prefill bench alloc");
+        for (int mm = 0; mm < 2; mm++) {
+            setenv("DS4_QWEN4_IDX_SCORE_MM", mm ? "1" : "0", 1);
+            char name[64];
+            snprintf(name, sizeof(name), "idx score %s T=%u n=%u", mm ? "mm" : "warp", T, n);
+            bench_run(name, bench_score_prefill, &c, mm ? 20 : 3);
+        }
+        unsetenv("DS4_QWEN4_IDX_SCORE_MM");
+        ds4_gpu_tensor_free(c.score); ds4_gpu_tensor_free(c.tiles); ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.key); free(q);
+    }
+}
+
+/* DS4_TEST_QWEN4_IDX_TOPK_BENCH=1: one prefill chunk's scores through
+ * idx_score_mm and through the tensor-core scorer with exact rescoring
+ * (tc), alone and with the selection, on random rows or on the inputs of
+ * real chunks in the files of DS4_TEST_QWEN4_IDX_DUMP (colon-separated:
+ * u32 rows, blocks, heads, dims, pos0, ratio, then f32 queries and f16
+ * keys), whose two selections are compared. */
+typedef struct { ds4_gpu_tensor *score, *tiles, *sel, *q, *key; uint32_t n, T, pos0; } topk_bench;
+static int bench_topk_score(void *ud) {
+    topk_bench *c = ud;
+    return ds4_gpu_qwen4_idx_score_topk_tensor(c->score, c->tiles, c->q, c->key, c->T, c->n, 4, 128, c->pos0, 4, 512);
+}
+static int bench_topk_both(void *ud) {
+    topk_bench *c = ud;
+    return bench_topk_score(ud) && ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tiles, c->n, c->T, 512);
+}
+
+static void bench_topk_case(const char *what, const float *q, const uint16_t *keyh, uint32_t T, uint32_t n, uint32_t pos0) {
+    topk_bench c = { upload(NULL, (uint64_t)T * n), ds4_gpu_tensor_alloc((uint64_t)T * ((n + 7) / 8) * 4),
+                     ds4_gpu_tensor_alloc((uint64_t)T * 512 * 4), upload(q, (uint64_t)T * 512),
+                     ds4_gpu_tensor_alloc((uint64_t)n * 256), n, T, pos0 };
+    require_ok(c.tiles && c.sel && c.key && ds4_gpu_tensor_write(c.key, 0, keyh, (uint64_t)n * 256), "topk bench alloc");
+    int32_t *sel[2];
+    for (int tc = 0; tc < 2; tc++) {
+        setenv("DS4_QWEN4_IDX_TC_MIN", tc ? "1" : "0", 1);
+        char name[96];
+        snprintf(name, sizeof(name), "idx score %s %s T=%u n=%u", tc ? "tc" : "mm", what, T, n);
+        bench_run(name, bench_topk_score, &c, 10);
+        snprintf(name, sizeof(name), "idx score+select %s %s T=%u n=%u", tc ? "tc" : "mm", what, T, n);
+        bench_run(name, bench_topk_both, &c, 10);
+        sel[tc] = malloc((uint64_t)T * 512 * 4);
+        require_ok(sel[tc] && ds4_gpu_tensor_read(c.sel, 0, sel[tc], (uint64_t)T * 512 * 4), "topk bench read");
+    }
+    unsetenv("DS4_QWEN4_IDX_TC_MIN");
+    printf("  idx %s T=%u n=%u: selections %s\n", what, T, n,
+           memcmp(sel[0], sel[1], (uint64_t)T * 512 * 4) ? "DIFFER" : "identical");
+    free(sel[0]); free(sel[1]);
+    ds4_gpu_tensor_free(c.score); ds4_gpu_tensor_free(c.tiles); ds4_gpu_tensor_free(c.sel);
+    ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.key);
+}
+
+static void bench_idx_topk(void) {
+    const char *dumps = getenv("DS4_TEST_QWEN4_IDX_DUMP");
+    if (dumps && dumps[0]) {
+        char *list = strdup(dumps), *save = NULL;
+        for (char *path = strtok_r(list, ":", &save); path; path = strtok_r(NULL, ":", &save)) {
+            FILE *f = fopen(path, "rb");
+            uint32_t h[6];
+            require_ok(f && fread(h, 4, 6, f) == 6 && h[2] == 4 && h[3] == 128 && h[5] == 4, path);
+            float *q = malloc((uint64_t)h[0] * 512 * 4);
+            uint16_t *keyh = malloc((uint64_t)h[1] * 256);
+            require_ok(q && keyh && fread(q, 4, (size_t)h[0] * 512, f) == (size_t)h[0] * 512 &&
+                       fread(keyh, 2, (size_t)h[1] * 128, f) == (size_t)h[1] * 128, path);
+            fclose(f);
+            const char *base = strrchr(path, '/'), *cut = getenv("DS4_TEST_QWEN4_IDX_DUMP_N");
+            /* DS4_TEST_QWEN4_IDX_DUMP_N: the first n blocks only, the last row seeing them all */
+            const uint32_t n = cut && atol(cut) > 0 && (uint32_t)atol(cut) < h[1] ? (uint32_t)atol(cut) : h[1];
+            bench_topk_case(base ? base + 1 : path, q, keyh, h[0], n, n < h[1] ? 4 * n - h[0] : h[4]);
+            free(q); free(keyh);
+        }
+        free(list);
+        return;
+    }
+    const uint32_t ns[] = { 16384, 32768, 63488 }, T = 8192;
+    for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        float *q = rand_vec((uint64_t)T * 512, 1.0f), *keyf = rand_vec((uint64_t)ns[i] * 128, 1.0f);
+        uint16_t *keyh = keys_to_half(keyf, (uint64_t)ns[i] * 128);
+        bench_topk_case("random", q, keyh, T, ns[i], ns[i] * 4 - T);
+        free(keyh); free(keyf); free(q);
+    }
+}
+#endif
+
+#ifndef __APPLE__
+/* DS4_TEST_QWEN4_ATTN_BENCH=1: the sparse attention of one prefill chunk
+ * (8192 rows, 512 blocks plus the tail each), rows sharing most blocks
+ * with their neighbours as real selections do */
+typedef struct { ds4_gpu_tensor *o, *q, *gate, *k, *v, *sel, *cnt; uint32_t T, pos0, stride; } attn_bench;
+static int bench_attn_one(void *ud) {
+    attn_bench *c = ud;
+    return ds4_gpu_qwen4_attn_decode_tensor(c->o, c->q, c->gate, c->k, c->v, c->sel, c->cnt, NULL, c->T, 24, 2, 256,
+                                            c->pos0, true, c->stride, 0.0625f);
+}
+
+static void bench_attn_prefill(void) {
+    const uint32_t T = 8192, H = 24, Hkv = 2, D = 256, ratio = 4, k_blocks = 512, stride = k_blocks * ratio + ratio;
+    const uint32_t pos0s[] = { 24576, 245760 };
+    for (unsigned pi = 0; pi < 2; pi++) {
+        const uint32_t pos0 = pos0s[pi], cap = pos0 + T;
+        const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
+        int32_t *sel = malloc((uint64_t)T * stride * 4);
+        uint32_t *cnt = malloc((uint64_t)T * 4), base[512];
+        require_ok(sel && cnt, "attn bench alloc");
+        for (uint32_t t = 0; t < T; t++) {
+            const uint32_t pos = pos0 + t, nb = (pos + 1) / ratio, span = nb / k_blocks;
+            if (t % 32 == 0) for (uint32_t i = 0; i < k_blocks; i++) base[i] = i * span + (g_rng = g_rng * 1664525u + 1013904223u) % span;
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < k_blocks; i++) {
+                /* one block in eight differs from the group's */
+                const uint32_t b = i % 8 == t % 8 ? i * span + (t * 7919u + i) % span : base[i];
+                for (uint32_t r = 0; r < ratio; r++) sel[(uint64_t)t * stride + n++] = (int32_t)(b * ratio + r);
+            }
+            for (uint32_t k = nb * ratio; k <= pos; k++) sel[(uint64_t)t * stride + n++] = (int32_t)k;
+            cnt[t] = n;
+        }
+        float *q = rand_vec(qn, 1.0f);
+        attn_bench c = { upload(NULL, qn), upload(q, qn), upload(q, qn), ds4_gpu_tensor_alloc(kvn * 2), ds4_gpu_tensor_alloc(kvn * 2),
+                         ds4_gpu_tensor_alloc((uint64_t)T * stride * 4), ds4_gpu_tensor_alloc((uint64_t)T * 4), T, pos0, stride };
+        require_ok(c.k && c.v && c.sel && c.cnt && ds4_gpu_tensor_fill_f32(c.k, 0.01f, kvn / 2) && ds4_gpu_tensor_fill_f32(c.v, 0.02f, kvn / 2) &&
+                   ds4_gpu_tensor_write(c.sel, 0, sel, (uint64_t)T * stride * 4) && ds4_gpu_tensor_write(c.cnt, 0, cnt, (uint64_t)T * 4),
+                   "attn bench setup");
+        for (int pipe = 0; pipe < 2; pipe++) {
+            setenv("DS4_QWEN4_ATTN_PIPE", pipe ? "1" : "0", 1);
+            char name[64];
+            snprintf(name, sizeof(name), "attn prefill %s pos0=%u", pipe ? "pipe" : "group", pos0);
+            bench_run(name, bench_attn_one, &c, 5);
+        }
+        unsetenv("DS4_QWEN4_ATTN_PIPE");
+        ds4_gpu_tensor_free(c.o); ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.gate); ds4_gpu_tensor_free(c.k);
+        ds4_gpu_tensor_free(c.v); ds4_gpu_tensor_free(c.sel); ds4_gpu_tensor_free(c.cnt); free(q); free(sel); free(cnt);
+    }
+}
+#endif
+
 static void bench_idx_select(void) {
     const uint32_t ns[] = { 1024, 2048, 4096, 8192, 16384, 32768, 50000, 65536, 131072, 262144 };
     for (unsigned i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
@@ -4708,6 +5282,14 @@ int main(void) {
     }
     if (getenv("DS4_TEST_QWEN4_IDX_SELECT_ONLY")) { test_idx_select_exact_all(); printf("all qwen4 idx select tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN4_IDX_SELECT_BENCH")) { bench_idx_score(); bench_idx_select(); return 0; }
+#ifndef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_IDX_SCORE_ONLY")) { test_idx_score_exact_all(); printf("all qwen4 idx score tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_IDX_TOPK_ONLY")) { test_idx_score_topk_all(); printf("all qwen4 idx topk tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_IDX_SCORE_BENCH")) { bench_idx_score_prefill(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_IDX_TOPK_BENCH")) { bench_idx_topk(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ATTN_PIPE_ONLY")) { test_attn_pipe_exact_all(); printf("all qwen4 attention pipe tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_ATTN_BENCH")) { bench_attn_prefill(); return 0; }
+#endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
@@ -4766,6 +5348,10 @@ int main(void) {
     test_gdn(&arena, 16, 48, 128, 200);
     test_idx_score_mm(37, 3001, 11000);
     test_idx_score_mm(3, 70, 100);
+#ifndef __APPLE__
+    test_idx_score_exact_all();
+    test_idx_score_topk_all();
+#endif
     test_idx_select(4, 70001, 512, 69000);
     test_idx_select(3, 600, 512, 599);
     test_idx_select(2, 3000, 512, 520);
@@ -4778,6 +5364,7 @@ int main(void) {
     test_attn_mm(9, 128, false);
 #ifndef __APPLE__
     test_attn_groups();
+    test_attn_pipe_exact_all();
     test_attn_decode_rows();
 #endif
     test_gdn(&arena, 2, 6, 32, 7);

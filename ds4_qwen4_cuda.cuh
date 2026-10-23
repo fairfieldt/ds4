@@ -430,6 +430,154 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
     out[(uint64_t)t * tiles + tile] = v;
 }
 
+/* Prefill rows: the scores of idx_score_body, bit for bit, for tiles of
+ * SCORE_ROWS rows x SCORE_BLOCKS blocks whose queries and keys are staged
+ * in shared memory once.  The per-warp kernels read every key again for
+ * every row (16 MB a row at 250K tokens of context) and reduce each score
+ * with five shuffles.  4 heads of 128 dims.
+ *
+ * idx_score_body gives lane l the products of dims l, l+32, l+64, l+96, in
+ * that order, as fused multiply-adds, then adds the 32 lane values with a
+ * butterfly over lanes (l, l^16), then (l, l^8), down to (l, l^1).  Taken in
+ * bit-reversed lane order that butterfly is a binary counter: each lane
+ * value merges at once with the pending subtrees of its size, so a score
+ * keeps at most four partial sums per half of the lanes (the even lanes,
+ * then the odd ones, whose two subtrees make the final add).  Shared memory
+ * holds each lane value's four dims together, as floats: queries [l][row],
+ * keys [l][block].  A thread scores rows 16 wr + lr + 4 m of blocks
+ * 32 wc + lc + 8 j (m, j < 4), and loads the next head's queries while it
+ * multiplies this head's. */
+enum { SCORE_ROWS = 32, SCORE_BLOCKS = 128 };
+constexpr unsigned SCORE_MM_SMEM = (32 * SCORE_ROWS + 32 * SCORE_BLOCKS) * 16;
+
+__device__ __forceinline__ unsigned u4_word(const uint4 &v, unsigned k) {
+    return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w;
+}
+
+__global__ void __launch_bounds__(256, 1) idx_score_mm(float *out, unsigned *tiles, const float *q,
+        const __half *key, unsigned N, unsigned T, unsigned pos0, unsigned ratio, unsigned nt) {
+    extern __shared__ float4 score_smem[];
+    float4 (*qs)[SCORE_ROWS] = (float4 (*)[SCORE_ROWS])score_smem;
+    float4 (*ks)[SCORE_BLOCKS] = (float4 (*)[SCORE_BLOCKS])(score_smem + 32 * SCORE_ROWS);
+    pdl_enter_early();
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lr = lane & 3, lc = lane >> 2;
+    const unsigned wr = w & 1, wc = w >> 1;
+    const unsigned t0 = blockIdx.y * SCORE_ROWS, b0 = blockIdx.x * SCORE_BLOCKS;
+    const unsigned rows = min(T - t0, (unsigned)SCORE_ROWS);
+    if (b0 >= (pos0 + t0 + rows) / ratio) {
+        /* no row of the tile sees these blocks */
+        for (unsigned m = 0; m < 4; m++) {
+            const unsigned t = t0 + 16 * wr + lr + 4 * m;
+            for (unsigned j = 0; j < 4 && t < T; j++) {
+                const unsigned b = b0 + 32 * wc + lc + 8 * j;
+                if (b < N) out[(uint64_t)t * N + b] = -3e38f;
+                if (tiles && !lc && b < N) tiles[(uint64_t)t * nt + b / 8] = 0;
+            }
+        }
+        return;
+    }
+    #pragma unroll
+    for (unsigned k = 0; k < 2; k++) {
+        /* dims 8 cg .. 8 cg + 7 of each quarter of a key: lane values 8 cg + e */
+        const unsigned bi = (w & 3) * 32 + lane, cg = (w >> 2) * 2 + k, b = b0 + bi;
+        uint4 v[4];
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            v[i] = b < N ? *(const uint4 *)(key + (uint64_t)b * 128 + 32 * i + 8 * cg) : make_uint4(0, 0, 0, 0);
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) {
+            float f[4];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                const unsigned x = u4_word(v[i], e / 2);
+                f[i] = __half2float(__ushort_as_half((unsigned short)(e & 1 ? x >> 16 : x & 0xffff)));
+            }
+            ks[8 * cg + e][bi] = make_float4(f[0], f[1], f[2], f[3]);
+        }
+    }
+    /* dims 4 w .. 4 w + 3 of each quarter of row lane's query: lane values 4 w + e */
+    float4 pf[4];
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++)
+        pf[i] = lane < rows ? *(const float4 *)(q + (uint64_t)(t0 + lane) * 512 + 32 * i + 4 * w) : make_float4(0, 0, 0, 0);
+    float acc[4][4];
+    #pragma unroll
+    for (unsigned m = 0; m < 4; m++)
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) acc[m][j] = 0;
+    for (unsigned h = 0; h < 4; h++) {
+        __syncthreads();
+        qs[4 * w + 0][lane] = make_float4(pf[0].x, pf[1].x, pf[2].x, pf[3].x);
+        qs[4 * w + 1][lane] = make_float4(pf[0].y, pf[1].y, pf[2].y, pf[3].y);
+        qs[4 * w + 2][lane] = make_float4(pf[0].z, pf[1].z, pf[2].z, pf[3].z);
+        qs[4 * w + 3][lane] = make_float4(pf[0].w, pf[1].w, pf[2].w, pf[3].w);
+        __syncthreads();
+        if (h < 3) {
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++)
+                pf[i] = lane < rows ? *(const float4 *)(q + (uint64_t)(t0 + lane) * 512 + (h + 1) * 128 + 32 * i + 4 * w)
+                                    : make_float4(0, 0, 0, 0);
+        }
+        float even[16], sum[16];
+        #pragma unroll 1
+        for (unsigned half = 0; half < 2; half++) {
+            const float4 *qp = &qs[half][16 * wr + lr];
+            const float4 *kp = &ks[half][32 * wc + lc];
+            float st[4][16], node[16];
+            #pragma unroll
+            for (unsigned s = 0; s < 16; s++) {
+                /* lane value l2 + half, l2 = 2 bitrev4(s) */
+                const unsigned l2 = ((s & 1) << 4) | ((s & 2) << 2) | (s & 4) | ((s & 8) >> 2);
+                float4 qv[4], kv[4];
+                #pragma unroll
+                for (unsigned m = 0; m < 4; m++) qv[m] = qp[l2 * SCORE_ROWS + 4 * m];
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) kv[j] = kp[l2 * SCORE_BLOCKS + 8 * j];
+                #pragma unroll
+                for (unsigned p = 0; p < 16; p++) {
+                    const float4 a = qv[p >> 2], c = kv[p & 3];
+                    float v = __fmaf_rn(a.x, c.x, 0.0f);
+                    v = __fmaf_rn(a.y, c.y, v);
+                    v = __fmaf_rn(a.z, c.z, v);
+                    v = __fmaf_rn(a.w, c.w, v);
+                    #pragma unroll
+                    for (unsigned lv = 0; lv < 4; lv++) {
+                        if (!(s >> lv & 1)) { st[lv][p] = v; break; }
+                        v = st[lv][p] + v;
+                    }
+                    if (s == 15) node[p] = v;
+                }
+            }
+            #pragma unroll
+            for (unsigned p = 0; p < 16; p++) {
+                if (half) sum[p] = even[p] + node[p];
+                else even[p] = node[p];
+            }
+        }
+        #pragma unroll
+        for (unsigned p = 0; p < 16; p++) acc[p >> 2][p & 3] += fmaxf(sum[p], 0);
+    }
+    #pragma unroll
+    for (unsigned m = 0; m < 4; m++) {
+        const unsigned t = t0 + 16 * wr + lr + 4 * m, visible = (pos0 + t + 1) / ratio;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const unsigned b = b0 + 32 * wc + lc + 8 * j;
+            const bool in = t < T && b < N;
+            const float sc = b < visible ? acc[m][j] : -3e38f;
+            if (in) __stcs(out + (uint64_t)t * N + b, sc);
+            if (tiles) {
+                /* the tile's eight blocks sit in the lanes of this row */
+                unsigned top = in ? __float_as_uint(fmaxf(sc, 0)) : 0;
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 4));
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 8));
+                top = max(top, __shfl_xor_sync(0xffffffffu, top, 16));
+                if (!lc && in) tiles[(uint64_t)t * nt + b / 8] = top;
+            }
+        }
+    }
+}
+
 /* Inclusive prefix sums of a and b over the 256 threads of the block, in
  * thread order: a warp shuffle scan, then the preceding warps' totals. */
 __device__ __forceinline__ void block_scan256(unsigned &a, unsigned &b, unsigned (*tot)[8]) {
@@ -546,12 +694,15 @@ __host__ __device__ __forceinline__ unsigned idx_select_wide_smem(unsigned N, bo
 template<unsigned NT, unsigned NB>
 __device__ __forceinline__ void sel_find(const unsigned *hist, unsigned need, unsigned *tot, unsigned *res) {
     constexpr unsigned BPT = NB / NT;
-    static_assert(BPT == 1 || BPT == 4, "sel_find reads one or four bins a thread");
+    static_assert(BPT == 1 || BPT % 4 == 0, "sel_find reads one bin a thread or a multiple of four");
     const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5, top = NB - 1 - threadIdx.x * BPT;
     unsigned h[BPT];
-    if constexpr (BPT == 4) {
-        const uint4 v = *(const uint4 *)(hist + NB - 4 * (threadIdx.x + 1));
-        h[0] = v.w; h[1] = v.z; h[2] = v.y; h[3] = v.x;
+    if constexpr (BPT % 4 == 0) {
+        #pragma unroll
+        for (unsigned c = 0; c < BPT / 4; c++) {
+            const uint4 v = *(const uint4 *)(hist + NB - BPT * threadIdx.x - 4 * (c + 1));
+            h[4 * c] = v.w; h[4 * c + 1] = v.z; h[4 * c + 2] = v.y; h[4 * c + 3] = v.x;
+        }
     } else {
         h[0] = hist[top];
     }
@@ -810,6 +961,414 @@ __global__ void __launch_bounds__(1024) idx_select_wide(int *out, const float *s
     const unsigned t = blockIdx.x;
     idx_select_wide_body<1024>(out + (uint64_t)t * K, score + (uint64_t)t * N,
                                tiles ? tiles + (uint64_t)t * ((N + 7) / 8) : nullptr, N, K, wsm);
+}
+
+/* Prefill rows at long context: approximate scores from tensor cores, exact
+ * scores wherever the top-k selection can tell them apart.
+ *
+ * idx_score_tc multiplies half queries (each row scaled by a power of two
+ * to [2^14, 2^15) at its largest element) with the half keys and writes
+ * approximate scores a and their 8-block tile maxima.  Let delta bound
+ * |a - s| over a row, s its exact scores (idx_score_body), and tau be at
+ * most the k-th largest approximate tile maximum: k blocks of the row have
+ * a >= tau, so the k-th largest exact key thr is at least tau - delta, and
+ * a block with a < tau - 2 delta has s < thr and a < thr.  idx_tc_exact
+ * rescores every other visible block and rewrites the maxima of their
+ * tiles.  The row then holds the exact key of each block at or above thr
+ * and keys below thr elsewhere, every tile maximum the largest key of its
+ * tile, so the selection takes the same slots as from exact scores.
+ *
+ * delta, per head h with query q, rounding error r and key k: |r . k| <=
+ * |r| |k| (Cauchy-Schwarz) for the half queries.  The tensor cores multiply
+ * halves exactly and add the 128 products in eight steps; on this GPU a
+ * step aligns 16 products and the accumulator to the largest with 25
+ * fraction bits, truncating, and truncates the sum to FP32 (Khattak and
+ * Mikaitis, arXiv 2512.07004, measured on the RTX PRO 6000): at most
+ * 5.25 2^-23 of the terms' magnitudes per step, under 2^-17 of
+ * sum |q_i k_i| <= |q| |k| over the eight.  The reference's fused
+ * multiply-adds and butterfly round each product at most nine times,
+ * gamma_9 < 2^-20, and the sums of the four relu'd heads six more times.
+ * idx_tc_prep takes E = sum_h (|r_h| + 2^-11 |q_h|) (1 + 2^-10), which
+ * covers it all with 2^-12 for the tensor cores, and idx_tc_exact
+ * delta = E max |k| (1 + 2^-9) + 2^-50 (max |k| + 1), the last term for
+ * values flushed to zero (the build flushes subnormals). */
+enum { TC_WARPS = 8, TC_BLK = 64, TC_KROW = 136, TC_SPAN = 1024, TC_KEYS = 256 };
+
+/* Rows: one warp each, blocks [0, row_blocks).  qf holds the row's half
+ * queries in fragment order (64 words for thread j of each quad: words
+ * 32 mt + 4 ks + i, mt the m-tile, ks the k-step, i the fragment register)
+ * and info the power of two undoing the scale and E (infinite when the
+ * row is not finite).  Keys: TC_KEYS a block past those; kt holds key b in
+ * the order idx_exact_score reads it (16 bytes 2 u + h2: lane values
+ * l2(2 u) + h2 and l2(2 u + 1) + h2, l2(s) = 2 bitrev4(s), each as dims
+ * l + 32 i) and kmax the largest key norm of the block (infinite if any
+ * key is not finite). */
+__global__ void __launch_bounds__(256) idx_tc_prep(uint32_t *qf, float2 *info, uint4 *kt, float *kmax,
+        const float *q, const __half *key, unsigned T, unsigned N, unsigned row_blocks) {
+    __shared__ __align__(16) unsigned short hq[8][512];
+    __shared__ float wmax[8];
+    pdl_enter_early();
+    const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (blockIdx.x >= row_blocks) {
+        const unsigned b = (blockIdx.x - row_blocks) * TC_KEYS + threadIdx.x;
+        float ss = 0;
+        if (b < N) {
+            uint32_t k[64];
+            const uint4 *src = (const uint4 *)(key + (uint64_t)b * 128);
+            #pragma unroll
+            for (unsigned i = 0; i < 16; i++) {
+                const uint4 v = src[i];
+                k[4 * i] = v.x; k[4 * i + 1] = v.y; k[4 * i + 2] = v.z; k[4 * i + 3] = v.w;
+            }
+            #pragma unroll
+            for (unsigned m = 0; m < 64; m++) {
+                const float2 f = __half22float2(*(const __half2 *)&k[m]);
+                ss = fmaf(f.x, f.x, ss);
+                ss = fmaf(f.y, f.y, ss);
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 16; i++) {
+                const unsigned s = i & ~1u, h2 = i & 1;
+                const unsigned la = ((s & 2) << 2 | (s & 4) | (s & 8) >> 2) + h2, lb = la + 16;   /* l2(s), l2(s + 1) */
+                /* dim d is half d & 1 of word d / 2 */
+                #define KT_HALF(d) (((d) & 1) ? (k[(d) / 2] >> 16) : (k[(d) / 2] & 0xffffu))
+                kt[(uint64_t)b * 16 + i] = make_uint4(KT_HALF(la) | KT_HALF(la + 32) << 16,
+                                                      KT_HALF(la + 64) | KT_HALF(la + 96) << 16,
+                                                      KT_HALF(lb) | KT_HALF(lb + 32) << 16,
+                                                      KT_HALF(lb + 64) | KT_HALF(lb + 96) << 16);
+                #undef KT_HALF
+            }
+        }
+        float n = ss <= FLT_MAX ? sqrtf(ss) : INFINITY;
+        for (unsigned o = 16; o; o >>= 1) n = fmaxf(n, __shfl_xor_sync(~0u, n, o));
+        if (!lane) wmax[w] = n;
+        __syncthreads();
+        if (!threadIdx.x) {
+            float m = 0;
+            for (unsigned i = 0; i < 8; i++) m = fmaxf(m, wmax[i]);
+            kmax[blockIdx.x - row_blocks] = m;
+        }
+        return;
+    }
+    const unsigned t = blockIdx.x * 8 + w;
+    if (t >= T) return;
+    /* lane: dims 16 lane .. 16 lane + 15, of head lane / 8 */
+    float v[16];
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++) {
+        const float4 x = *(const float4 *)(q + (uint64_t)t * 512 + 16 * lane + 4 * i);
+        v[4 * i] = x.x; v[4 * i + 1] = x.y; v[4 * i + 2] = x.z; v[4 * i + 3] = x.w;
+    }
+    float mx = 0;
+    bool fin = true;
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) { mx = fmaxf(mx, fabsf(v[i])); fin = fin && isfinite(v[i]); }
+    for (unsigned o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    fin = __all_sync(~0u, fin);
+    int ex = 15;
+    if (fin && mx > 0) frexpf(mx, &ex);   /* mx in [2^(ex-1), 2^ex) */
+    const int e = max(-126, min(127, 15 - ex));
+    const float sc = ldexpf(1.0f, e), inv = ldexpf(1.0f, -e);
+    float qq = 0, rr = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) {
+        const __half h = __float2half_rn(v[i] * sc);
+        const float r = v[i] - __half2float(h) * inv;
+        hq[w][16 * lane + i] = __half_as_ushort(h);
+        qq = fmaf(v[i], v[i], qq);
+        rr = fmaf(r, r, rr);
+    }
+    for (unsigned o = 1; o < 8; o <<= 1) {
+        qq += __shfl_xor_sync(~0u, qq, o);
+        rr += __shfl_xor_sync(~0u, rr, o);
+    }
+    float E = sqrtf(rr) + ldexpf(sqrtf(qq), -11);
+    E += __shfl_xor_sync(~0u, E, 8);
+    E += __shfl_xor_sync(~0u, E, 16);
+    if (!lane) info[t] = make_float2(inv, fin ? E * (1.0f + 0x1p-10f) : INFINITY);
+    __syncwarp();
+    /* lane: words 8 (lane & 7) .. + 7 of thread j = lane / 8 */
+    const unsigned j = lane >> 3, r0 = (lane & 7) * 8;
+    uint32_t wd[8];
+    #pragma unroll
+    for (unsigned u = 0; u < 8; u++) {
+        const unsigned r = r0 + u, mt = r >> 5, ks = (r >> 2) & 7, i = r & 3;
+        const unsigned at = (2 * mt + (i & 1)) * 128 + 16 * ks + 2 * j + 8 * (i >> 1);
+        wd[u] = hq[w][at] | (uint32_t)hq[w][at + 1] << 16;
+    }
+    uint4 *dst = (uint4 *)(qf + ((uint64_t)t * 4 + j) * 64 + r0);
+    dst[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+    dst[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
+}
+
+/* Approximate scores and tile maxima: a block of W warps takes 8 W rows
+ * and blocks [x span, (x + 1) span), staged TC_BLK keys at a time.  Warp w
+ * multiplies the four heads of rows 8 w .. 8 w + 7 (m-tile mt rows g and
+ * g + 8: heads 2 mt and 2 mt + 1 of row g), its query fragments held in
+ * registers, with NC blocks at a time. */
+template<unsigned NC, unsigned W>
+__global__ void __launch_bounds__(32 * W, 16 / W) idx_score_tc(float *out, unsigned *tiles, const uint32_t *qf,
+        const float2 *info, const __half *key, unsigned N, unsigned T, unsigned pos0, unsigned ratio,
+        unsigned nt, unsigned span) {
+    constexpr unsigned NT = 32 * W, TOK = 8 * W;
+    __shared__ __align__(16) __half kst[2][TC_BLK][TC_KROW];
+    pdl_enter_early();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, j = lane & 3;
+    const unsigned t0 = blockIdx.y * TOK, t = t0 + 8 * w + g, rows = min(T - t0, TOK);
+    const unsigned b_lo = blockIdx.x * span, b_hi = min(N, b_lo + span);
+    const unsigned seen = min(b_hi, (pos0 + t0 + rows) / ratio);
+    const unsigned nst = seen > b_lo ? (seen - b_lo + TC_BLK - 1) / TC_BLK : 0;
+    const unsigned fill = min(b_hi, b_lo + nst * TC_BLK);
+    if (fill < b_hi) {
+        /* blocks no row of the panel sees */
+        const unsigned nb = b_hi - fill;
+        for (unsigned i = tid; i < rows * nb; i += NT) {
+            const unsigned r = i / nb, b = fill + i % nb;
+            out[(uint64_t)(t0 + r) * N + b] = -3e38f;
+            if (tiles && !(b & 7)) tiles[(uint64_t)(t0 + r) * nt + b / 8] = 0;
+        }
+    }
+    if (!nst) return;
+    uint32_t a[2][8][4];
+    {
+        const uint4 *src = (const uint4 *)(qf + ((uint64_t)min(t, T - 1) * 4 + j) * 64);
+        #pragma unroll
+        for (unsigned i = 0; i < 16; i++) {
+            const uint4 v = t < T ? src[i] : make_uint4(0, 0, 0, 0);
+            a[i / 8][i % 8][0] = v.x; a[i / 8][i % 8][1] = v.y; a[i / 8][i % 8][2] = v.z; a[i / 8][i % 8][3] = v.w;
+        }
+    }
+    const float inv = t < T ? info[t].x : 0.0f;
+    const unsigned vis = t < T ? (pos0 + t + 1) / ratio : 0;
+    #pragma unroll 1
+    for (unsigned s = 0; s <= nst; s++) {
+        if (s < nst) {
+            const unsigned b0 = b_lo + s * TC_BLK;
+            #pragma unroll
+            for (unsigned c = tid; c < TC_BLK * 16; c += NT) {
+                const unsigned r = c >> 4, d = (c & 15) * 8, b = b0 + r;
+                tt_cp_async_16B(&kst[s & 1][r][d], key + (uint64_t)(b < N ? b : 0) * 128 + d, b < N);
+            }
+            tt_cp_async_commit();
+        }
+        if (!s) continue;
+        if (s < nst) tt_cp_async_wait_group<1>();
+        else tt_cp_async_wait_group<0>();
+        __syncthreads();
+        const unsigned buf = (s - 1) & 1, b0 = b_lo + (s - 1) * TC_BLK;
+        #pragma unroll 1
+        for (unsigned c0 = 0; c0 < TC_BLK; c0 += NC) {
+            float acc[2][NC / 8][4];
+            #pragma unroll
+            for (unsigned mt = 0; mt < 2; mt++)
+                #pragma unroll
+                for (unsigned n = 0; n < NC / 8; n++)
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; i++) acc[mt][n][i] = 0;
+            #pragma unroll
+            for (unsigned ks = 0; ks < 8; ks++) {
+                uint32_t bf[NC / 8][2];
+                #pragma unroll
+                for (unsigned p = 0; p < NC / 16; p++) {
+                    uint32_t r4[4];
+                    tt_ldmatrix_x4(r4, &kst[buf][c0 + 16 * p + (lane & 7) + 8 * (lane >> 4)][16 * ks + 8 * ((lane >> 3) & 1)]);
+                    bf[2 * p][0] = r4[0]; bf[2 * p][1] = r4[1]; bf[2 * p + 1][0] = r4[2]; bf[2 * p + 1][1] = r4[3];
+                }
+                #pragma unroll
+                for (unsigned mt = 0; mt < 2; mt++)
+                    #pragma unroll
+                    for (unsigned n = 0; n < NC / 8; n++) tt_mma_m16n8k16_f16_f32(acc[mt][n], a[mt][ks], bf[n]);
+            }
+            #pragma unroll
+            for (unsigned n = 0; n < NC / 8; n++) {
+                const unsigned b = b0 + c0 + 8 * n + 2 * j;
+                float sc[2];
+                #pragma unroll
+                for (unsigned e = 0; e < 2; e++) {
+                    sc[e] = 0;
+                    sc[e] += fmaxf(acc[0][n][e], 0);
+                    sc[e] += fmaxf(acc[0][n][2 + e], 0);
+                    sc[e] += fmaxf(acc[1][n][e], 0);
+                    sc[e] += fmaxf(acc[1][n][2 + e], 0);
+                    sc[e] = b + e < vis ? sc[e] * inv : -3e38f;
+                }
+                /* blocks b, b + 1: one 8-byte store when the row length is even */
+                float *o = out + (uint64_t)t * N + b;
+                if (t < T) {
+                    if (!(N & 1) && b + 1 < N) __stcs((float2 *)o, make_float2(sc[0], sc[1]));
+                    else {
+                        if (b < N) __stcs(o, sc[0]);
+                        if (b + 1 < N) __stcs(o + 1, sc[1]);
+                    }
+                }
+                unsigned top = b < N ? __float_as_uint(fmaxf(sc[0], 0)) : 0;
+                if (b + 1 < N) top = max(top, __float_as_uint(fmaxf(sc[1], 0)));
+                top = max(top, __shfl_xor_sync(~0u, top, 1));
+                top = max(top, __shfl_xor_sync(~0u, top, 2));
+                const unsigned tile = (b0 + c0) / 8 + n;
+                if (!j && t < T && tile < nt) tiles[(uint64_t)t * nt + tile] = top;
+            }
+        }
+        __syncthreads();
+    }
+#endif
+}
+
+/* The score of idx_score_mm (and idx_score_body) for one row and block,
+ * two lanes a block: lane half h2 (0 the even lane values, 1 the odd ones)
+ * counts its 16 lane values of the four heads from qs[h][l] (dims l + 32 i
+ * of head h) and the transposed key of idx_tc_prep; the even lane returns
+ * the score. */
+__device__ __forceinline__ float idx_exact_score(const float4 (*qs)[32], const uint4 *kt, unsigned h2) {
+    float st[4][4], node[4];
+    uint4 kp;
+    #pragma unroll
+    for (unsigned s = 0; s < 16; s++) {
+        const unsigned l2 = ((s & 1) << 4) | ((s & 2) << 2) | (s & 4) | ((s & 8) >> 2);
+        if (!(s & 1)) kp = kt[s + h2];   /* steps s and s + 1 of this half: the two lanes read one 32-byte sector */
+        const uint32_t kx = s & 1 ? kp.z : kp.x, ky = s & 1 ? kp.w : kp.y;
+        const float2 k0 = __half22float2(*(const __half2 *)&kx), k1 = __half22float2(*(const __half2 *)&ky);
+        #pragma unroll
+        for (unsigned h = 0; h < 4; h++) {
+            const float4 a = qs[h][l2 + h2];
+            float v = __fmaf_rn(a.x, k0.x, 0.0f);
+            v = __fmaf_rn(a.y, k0.y, v);
+            v = __fmaf_rn(a.z, k1.x, v);
+            v = __fmaf_rn(a.w, k1.y, v);
+            #pragma unroll
+            for (unsigned lv = 0; lv < 4; lv++) {
+                if (!(s >> lv & 1)) { st[h][lv] = v; break; }
+                v = st[h][lv] + v;
+            }
+            if (s == 15) node[h] = v;
+        }
+    }
+    float acc = 0;
+    #pragma unroll
+    for (unsigned h = 0; h < 4; h++) acc += fmaxf(node[h] + __shfl_down_sync(~0u, node[h], 1), 0);
+    return acc;
+}
+
+/* Per row: cut = tau - 2 delta rounded down, tau the largest 22-bit prefix
+ * with at least k approximate tile maxima at or above it (bisection on its
+ * bits), or -inf (every visible block) when k tiles or fewer are visible or
+ * delta is not finite.  The visible blocks whose approximate key reaches
+ * cut then get exact scores, a batch of at most TC_CAND tiles holding them
+ * at a time, and those tiles the maxima of their exact and remaining
+ * approximate keys.  Each thread holds TC_LOADS tile maxima at a time. */
+enum { TC_CAND = 768, TC_LOADS = 32 };
+
+__global__ void __launch_bounds__(256, 3) idx_tc_exact(float *out, unsigned *tiles, const float *q, const uint4 *kt,
+        const float2 *info, const float *kmax, unsigned nk, unsigned N, unsigned pos0, unsigned ratio, unsigned nt,
+        unsigned K) {
+    __shared__ float4 qs[4][32];
+    __shared__ unsigned ctile[TC_CAND], cmax[TC_CAND], cblk[8 * TC_CAND], cnt[2][8], wt[8], ncb;
+    __shared__ float wm[8];
+    pdl_enter_early();
+    const unsigned t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const unsigned vis = min(N, (pos0 + t + 1) / ratio), ntv = (vis + 7) / 8;
+    float *srow = out + (uint64_t)t * N;
+    unsigned *trow = tiles + (uint64_t)t * nt;
+    if (tid < 128) {
+        const float *qh = q + (uint64_t)t * 512 + (tid >> 5) * 128 + lane;
+        qs[tid >> 5][lane] = make_float4(qh[0], qh[32], qh[64], qh[96]);
+    }
+    float km = 0;
+    for (unsigned i = tid; i < nk; i += 256) km = fmaxf(km, kmax[i]);
+    for (unsigned o = 16; o; o >>= 1) km = fmaxf(km, __shfl_xor_sync(~0u, km, o));
+    if (!lane) wm[w] = km;
+    unsigned v[TC_LOADS];   /* tile maxima tid + 256 j (0 past ntv) */
+    #pragma unroll
+    for (unsigned j = 0; j < TC_LOADS; j++) v[j] = tid + 256 * j < ntv ? trow[tid + 256 * j] : 0;
+    __syncthreads();
+    km = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 8; i++) km = fmaxf(km, wm[i]);
+    const float delta = info[t].y * km * (1.0f + 0x1p-9f) + 0x1p-50f * (km + 1.0f);
+    float c = -INFINITY;
+    if (ntv > K && delta <= FLT_MAX) {
+        unsigned x = 0;
+        for (unsigned bit = 30; bit >= 10; bit--) {
+            const unsigned y = x | 1u << bit;
+            unsigned n = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < TC_LOADS; j++) n += v[j] >= y;
+            for (unsigned i = 256 * TC_LOADS + tid; i < ntv; i += 256) n += trow[i] >= y;
+            n = __reduce_add_sync(~0u, n);
+            if (!lane) cnt[bit & 1][w] = n;
+            __syncthreads();
+            n = 0;
+            #pragma unroll
+            for (unsigned i = 0; i < 8; i++) n += cnt[bit & 1][i];
+            if (n >= K) x = y;
+        }
+        const float cc = __fsub_rd(__uint_as_float(x), 2 * delta);
+        if (cc > 0) c = cc;
+    }
+    unsigned hits0 = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < TC_LOADS; j++) if (tid + 256 * j < ntv && __uint_as_float(v[j]) >= c) hits0 |= 1u << j;
+    for (unsigned c0 = 0; c0 < ntv; c0 += 256 * TC_LOADS) {
+        /* candidate tiles c0 + tid + 256 j, numbered in thread order */
+        unsigned hits = hits0;
+        if (c0) {
+            hits = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < TC_LOADS; j++) {
+                const unsigned i = c0 + tid + 256 * j;
+                if (i < ntv && __uint_as_float(trow[i]) >= c) hits |= 1u << j;
+            }
+        }
+        const unsigned cn = __popc(hits);
+        unsigned incl = cn;
+        for (unsigned o = 1; o < 32; o <<= 1) {
+            const unsigned y = __shfl_up_sync(~0u, incl, o);
+            if (lane >= o) incl += y;
+        }
+        if (lane == 31) wt[w] = incl;
+        __syncthreads();
+        unsigned off = incl - cn, total = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < 8; i++) { off += i < w ? wt[i] : 0; total += wt[i]; }
+        for (unsigned base = 0; base < total; base += TC_CAND) {
+            unsigned k = off;
+            for (unsigned m = hits; m; m &= m - 1, k++)
+                if (k >= base && k < base + TC_CAND) ctile[k - base] = c0 + tid + 256 * (__ffs(m) - 1);
+            if (!tid) ncb = 0;
+            __syncthreads();
+            const unsigned n_t = min(total - base, (unsigned)TC_CAND);
+            /* the batch's blocks reaching cut; the others' keys start the maxima */
+            for (unsigned s = tid; s < n_t; s += 256) {
+                const unsigned tile = ctile[s];
+                unsigned mx = 0;
+                for (unsigned e = 0; e < 8 && 8 * tile + e < vis; e++) {
+                    const unsigned key = __float_as_uint(fmaxf(srow[8 * tile + e], 0));
+                    if (__uint_as_float(key) >= c) cblk[atomicAdd(&ncb, 1u)] = s << 3 | e;
+                    else mx = max(mx, key);
+                }
+                cmax[s] = mx;
+            }
+            __syncthreads();
+            const unsigned n_b = ncb;
+            #pragma unroll 1
+            for (unsigned i0 = 0; i0 < n_b; i0 += 128) {
+                const unsigned i = i0 + (tid >> 1), x = cblk[i < n_b ? i : 0], s = x >> 3, b = 8 * ctile[s] + (x & 7);
+                /* the queries are read where used, not hoisted out of the loop */
+                const float4 (*qp)[32] = qs;
+                asm volatile("" : "+l"(qp));
+                const float sc = idx_exact_score(qp, kt + (uint64_t)b * 16, tid & 1);
+                if (i < n_b && !(tid & 1)) {
+                    srow[b] = sc;
+                    atomicMax(&cmax[s], __float_as_uint(fmaxf(sc, 0)));
+                }
+            }
+            __syncthreads();
+            for (unsigned s = tid; s < n_t; s += 256) trow[ctile[s]] = cmax[s];
+            __syncthreads();
+        }
+        __syncthreads();   /* wt is rewritten by the next chunk */
+    }
 }
 
 __device__ __forceinline__ void idx_expand_body(int *out, unsigned *count, const int *blocks,
@@ -1094,6 +1653,160 @@ __global__ void attention_group(float *out, float *partial, const float *q, cons
     attention_group_body(out+(uint64_t)t*H*D,partial ? partial+(uint64_t)t*H*64*(D+2) : nullptr,
         q+(uint64_t)t*H*D,gate+(uint64_t)t*H*D,kc,vc,sparse ? sel+(uint64_t)t*stride : nullptr,
         sparse ? counts+t : nullptr,H,Hkv,pos0+t,stride,sparse,scale,splits,(keys+splits-1)/splits,0);
+}
+
+/* Prefill rows (one split): attention_group_body's arithmetic with the key
+ * gathers overlapped.  attention_group_body waits for each tile's
+ * positions, then its keys, then its values; here the values load during
+ * the tile's key products, the next tile's keys during its softmax and
+ * value products, and the positions two tiles ahead.  Keys and values get
+ * a tile each, so the queries keep only their group's rows (rows past it
+ * read a zero chunk) and the tiles swizzle their 16-byte chunks by row
+ * instead of padding: two blocks per SM.  Groups of at most 12 heads. */
+__device__ __forceinline__ unsigned kv_chunk(unsigned r, unsigned c) { return (c ^ (r & 7)) * 8; }
+
+__global__ void __launch_bounds__(256, 2) attention_group_pipe(float *out, const float *q, const float *gate,
+        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+#if __CUDA_ARCH__ >= 800
+    pdl_enter_early();
+    const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32, t = blockIdx.y;
+    const unsigned kh = blockIdx.x, group = H/Hkv;
+    const unsigned qr = tid/16, col = tid%16, h = kh*group+qr, pos = pos0+t;
+    q += (uint64_t)t*H*D; gate += (uint64_t)t*H*D; out += (uint64_t)t*H*D;
+    if (sparse) { sel += (uint64_t)t*stride; counts += t; }
+    const unsigned n = sparse ? counts[0] : pos+1, tiles = (n+31)/32;
+    __shared__ __align__(128) __half kt[32][256], vt[32][256];
+    __shared__ __align__(16) __half qh[12][264], ql[12][264];
+    __shared__ __align__(16) __half zero[8];
+    union Scores { float part[2][12][32]; __half prob[2][12][40]; };
+    __shared__ __align__(16) Scores scores;
+    __shared__ float qs[16], max_score[16], denom[16], correction[16];
+    __shared__ unsigned positions[2][32];
+    float mx = 0;
+    for (unsigned d = col; d < D; d += 16)
+        if (qr < group) mx = fmaxf(mx,fabsf(q[(uint64_t)h*D+d]*scale));
+    for (unsigned off = 8; off; off /= 2) mx = fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,off,16));
+    const int exp = mx > 0 ? max(-120,min(120,(int)((__float_as_uint(mx)>>23)&255)-127)) : 0;
+    const float inv = ldexpf(1,-exp);
+    if (!col) { qs[qr] = ldexpf(1,exp); max_score[qr] = -3e38f; denom[qr] = 0; correction[qr] = 0; }
+    if (qr < 12)
+        for (unsigned d = col; d < D; d += 16) {
+            const float v = qr < group ? q[(uint64_t)h*D+d]*scale*inv : 0;
+            qh[qr][d] = __float2half_rn(v);
+            ql[qr][d] = __float2half_rn((v-__half2float(qh[qr][d]))*4096);
+        }
+    if (tid < 8) zero[tid] = __float2half_rn(0);
+    /* tile j's positions, as attention_group_body takes them */
+    auto position = [&](unsigned j) {
+        const unsigned p = j < n ? (sparse ? (unsigned)sel[j] : j) : UINT_MAX;
+        return p <= pos ? p : UINT_MAX;
+    };
+    unsigned next = 0;
+    if (tid < 32) { positions[0][tid] = position(tid); next = position(32+tid); }
+    __syncthreads();
+    auto gather = [&](__half (*dst)[256], const __half *src, const unsigned *ps) {
+        for (unsigned i = tid*8; i < 32*D; i += 256*8) {
+            const unsigned r = i/D, c = (i%D)/8, p = ps[r];
+            tt_cp_async_16B(&dst[r][kv_chunk(r,c)],src+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+c*8,p != UINT_MAX);
+        }
+        tt_cp_async_commit();
+    };
+    if (tiles) gather(kt,kc,positions[0]);
+    float result[4][4] = {};
+    const unsigned split = warp/4, key0 = (warp%4)*8;
+    for (unsigned j = 0; j < tiles; j++) {
+        const unsigned *ps = positions[j&1];
+        if (tid < 32) positions[(j+1)&1][tid] = next;
+        tt_cp_async_wait_group<0>();
+        __syncthreads();
+        gather(vt,vc,ps);
+        if (tid < 32) next = position((j+2)*32+tid);
+        float hi[4] = {}, lo[4] = {};
+        for (unsigned k = split*128; k < (split+1)*128; k += 16) {
+            uint32_t ah[4], al[4], b[2];
+            const unsigned r = lane%16, c = k+(lane/16)*8;
+            tt_ldmatrix_x4(ah,r < 12 ? &qh[r][c] : zero);
+            tt_ldmatrix_x4(al,r < 12 ? &ql[r][c] : zero);
+            tt_ldmatrix_x2(b,&kt[key0+lane%8][kv_chunk(key0+lane%8,k/8+(lane%16)/8)]);
+            tt_mma_m16n8k16_f16_f32(hi,ah,b);
+            tt_mma_m16n8k16_f16_f32(lo,al,b);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            if (tt_mma_c_i(lane,i) < 12)
+                scores.part[split][tt_mma_c_i(lane,i)][key0+tt_mma_c_j(lane,i)] = hi[i]+lo[i]*0x1p-12f;
+        __syncthreads();
+        const bool more = j+1 < tiles;
+        if (more) gather(kt,kc,positions[(j+1)&1]);
+        float prob[2] = {}, peak = 0, old = 0, total = 0;
+        if (qr < 12) {
+            peak = max_score[qr];
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                const unsigned key = col+i*16;
+                prob[i] = ps[key] != UINT_MAX ? (scores.part[0][qr][key]+scores.part[1][qr][key])*qs[qr] : -3e38f;
+                peak = fmaxf(peak,prob[i]);
+            }
+        }
+        for (unsigned off = 8; off; off /= 2) peak = fmaxf(peak,__shfl_xor_sync(0xffffffff,peak,off,16));
+        if (qr < 12) {
+            old = expf(max_score[qr]-peak);
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                prob[i] = ps[col+i*16] != UINT_MAX ? expf(prob[i]-peak) : 0;
+                total += prob[i];
+            }
+        }
+        for (unsigned off = 8; off; off /= 2) total += __shfl_xor_sync(0xffffffff,total,off,16);
+        __syncthreads();
+        if (qr < 12) {
+            if (!col) {
+                correction[qr] = old;
+                max_score[qr] = peak;
+                denom[qr] = denom[qr]*old+total;
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 2; i++) {
+                const __half p = __float2half_rn(prob[i]);
+                scores.prob[0][qr][col+i*16] = p;
+                scores.prob[1][qr][col+i*16] = __float2half_rn((prob[i]-__half2float(p))*4096);
+            }
+        }
+        if (more) tt_cp_async_wait_group<1>();
+        else tt_cp_async_wait_group<0>();
+        __syncthreads();
+        #pragma unroll
+        for (unsigned tile = 0; tile < 4; tile++) {
+            float hi[4] = {}, lo[4] = {};
+            #pragma unroll
+            for (unsigned k = 0; k < 32; k += 16) {
+                uint32_t ah[4], al[4], b[2];
+                const unsigned r = lane%16, c = k+(lane/16)*8, vr = k+lane%16;
+                tt_ldmatrix_x4(ah,r < 12 ? &scores.prob[0][r][c] : zero);
+                tt_ldmatrix_x4(al,r < 12 ? &scores.prob[1][r][c] : zero);
+                tt_ldmatrix_x2_trans(b,&vt[vr][kv_chunk(vr,warp*4+tile)]);
+                tt_mma_m16n8k16_f16_f32(hi,ah,b);
+                tt_mma_m16n8k16_f16_f32(lo,al,b);
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) result[tile][i] =
+                result[tile][i]*correction[tt_mma_c_i(lane,i)]+(hi[i]+lo[i]*0x1p-12f);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned tile = 0; tile < 4; tile++) {
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++) {
+            const unsigned r = tt_mma_c_i(lane,i), d = warp*32+tile*8+tt_mma_c_j(lane,i);
+            if (r < group) {
+                const uint64_t dst = (uint64_t)(kh*group+r)*D+d;
+                out[dst] = (denom[r] > 0 ? result[tile][i]/denom[r] : 0)*sigmoid(gate[dst]);
+            }
+        }
+    }
+#endif
 }
 
 static bool tensor(const ds4_gpu_tensor *t, uint64_t bytes) {
@@ -4408,14 +5121,72 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
     return launched();
 }
 
-extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
+namespace qwen4_cuda {
+/* Launches of at least 16 rows (prefill chunks) take idx_score_mm, which
+ * gives the per-warp kernels' scores; DS4_QWEN4_IDX_SCORE_MM=0 keeps those.
+ * Read per call: decode-sized launches do not reach it. */
+static bool score_mm(unsigned T, unsigned H, unsigned D, const void *q, const void *key) {
+    if (T < 16 || H != 4 || D != 128 || ((uintptr_t)q & 15) || ((uintptr_t)key & 15)) return false;
+    const char *env = getenv("DS4_QWEN4_IDX_SCORE_MM");
+    if (env && env[0] == '0') return false;
+    static int opted = -1;
+    if (opted < 0) {
+        opted = cudaFuncSetAttribute(idx_score_mm, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)SCORE_MM_SMEM) == cudaSuccess &&
+                cudaFuncSetAttribute(idx_score_mm, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    return opted;
+}
+
+/* Of those, launches with tile maxima whose rows select from at least
+ * this many blocks (8192: every prefill chunk past 32K tokens of context)
+ * take the tensor-core scorer and rescore exactly what the selection can
+ * see; DS4_QWEN4_IDX_TC_MIN overrides (0 never).  Read per call, as
+ * score_mm. */
+static unsigned score_tc_min() {
+    const char *env = getenv("DS4_QWEN4_IDX_TC_MIN");
+    const long v = env && env[0] ? atol(env) : 8192;
+    return v > 0 ? (unsigned)v : 0;
+}
+}
+
+extern "C" int ds4_gpu_qwen4_idx_score_topk_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *key, uint32_t T, uint32_t N,
-        uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {
+        uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio, uint32_t K) {
     using namespace qwen4_cuda;
     const unsigned nt = (N + 7) / 8;
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    const unsigned tc_min = score_tc_min();
+    if (K && tiles && tc_min && N >= tc_min && !((uintptr_t)out->ptr & 7) && score_mm(T, H, D, q->ptr, key->ptr)) {
+        const unsigned rows = (T + 7) / 8, nk = (N + TC_KEYS - 1) / TC_KEYS;
+        const uint64_t kt_bytes = (uint64_t)N * 256, qf_bytes = (uint64_t)T * 1024, info_bytes = (uint64_t)T * 8;
+        char *s = (char *)cuda_tmp_alloc(kt_bytes + qf_bytes + info_bytes + (uint64_t)nk * 4,
+                                         "Qwen indexer tensor-core scratch");
+        if (!s) return 0;
+        uint4 *kt = (uint4 *)s;
+        uint32_t *qf = (uint32_t *)(s + kt_bytes);
+        float2 *info = (float2 *)(s + kt_bytes + qf_bytes);
+        float *kmax = (float *)(s + kt_bytes + qf_bytes + info_bytes);
+        launch(idx_tc_prep, rows + nk, 256, 0, qf, info, kt, kmax, (const float *)q->ptr, (const __half *)key->ptr,
+            T, N, rows);
+        launch(idx_score_tc<32, TC_WARPS>, dim3((N + TC_SPAN - 1) / TC_SPAN, (T + 8 * TC_WARPS - 1) / (8 * TC_WARPS)),
+            32 * TC_WARPS, 0, (float *)out->ptr, (unsigned *)tiles->ptr, (const uint32_t *)qf, (const float2 *)info,
+            (const __half *)key->ptr, N, T, pos0, ratio, nt, (unsigned)TC_SPAN);
+        if (getenv("DS4_QWEN4_IDX_TC_APPROX")) return launched();   /* tests: the approximate pass alone */
+        launch(idx_tc_exact, T, 256, 0, (float *)out->ptr, (unsigned *)tiles->ptr, (const float *)q->ptr,
+            (const uint4 *)kt, (const float2 *)info, (const float *)kmax, nk, N, pos0, ratio, nt, K);
+        return launched();
+    }
+    if (score_mm(T, H, D, q->ptr, key->ptr)) {
+        launch(idx_score_mm, dim3((N + SCORE_BLOCKS - 1) / SCORE_BLOCKS, (T + SCORE_ROWS - 1) / SCORE_ROWS), 256,
+            SCORE_MM_SMEM, (float *)out->ptr, tiles ? (unsigned *)tiles->ptr : (unsigned *)NULL,
+            (const float *)q->ptr, (const __half *)key->ptr, N, T, pos0, ratio, nt);
+        return launched();
+    }
     if (tiles && H <= 4 && D % 32 == 0 && D <= 128) {
 #define QWEN_SCORE_TILES(DPL) case DPL: launch(idx_score_tiles<DPL>, dim3((nt + 7) / 8, T), 256, 0, (float *)out->ptr, \
         (unsigned *)tiles->ptr, (const float *)q->ptr, (const __half *)key->ptr, N, H, pos0, ratio, nt); break
@@ -4429,6 +5200,12 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (tiles) launch(tile_max, dim3((nt + 255) / 256, T), 256, 0,
         (unsigned *)tiles->ptr, (const float *)out->ptr, N, nt);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *key, uint32_t T, uint32_t N,
+        uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {
+    return ds4_gpu_qwen4_idx_score_topk_tensor(out, tiles, q, key, T, N, H, D, pos0, ratio, 0);
 }
 
 namespace qwen4_cuda {
@@ -5085,6 +5862,24 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     return ok;
 }
 
+namespace qwen4_cuda {
+/* Prefill rows take attention_group_pipe (the same outputs as
+ * attention_group); DS4_QWEN4_ATTN_PIPE=0 keeps attention_group.  Read per
+ * call: decode rows have partial scratch and do not reach it. */
+static bool attn_pipe() {
+    const char *env = getenv("DS4_QWEN4_ATTN_PIPE");
+    if (env && env[0] == '0') return false;
+    static int carved = -1;
+    if (carved < 0) {
+        /* two blocks of 49 KB per SM */
+        carved = cudaFuncSetAttribute(attention_group_pipe, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                      cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    return true;
+}
+}
+
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
@@ -5121,7 +5916,11 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         else { QWEN_ATTN(256); }
 #undef QWEN_ATTN
     }
-    if (g0 < T) {
+    if (g0 < T && !split && H/Hkv <= 12 && attn_pipe()) {
+        const uint64_t r = (uint64_t)g0*H*D;
+        launch(attention_group_pipe, dim3(Hkv,T-g0), 256, 0, o+r, qp+r, gp+r, kp, vp,
+            sp ? sp+(uint64_t)g0*stride : nullptr, cp ? cp+g0 : nullptr, H, Hkv, pos0+g0, stride, sparse, scale);
+    } else if (g0 < T) {
         const uint64_t r = (uint64_t)g0*H*D;
         launch(attention_group, dim3(Hkv,T-g0,max_splits), 256, 0, o+r,
             part ? part+(uint64_t)g0*H*64*(D+2) : nullptr, qp+r, gp+r, kp, vp,
