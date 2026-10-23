@@ -1834,6 +1834,18 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
 
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
+/* Prefill takes matrix_half_ws, dense_f16_pipe, pack_half_rows,
+ * conv_seg, ngram_conv_seg and gdn_scan_pipe (the outputs of
+ * matrix_half_tile, dense_f16_components, pack_half_components, conv,
+ * ngram_conv and gdn_scan); DS4_QWEN4_EXPERT_WS=0, DS4_QWEN4_F16_PIPE=0,
+ * DS4_QWEN4_PACK_ROWS=0, DS4_QWEN4_CONV_SEG=0 (both convs) and
+ * DS4_QWEN4_GDN_PIPE=0 keep the originals, DS4_QWEN4_PACK_ONCE=0 a pack of
+ * the shared input per projection.  Read per call for the tests. */
+static bool env_on(const char *name) {
+    const char *env = getenv(name);
+    return !env || env[0] != '0';
+}
+
 __device__ __forceinline__ float sum(float x) {
     for (int d = 16; d; d >>= 1) x += __shfl_xor_sync(0xffffffff, x, d);
     return x;
@@ -3010,12 +3022,554 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
 #endif
 }
 
+/* Prefill expert GEMMs of the Q4 model (Q4_K gate/up, MXFP4 down): the
+ * products of matrix_half_tile, every output rounded the same way.  The
+ * operands are the same halves (value4's arithmetic, rounded to nearest)
+ * and every output takes the same m16n8k16 chain over k in order, so only
+ * the schedule differs.  matrix_half_tile dequantizes through value4's
+ * byte loads and reads each activation as a float, so a block waits on
+ * dependent loads before every k step and the tensor cores idle.
+ *
+ * matrix_half_ws runs one persistent block per SM over tiles of 256 A rows
+ * (128 gate rows and the same up rows, or 256 down rows) by 64 tokens.
+ * Eight producer warps load the weights two k steps ahead (a thread per A
+ * row), dequantize them into one of two A stages and copy the activations
+ * (packed to halves once per call) into one of three B stages a step
+ * ahead; eight consumer warps only multiply.  Named barriers hand the
+ * stages over: FULL (producers arrive, consumers wait) and EMPTY (the
+ * reverse).  An expert's last tile is partly empty: its consumers skip the
+ * 8-token columns past the expert's tokens, whose products are never
+ * stored. */
+constexpr unsigned XW_NT = 64;
+
+/* shared memory: two A stages, three B stages, two tiles' token pairs and
+ * the E2M1 levels (90,688 bytes) */
+constexpr unsigned XW_SMEM = 2*256*128+3*XW_NT*128+2*XW_NT*4+16*4;
+
+/* One row's raw weights for a 64-element k step: the Q4_K superblock
+ * header and the step's 32 bytes of nibbles, or the three aligned 16-byte
+ * chunks holding the MXFP4 step's two 17-byte blocks (byte sb onward). */
+struct xw_q4k { uint4 h, q0, q1; };
+struct xw_mxfp4 { uint4 c[3]; unsigned sb; };
+template<unsigned TYPE> struct xw_raw { typedef xw_q4k type; };
+template<> struct xw_raw<39> { typedef xw_mxfp4 type; };
+
+__device__ __forceinline__ void xw_load(xw_q4k &r, const char *row, unsigned k) {
+    const char *b = row+k/256*144;
+    r.h = __ldg((const uint4 *)b);
+    r.q0 = __ldg((const uint4 *)(b+16+k%256/64*32));
+    r.q1 = __ldg((const uint4 *)(b+32+k%256/64*32));
+}
+
+__device__ __forceinline__ void xw_load(xw_mxfp4 &r, const char *row, unsigned k) {
+    const uintptr_t a = (uintptr_t)(row+k/32*17), a16 = a&~(uintptr_t)15;
+    r.sb = (unsigned)(a&15);
+    #pragma unroll
+    for (unsigned i = 0; i < 3; i++) r.c[i] = __ldg((const uint4 *)a16+i);
+}
+
+__device__ __forceinline__ unsigned xw_byte(const uint4 &h, unsigned i) {
+    return ((i < 4 ? h.y : i < 8 ? h.z : h.w) >> i%4*8)&255;
+}
+
+__device__ __forceinline__ unsigned half2_bits(float a, float b) {
+    const __half2 h = __floats2half2_rn(a,b);
+    return *(const unsigned *)&h;
+}
+
+/* value4<12> for elements k..k+63, in 16-byte chunks of halves; a nibble n
+ * becomes the float 2^23 + n by a byte permute, minus 2^23 (exact, where
+ * the integer conversion issues at half rate) */
+__device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_q4k &r, unsigned k, const float *) {
+    const unsigned g0 = k%256/32, q[8] = {r.q0.x,r.q0.y,r.q0.z,r.q0.w,r.q1.x,r.q1.y,r.q1.z,r.q1.w};
+    const float d = __half2float(__ushort_as_half((unsigned short)(r.h.x&0xffff)));
+    const float dm = __half2float(__ushort_as_half((unsigned short)(r.h.x>>16)));
+    float scale[2], offset[2];
+    #pragma unroll
+    for (unsigned s = 0; s < 2; s++) {
+        const unsigned g = g0+s;
+        unsigned sc, mn;
+        if (g < 4) { sc = xw_byte(r.h,g)&63; mn = xw_byte(r.h,g+4)&63; }
+        else {
+            sc = (xw_byte(r.h,g+4)&15)|((xw_byte(r.h,g-4)>>6)<<4);
+            mn = (xw_byte(r.h,g+4)>>4)|((xw_byte(r.h,g)>>6)<<4);
+        }
+        scale[s] = d*sc; offset[s] = dm*mn;
+    }
+    #pragma unroll
+    for (unsigned c = 0; c < 8; c++) {
+        unsigned hv[4];
+        #pragma unroll
+        for (unsigned w = 0; w < 2; w++) {
+            const unsigned word = (c/4 ? q[c%4*2+w]>>4 : q[c%4*2+w])&0x0f0f0f0fu;
+            float v[4];
+            #pragma unroll
+            for (unsigned b = 0; b < 4; b++)
+                v[b] = scale[c/4]*(__uint_as_float(__byte_perm(word,0x4b000000u,b|0x7540u))-8388608.0f)-offset[c/4];
+            hv[w*2] = half2_bits(v[0],v[1]);
+            hv[w*2+1] = half2_bits(v[2],v[3]);
+        }
+        out[c] = make_uint4(hv[0],hv[1],hv[2],hv[3]);
+    }
+}
+
+/* value4<39> for elements k..k+63: the step's 34 bytes moved to word 0,
+ * then lut[q] (the signed E2M1 level) times the block scale */
+__device__ __forceinline__ void xw_dequant(uint4 (&out)[8], const xw_mxfp4 &r, unsigned, const float *lut) {
+    const unsigned w[12] = {r.c[0].x,r.c[0].y,r.c[0].z,r.c[0].w,r.c[1].x,r.c[1].y,r.c[1].z,r.c[1].w,
+                            r.c[2].x,r.c[2].y,r.c[2].z,r.c[2].w};
+    const unsigned wo = r.sb/4, sh = r.sb%4*8;
+    unsigned u[11], v[10], b[9];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; j++) u[j] = wo&2 ? w[j+2] : w[j];
+    u[10] = wo&2 ? 0 : w[10];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; j++) v[j] = wo&1 ? u[j+1] : u[j];
+    #pragma unroll
+    for (unsigned i = 0; i < 9; i++) b[i] = __funnelshift_r(v[i],v[i+1],sh);
+    #pragma unroll
+    for (unsigned blk = 0; blk < 2; blk++) {
+        const unsigned b0 = (b[blk*17/4]>>(blk*17%4*8))&255;
+        const float scale = b0 == 0 ? 0x1p-127f : __uint_as_float(b0<<23);
+        #pragma unroll
+        for (unsigned c = 0; c < 4; c++) {
+            unsigned hv[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                float f[2];
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const unsigned m = c*8+j*2+h, byte = blk*17+1+m%16;
+                    f[h] = lut[(b[byte/4]>>(byte%4*8+m/16*4))&15]*scale;
+                }
+                hv[j] = half2_bits(f[0],f[1]);
+            }
+            out[blk*4+c] = make_uint4(hv[0],hv[1],hv[2],hv[3]);
+        }
+    }
+}
+
+/* 16-byte chunk c of row r in a 128-byte-row tile, swizzled so the
+ * ldmatrix rows and the dequant stores hit distinct banks */
+__device__ __forceinline__ unsigned xw_chunk(unsigned r, unsigned c) { return r*128+((c^(r%8))*16); }
+
+__device__ __forceinline__ void bar_sync(unsigned id, unsigned n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void bar_arrive(unsigned id, unsigned n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+
+/* tile q of the schedule: the expert, its token count, first token and first A row */
+struct xw_tile { unsigned e, count, t0, r0; };
+__device__ __forceinline__ xw_tile xw_decode(unsigned q, unsigned nr, unsigned rows, const unsigned *tiles,
+        const int *counts, unsigned NE, unsigned nt = XW_NT) {
+    const unsigned job = q/nr;
+    unsigned e = 0, end = NE;
+    while (e < end) {
+        const unsigned mid = (e+end)/2;
+        if (tiles[mid+1] <= job) e = mid+1; else end = mid;
+    }
+    return {e,(unsigned)counts[e],(job-tiles[e])*nt,q%nr*rows};
+}
+
+template<unsigned TYPE, bool DOWN>
+__global__ void __launch_bounds__(512, 1) matrix_half_ws(float *out, const __half *xh,
+        const char *w0, const char *w1, const int *lists, const int *counts, const unsigned *tiles,
+        unsigned NE, unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    extern __shared__ __align__(128) unsigned char xw_smem[];
+    unsigned char *As = xw_smem, *Bs = xw_smem+2*256*128;
+    int *pairs = (int *)(Bs+3*XW_NT*128);
+    float *lut = (float *)(pairs+2*XW_NT);
+    enum { FULL = 1, EMPTY = 3, PROD = 5 };
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, rows = DOWN ? 256 : 128, nr = (M+rows-1)/rows, KS = K/64;
+    const unsigned ntiles = tiles[NE]*nr, mine = blockIdx.x < ntiles ? (ntiles-blockIdx.x+gridDim.x-1)/gridDim.x : 0;
+    const unsigned steps = mine*KS;
+    if (tid >= 256) {
+        /* producers: thread p dequantizes A row p (gate rows, then the same up rows) */
+        const unsigned p = tid-256;
+        if (TYPE == 39 && p < 16) {
+            const unsigned mag = p&7;
+            const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+            lut[p] = p&8 ? -level : level;
+        }
+        bar_sync(PROD,256);
+        typedef typename xw_raw<TYPE>::type raw_t;
+        /* a tile's expert, weight row and activation rows */
+        struct state { unsigned it; xw_tile t; const char *wrow; const __half *b[2]; };
+        auto enter = [&](state &st, unsigned it) {
+            st.it = it;
+            st.t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE);
+            const unsigned arow = DOWN ? st.t.r0+p : st.t.r0+p%128;
+            st.wrow = (DOWN || p < 128 ? w0 : w1)+((uint64_t)st.t.e*M+(arow < M ? arow : 0))*rb;
+            #pragma unroll
+            for (unsigned c = 0; c < 2; c++) {
+                const unsigned item = st.t.t0+p/8+c*32;
+                const int pr = item < st.t.count ? lists[(uint64_t)st.t.e*cap+item] : -1;
+                st.b[c] = pr < 0 ? nullptr : xh+(DOWN ? (uint64_t)(pr/NS)*NO+pr%NS : (uint64_t)pr/NS)*K+p%8*8;
+            }
+        };
+        /* three cursors over (tile, k step): the step being dequantized, the
+         * activations one step ahead and the weights two steps ahead */
+        struct cursor { state st; unsigned ks; };
+        auto advance = [&](cursor &c) {
+            if (++c.ks == KS) { c.ks = 0; if (c.st.it+1 < mine) enter(c.st,c.st.it+1); else c.st.it++; }
+        };
+        cursor cur = {}, braw, bb;
+        if (steps) enter(cur.st,0);
+        braw = cur;
+        bb = cur;
+        auto load_raw = [&](raw_t &raw, unsigned g) {
+            if (g < steps) xw_load(raw,braw.st.wrow,braw.ks*64);
+            advance(braw);
+        };
+        /* the activation chunks of step g: tokens p/8 and p/8+32, chunk p%8 */
+        auto load_b = [&](unsigned g) {
+            if (g < steps) {
+                unsigned char *dst = Bs+g%3*XW_NT*128;
+                #pragma unroll
+                for (unsigned c = 0; c < 2; c++)
+                    tt_cp_async_16B(dst+xw_chunk(p/8+c*32,p%8),bb.st.b[c] ? bb.st.b[c]+bb.ks*64 : xh,bb.st.b[c] != nullptr);
+                advance(bb);
+            }
+            tt_cp_async_commit();
+        };
+        auto produce = [&](unsigned g, const raw_t &raw) {
+            if (g >= 2) bar_sync(EMPTY+g%2,512);
+            load_b(g+1);
+            const unsigned ks = cur.ks, arow = DOWN ? cur.st.t.r0+p : cur.st.t.r0+p%128;
+            if (ks == 0 && p < XW_NT)
+                pairs[cur.st.it%2*XW_NT+p] = cur.st.t.t0+p < cur.st.t.count ? lists[(uint64_t)cur.st.t.e*cap+cur.st.t.t0+p] : -1;
+            uint4 h[8];
+            if (arow < M) xw_dequant(h,raw,ks*64,lut);
+            else for (unsigned c = 0; c < 8; c++) h[c] = make_uint4(0,0,0,0);
+            unsigned char *A = As+g%2*256*128;
+            #pragma unroll
+            for (unsigned c = 0; c < 8; c++) *(uint4 *)(A+xw_chunk(p,c)) = h[c];
+            tt_cp_async_wait_group<1>();
+            __threadfence_block();
+            bar_arrive(FULL+g%2,512);
+            advance(cur);
+        };
+        raw_t ra, rbuf;
+        load_b(0);
+        load_raw(ra,0);
+        load_raw(rbuf,1);
+        for (unsigned g = 0; g < steps; g += 2) {
+            produce(g,ra);
+            load_raw(ra,g+2);
+            if (g+1 < steps) {
+                produce(g+1,rbuf);
+                load_raw(rbuf,g+3);
+            }
+        }
+        tt_cp_async_wait_group<0>();
+    } else {
+        /* consumers: warp tile of 4 m16 tiles of A rows (gate/up: two of each) by 32 tokens */
+        const unsigned lane = tid%32, warp = tid/32, wm = warp%4, wn = warp/4;
+        unsigned mrow[4];
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++) mrow[i] = DOWN ? wm*64+i*16 : i/2*128+wm*32+i%2*16;
+        unsigned g = 0;
+        for (unsigned it = 0; it < mine; it++) {
+            const xw_tile t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE);
+            /* the 8-token columns holding the tile's tokens: an expert's last
+             * tile is partly empty, and those products are never stored */
+            const int left = (int)(t.count-t.t0)-(int)(wn*32);
+            const unsigned nj = left <= 0 ? 0 : left >= 32 ? 4 : (unsigned)(left+7)/8;
+            float acc[4][4][4] = {};
+            for (unsigned ks = 0; ks < KS; ks++, g++) {
+                bar_sync(FULL+g%2,512);
+                const unsigned char *A = As+g%2*256*128, *B = Bs+g%3*XW_NT*128;
+                /* the next 16 k's fragments load during this slice's products */
+                uint32_t a[2][4][4], b[2][2][4];
+                auto frags = [&](unsigned k16, uint32_t (&fa)[4][4], uint32_t (&fb)[2][4]) {
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; i++)
+                        tt_ldmatrix_x4(fa[i],A+xw_chunk(mrow[i]+lane%16,k16*2+lane/16));
+                    #pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (j*2 < nj) tt_ldmatrix_x4(fb[j],B+xw_chunk(wn*32+j*16+lane%8+lane/16*8,k16*2+lane/8%2));
+                };
+                if (nj) {
+                    frags(0,a[0],b[0]);
+                    #pragma unroll
+                    for (unsigned k16 = 0; k16 < 4; k16++) {
+                        if (k16 < 3) frags(k16+1,a[(k16+1)%2],b[(k16+1)%2]);
+                        #pragma unroll
+                        for (unsigned j = 0; j < 4; j++) {
+                            if (j >= nj) break;
+                            #pragma unroll
+                            for (unsigned i = 0; i < 4; i++) {
+                                const uint32_t bb[2] = {b[k16%2][j/2][j%2*2],b[k16%2][j/2][j%2*2+1]};
+                                tt_mma_m16n8k16_f16_f32(acc[i][j],a[k16%2][i],bb);
+                            }
+                        }
+                    }
+                }
+                if (g+2 < steps) bar_arrive(EMPTY+g%2,512);
+            }
+            const int *pp = pairs+it%2*XW_NT;
+            /* c0,c1: row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const int pr = pp[wn*32+j*8+lane%4*2+h];
+                    if (pr < 0) continue;
+                    float *o = out+((uint64_t)(pr/NS)*NO+pr%NS)*M;
+                    #pragma unroll
+                    for (unsigned i = 0; i < (DOWN ? 4 : 2); i++)
+                        #pragma unroll
+                        for (unsigned v = 0; v < 2; v++) {
+                            const unsigned row = t.r0+(DOWN ? mrow[i] : wm*32+i*16)+lane/4+v*8;
+                            if (row >= M) continue;
+                            if (DOWN) o[row] = acc[i][j][v*2+h];
+                            else o[row] = silu(acc[i][j][v*2+h])*acc[(i+2)%4][j][v*2+h];
+                        }
+                }
+        }
+    }
+#endif
+}
+
+/* matrix_half_ws on wider tiles: 128 A rows (64 gate rows and the same up
+ * rows, or 128 down rows) by 192 tokens, so a weight is dequantized once
+ * per 192 of an expert's tokens instead of 64 (once per expert at 8192
+ * rows) and the products per dequantized value triple.  Four producer warps
+ * (a thread per A row) dequantize a step while the consumers multiply the
+ * one before; the activations of a step go into its stage when the
+ * producers start it, behind the same empty barrier as the weights.  Eight
+ * consumer warps take 32 A rows (gate/up: 16 of each) by 96 tokens. */
+constexpr unsigned WB_NT = 192, WB_AR = 128, WB_SMEM = 2*WB_AR*128+2*WB_NT*128+2*WB_NT*4+16*4;
+
+/* a 16-byte copy that zero-fills where !valid (source size 0), without a branch */
+__device__ __forceinline__ void wb_cp16(void *dst, const void *src, bool valid) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(smem_addr(dst)), "l"(src), "r"(valid ? 16u : 0u));
+#endif
+}
+
+template<unsigned TYPE, bool DOWN>
+__global__ void __launch_bounds__(384, 1) matrix_half_wb(float *out, const __half *xh,
+        const char *w0, const char *w1, const int *lists, const int *counts, const unsigned *tiles,
+        unsigned NE, unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+    extern __shared__ __align__(128) unsigned char wb_smem[];
+    unsigned char *As = wb_smem, *Bs = wb_smem+2*WB_AR*128;
+    int *pairs = (int *)(Bs+2*WB_NT*128);
+    float *lut = (float *)(pairs+2*WB_NT);
+    enum { FULL = 1, EMPTY = 3, PROD = 5 };
+    constexpr unsigned G = DOWN ? WB_AR : WB_AR/2, NB = 8*WB_NT/WB_AR;
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, rows = G, nr = (M+rows-1)/rows, KS = K/64;
+    const unsigned ntiles = tiles[NE]*nr, mine = blockIdx.x < ntiles ? (ntiles-blockIdx.x+gridDim.x-1)/gridDim.x : 0;
+    const unsigned steps = mine*KS;
+    if (tid >= 256) {
+        /* producers: thread p dequantizes A row p (gate rows, then the same up rows) */
+        const unsigned p = tid-256;
+        if (TYPE == 39 && p < 16) {
+            const unsigned mag = p&7;
+            const float level = mag < 2 ? .5f*mag : __uint_as_float(((mag/2+126)<<23)|((mag&1)<<22));
+            lut[p] = p&8 ? -level : level;
+        }
+        bar_sync(PROD,WB_AR);
+        typedef typename xw_raw<TYPE>::type raw_t;
+        /* a tile's expert, weight row and activation rows (tokens p / 8 + 16c, chunk p % 8) */
+        struct state { unsigned it; xw_tile t; const char *wrow; const __half *b[NB]; };
+        auto enter = [&](state &st, unsigned it) {
+            st.it = it;
+            st.t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE,WB_NT);
+            const unsigned arow = st.t.r0+p%G;
+            st.wrow = (DOWN || p < G ? w0 : w1)+((uint64_t)st.t.e*M+(arow < M ? arow : 0))*rb;
+            #pragma unroll
+            for (unsigned c = 0; c < NB; c++) {
+                const unsigned item = st.t.t0+p/8+c*(WB_AR/8);
+                const int pr = item < st.t.count ? lists[(uint64_t)st.t.e*cap+item] : -1;
+                st.b[c] = pr < 0 ? nullptr : xh+(DOWN ? (uint64_t)(pr/NS)*NO+pr%NS : (uint64_t)pr/NS)*K+p%8*8;
+            }
+        };
+        struct cursor { state st; unsigned ks; };
+        auto advance = [&](cursor &c) {
+            if (++c.ks == KS) { c.ks = 0; if (c.st.it+1 < mine) enter(c.st,c.st.it+1); else c.st.it++; }
+        };
+        cursor cur = {}, braw;
+        if (steps) enter(cur.st,0);
+        braw = cur;
+        auto load_raw = [&](raw_t &raw, unsigned g) {
+            if (g < steps) xw_load(raw,braw.st.wrow,braw.ks*64);
+            advance(braw);
+        };
+        auto produce = [&](unsigned g, const raw_t &raw) {
+            if (g >= 2) bar_sync(EMPTY+g%2,WB_AR+256);
+            /* the step's activations into its stage, landing during the dequant */
+            unsigned char *B = Bs+g%2*WB_NT*128;
+            #pragma unroll
+            for (unsigned c = 0; c < NB; c++)
+                wb_cp16(B+xw_chunk(p/8+c*(WB_AR/8),p%8),cur.st.b[c] ? cur.st.b[c]+cur.ks*64 : xh,cur.st.b[c] != nullptr);
+            tt_cp_async_commit();
+            const unsigned ks = cur.ks, arow = cur.st.t.r0+p%G;
+            if (ks == 0)
+                for (unsigned q = p; q < WB_NT; q += WB_AR)
+                    pairs[cur.st.it%2*WB_NT+q] = cur.st.t.t0+q < cur.st.t.count ? lists[(uint64_t)cur.st.t.e*cap+cur.st.t.t0+q] : -1;
+            uint4 h[8];
+            if (arow < M) xw_dequant(h,raw,ks*64,lut);
+            else for (unsigned c = 0; c < 8; c++) h[c] = make_uint4(0,0,0,0);
+            unsigned char *A = As+g%2*WB_AR*128;
+            #pragma unroll
+            for (unsigned c = 0; c < 8; c++) *(uint4 *)(A+xw_chunk(p,c)) = h[c];
+            tt_cp_async_wait_group<0>();
+            __threadfence_block();
+            bar_arrive(FULL+g%2,WB_AR+256);
+            advance(cur);
+        };
+        raw_t ra, rbuf;
+        load_raw(ra,0);
+        load_raw(rbuf,1);
+        for (unsigned g = 0; g < steps; g += 2) {
+            produce(g,ra);
+            load_raw(ra,g+2);
+            if (g+1 < steps) {
+                produce(g+1,rbuf);
+                load_raw(rbuf,g+3);
+            }
+        }
+    } else {
+        /* consumers: warp tile of 32 A rows (gate/up: 16 of each) by 96 tokens */
+        const unsigned lane = tid%32, warp = tid/32, rg = warp%4, th = warp/4;
+        const unsigned mrow[2] = {DOWN ? rg*32 : rg*16, DOWN ? rg*32+16 : G+rg*16};
+        unsigned g = 0;
+        for (unsigned it = 0; it < mine; it++) {
+            const xw_tile t = xw_decode(blockIdx.x+it*gridDim.x,nr,rows,tiles,counts,NE,WB_NT);
+            /* the 8-token columns holding the tile's tokens; the rest are never stored */
+            const int left = (int)(t.count-t.t0)-(int)(th*96);
+            const unsigned nj = left <= 0 ? 0 : left >= 96 ? 12 : (unsigned)(left+7)/8;
+            float acc[2][12][4] = {};
+            for (unsigned ks = 0; ks < KS; ks++, g++) {
+                bar_sync(FULL+g%2,WB_AR+256);
+                const unsigned char *A = As+g%2*WB_AR*128, *B = Bs+g%2*WB_NT*128;
+                if (nj) {
+                    #pragma unroll
+                    for (unsigned k16 = 0; k16 < 4; k16++) {
+                        uint32_t a[2][4], b[6][4];
+                        #pragma unroll
+                        for (unsigned i = 0; i < 2; i++)
+                            tt_ldmatrix_x4(a[i],A+xw_chunk(mrow[i]+lane%16,k16*2+lane/16));
+                        #pragma unroll
+                        for (unsigned j = 0; j < 6; j++)
+                            if (j*2 < nj) tt_ldmatrix_x4(b[j],B+xw_chunk(th*96+j*16+lane%8+lane/16*8,k16*2+lane/8%2));
+                        #pragma unroll
+                        for (unsigned j = 0; j < 12; j++) {
+                            if (j >= nj) break;
+                            const uint32_t bb[2] = {b[j/2][j%2*2],b[j/2][j%2*2+1]};
+                            #pragma unroll
+                            for (unsigned i = 0; i < 2; i++) tt_mma_m16n8k16_f16_f32(acc[i][j],a[i],bb);
+                        }
+                    }
+                }
+                if (g+2 < steps) bar_arrive(EMPTY+g%2,WB_AR+256);
+            }
+            const int *pp = pairs+it%2*WB_NT;
+            /* c0,c1: row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+            #pragma unroll
+            for (unsigned j = 0; j < 12; j++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const int pr = pp[th*96+j*8+lane%4*2+h];
+                    if (pr < 0) continue;
+                    float *o = out+((uint64_t)(pr/NS)*NO+pr%NS)*M;
+                    #pragma unroll
+                    for (unsigned i = 0; i < (DOWN ? 2 : 1); i++)
+                        #pragma unroll
+                        for (unsigned v = 0; v < 2; v++) {
+                            const unsigned row = t.r0+(DOWN ? mrow[i] : rg*16)+lane/4+v*8;
+                            if (row >= M) continue;
+                            if (DOWN) o[row] = acc[i][j][v*2+h];
+                            else o[row] = silu(acc[0][j][v*2+h])*acc[1][j][v*2+h];
+                        }
+                }
+        }
+    }
+#endif
+}
+
+/* The activations rounded to half once per call, as matrix_half_tile
+ * rounds each one it loads. */
+__global__ void half_rows(__half *out, const float *x, uint64_t n) {
+    pdl_enter();
+    const uint64_t i = ((uint64_t)blockIdx.x*blockDim.x+threadIdx.x)*4;
+    if (i >= n) return;
+    const float4 v = *(const float4 *)(x+i);
+    uint2 h;
+    h.x = half2_bits(v.x,v.y);
+    h.y = half2_bits(v.z,v.w);
+    *(uint2 *)(out+i) = h;
+}
+
+/* matrix_half_ws with its tile schedule and half activations in the
+ * scratch, a block per SM */
+static int expert_ws(float *out, const float *x, const char *w0, const char *w1,
+        const int *lists, const int *counts, unsigned NE, unsigned T, unsigned NS,
+        unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
+    const uint64_t rb = expert_row_bytes(down ? 39 : 12, K), nx = (uint64_t)T*(down ? NO : 1)*K;
+    const uint64_t tb = (((uint64_t)NE+1)*4+255)/256*256;
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc(tb+nx*2, "Qwen expert scratch");
+    if (!scratch) return 0;
+    unsigned *tiles = (unsigned *)scratch;
+    __half *xh = (__half *)(scratch+tb);
+    /* the wide tiles for gate/up, and for down where an expert averages 64 tokens or more
+     * (fewer leave half a wide tile's consumer warps without columns) */
+    const bool wb = env_on("DS4_QWEN4_EXPERT_WB") && (!down || (uint64_t)T*NS >= (uint64_t)64*NE);
+    launch(expert_tiles, 1, 1, 0, tiles,counts,NE,wb ? WB_NT : XW_NT);
+    launch(half_rows, (nx/4+255)/256, 256, 0, xh,x,nx);
+    if (!launched()) return 0;
+    if (wb) {
+        static int wopted[2] = {-1,-1}, wsms = 0;
+        auto kernel = down ? matrix_half_wb<39,true> : matrix_half_wb<12,false>;
+        if (wopted[down] < 0) {
+            int dev = 0;
+            wopted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, WB_SMEM) == cudaSuccess &&
+                           cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                           cudaGetDevice(&dev) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&wsms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && wsms > 0;
+            (void)cudaGetLastError();
+        }
+        if (!wopted[down]) return 0;
+        const unsigned wrows = down ? WB_AR : WB_AR/2;
+        const uint64_t wjobs = ((uint64_t)T*NS+WB_NT-1)/WB_NT+NE, wblocks = wjobs*((M+wrows-1)/wrows);
+        launch(kernel, (unsigned)std::min<uint64_t>(wblocks,(uint64_t)wsms), 384, WB_SMEM,
+               out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+        return launched();
+    }
+    const unsigned rows = down ? 256 : 128;
+    const uint64_t jobs = ((uint64_t)T*NS+XW_NT-1)/XW_NT+NE, blocks = jobs*((M+rows-1)/rows);
+    if (blocks > INT_MAX) return 0;
+    auto kernel = down ? matrix_half_ws<39,true> : matrix_half_ws<12,false>;
+    static int opted[2] = {-1,-1}, sms = 0;
+    if (opted[down] < 0) {
+        int dev = 0;
+        opted[down] = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, XW_SMEM) == cudaSuccess &&
+                      cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                           cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+                      cudaGetDevice(&dev) == cudaSuccess &&
+                      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0;
+        (void)cudaGetLastError();
+    }
+    if (!opted[down]) return 0;
+    launch(kernel, (unsigned)std::min<uint64_t>(blocks,(uint64_t)sms), 512, XW_SMEM,
+           out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb);
+    return launched();
+}
+
 static int matrix_dispatch(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, unsigned type, unsigned NE, unsigned T,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
+        if (lists && !g_quality_mode && T >= 2048 && type == (down ? 39u : 12u) && !(K%(down ? 64 : 256)) &&
+            !(((uintptr_t)x|(uintptr_t)w0|(uintptr_t)(down ? w0 : w1))&15) && env_on("DS4_QWEN4_EXPERT_WS"))
+            return expert_ws(out,x,w0,w1,lists,counts,NE,T,NS,NO,K,M,cap,down);
         if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
@@ -3755,6 +4309,64 @@ __global__ void pack_half_components(float *scales, __half *hi, __half *lo,
     }
 }
 
+/* pack_half_components<0> in one pass: the row stays in registers between
+ * the maximum and the split, read as float4 (rows of K <= 4*256*NV). */
+template<unsigned NV>
+__global__ void __launch_bounds__(256) pack_half_rows(float *scales, __half *hi, __half *lo,
+        const float *x, unsigned K) {
+    pdl_enter();
+    const unsigned row = blockIdx.x, tid = threadIdx.x, n4 = K/4;
+    const float4 *xr = (const float4 *)(x+(uint64_t)row*K);
+    __shared__ float maxima[8];
+    __shared__ float inv;
+    float4 v[NV];
+    float mx = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < NV; j++)
+        if (tid+j*256 < n4) {
+            v[j] = xr[tid+j*256];
+            mx = fmaxf(mx,fabsf(v[j].x)); mx = fmaxf(mx,fabsf(v[j].y));
+            mx = fmaxf(mx,fabsf(v[j].z)); mx = fmaxf(mx,fabsf(v[j].w));
+        }
+    for (int d = 16; d; d >>= 1) mx = fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));
+    if (tid%32 == 0) maxima[tid/32] = mx;
+    __syncthreads();
+    if (!tid) {
+        for (unsigned w = 1; w < 8; w++) mx = fmaxf(mx,maxima[w]);
+        const int e = mx > 0 ? max(-120,min(120,(int)((__float_as_uint(mx)>>23)&255)-127)) : 0;
+        inv = ldexpf(1,-e); scales[row] = ldexpf(1,e);
+    }
+    __syncthreads();
+    const float s = inv;
+    #pragma unroll
+    for (unsigned j = 0; j < NV; j++)
+        if (tid+j*256 < n4) {
+            const float f[4] = {v[j].x*s,v[j].y*s,v[j].z*s,v[j].w*s};
+            __half h[4], l[4];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) {
+                h[i] = __float2half_rn(f[i]);
+                l[i] = __float2half_rn((f[i]-__half2float(h[i]))*4096);
+            }
+            const uint64_t o = (uint64_t)row*K+(tid+j*256)*4;
+            *(uint2 *)(hi+o) = *(const uint2 *)h;
+            *(uint2 *)(lo+o) = *(const uint2 *)l;
+        }
+}
+
+/* The activations' scaled half components (pack_half_components<0>) */
+static void pack_rows(float *scales, __half *hi, __half *lo, const float *x, unsigned T, unsigned K) {
+    if (K%4 || K > 4*256*10 || ((uintptr_t)x&15) || !env_on("DS4_QWEN4_PACK_ROWS")) {
+        launch(pack_half_components<0>, T, 256, 0, scales,hi,lo,(const char *)x,K,(uint64_t)K*4);
+    } else if (K <= 4*256*3) {
+        launch(pack_half_rows<3>, T, 256, 0, scales,hi,lo,x,K);
+    } else if (K <= 4*256*6) {
+        launch(pack_half_rows<6>, T, 256, 0, scales,hi,lo,x,K);
+    } else {
+        launch(pack_half_rows<10>, T, 256, 0, scales,hi,lo,x,K);
+    }
+}
+
 __global__ void dense_rescale(float *out, const float *scales,
         unsigned M, unsigned N) {
     pdl_enter();
@@ -3814,6 +4426,85 @@ __global__ void dense_f16_components(float *out, const __half *xh, const __half 
 #endif
 }
 
+/* dense_f16_components on 128 x 128 tiles, the next k step's tiles loading
+ * during this one's products.  Every output takes the same chains (its
+ * m16n8k16 products over k in order for each component, then hi + lo/4096
+ * and the row scale), so the outputs are the same; the HC up projections
+ * of a prefill chunk spent most of their time in a load-wait-multiply
+ * cycle per 64 x 64 tile.  96 KB: one block per SM. */
+constexpr unsigned DF_TILE = 128, DF_SMEM = 2*3*DF_TILE*128;
+
+__global__ void __launch_bounds__(256, 1) dense_f16_pipe(float *out, const __half *xh, const __half *xl,
+        const __half *w, const float *scales, unsigned T, unsigned K, unsigned M) {
+    extern __shared__ __align__(128) unsigned char df_smem[];
+    pdl_enter();
+#if __CUDA_ARCH__ >= 800
+    const unsigned tid = threadIdx.x, lane = tid%32, warp = tid/32;
+    const unsigned m0 = blockIdx.x*DF_TILE, t0 = blockIdx.y*DF_TILE, KS = K/64;
+    /* stage s holds the weight rows m0.., then the hi and lo rows t0.. */
+    auto tile = [&](unsigned s, unsigned which) { return df_smem+(s*3+which)*DF_TILE*128; };
+    auto load = [&](unsigned ks) {
+        if (ks < KS) {
+            for (unsigned i = tid; i < DF_TILE*8; i += 256) {
+                const unsigned r = i/8, c = i%8, k = ks*64+c*8;
+                const bool vw = m0+r < M, vx = t0+r < T;
+                tt_cp_async_16B(tile(ks%2,0)+xw_chunk(r,c),w+(uint64_t)(vw ? m0+r : 0)*K+k,vw);
+                tt_cp_async_16B(tile(ks%2,1)+xw_chunk(r,c),xh+(uint64_t)(vx ? t0+r : 0)*K+k,vx);
+                tt_cp_async_16B(tile(ks%2,2)+xw_chunk(r,c),xl+(uint64_t)(vx ? t0+r : 0)*K+k,vx);
+            }
+        }
+        tt_cp_async_commit();
+    };
+    load(0);
+    load(1);
+    /* warp tile: 64 weight rows by 32 tokens */
+    const unsigned wm = warp%2, wt = warp/2;
+    float hi[4][4][4] = {}, lo[4][4][4] = {};
+    for (unsigned ks = 0; ks < KS; ks++) {
+        tt_cp_async_wait_group<1>();
+        __syncthreads();
+        const unsigned char *W = tile(ks%2,0), *H = tile(ks%2,1), *L = tile(ks%2,2);
+        #pragma unroll
+        for (unsigned k16 = 0; k16 < 4; k16++) {
+            uint32_t a[4][4], bh[2][4], bl[2][4];
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) tt_ldmatrix_x4(a[i],W+xw_chunk(wm*64+i*16+lane%16,k16*2+lane/16));
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++) {
+                const unsigned c = xw_chunk(wt*32+j*16+lane%8+lane/16*8,k16*2+lane/8%2);
+                tt_ldmatrix_x4(bh[j],H+c);
+                tt_ldmatrix_x4(bl[j],L+c);
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++)
+                #pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    const uint32_t b0[2] = {bh[j/2][j%2*2],bh[j/2][j%2*2+1]}, b1[2] = {bl[j/2][j%2*2],bl[j/2][j%2*2+1]};
+                    tt_mma_m16n8k16_f16_f32(hi[i][j],a[i],b0);
+                    tt_mma_m16n8k16_f16_f32(lo[i][j],a[i],b1);
+                }
+        }
+        __syncthreads();
+        load(ks+2);
+    }
+    /* c0,c1: weight row lane/4, tokens lane%4*2 and +1; c2,c3: row lane/4+8 */
+    #pragma unroll
+    for (unsigned i = 0; i < 4; i++)
+        #pragma unroll
+        for (unsigned j = 0; j < 4; j++)
+            #pragma unroll
+            for (unsigned v = 0; v < 2; v++)
+                #pragma unroll
+                for (unsigned h = 0; h < 2; h++) {
+                    const unsigned m = m0+wm*64+i*16+lane/4+v*8, t = t0+wt*32+j*8+lane%4*2+h;
+                    if (m >= M || t >= T) continue;
+                    float r = hi[i][j][v*2+h];
+                    r += lo[i][j][v*2+h]*0x1p-12f;
+                    out[(uint64_t)t*M+m] = r*scales[t];
+                }
+#endif
+}
+
 static int dense_f16_blas(float *out, const float *x, const __half *w,
         unsigned T, unsigned K, unsigned M) {
     const uint64_t xn = (uint64_t)T*K;
@@ -3821,10 +4512,17 @@ static int dense_f16_blas(float *out, const float *x, const __half *w,
     if (!hi) return 0;
     __half *lo = hi+xn;
     float *scales = (float *)(lo+xn);
-    launch(pack_half_components<0>, T, 256, 0, scales,hi,lo,(const char *)x,K,(uint64_t)K*4);
+    pack_rows(scales,hi,lo,x,T,K);
     if (!launched()) return 0;
     if (K <= 512 && K%64 == 0 && T >= 32 && ds4_cuda_attn_tokentile_arch_ok()) {
-        launch(dense_f16_components, dim3((M+63)/64,(T+63)/64), 256, 0, out,hi,lo,w,scales,T,K,M);
+        static int opted = -1;
+        if (opted < 0) {
+            opted = cudaFuncSetAttribute(dense_f16_pipe, cudaFuncAttributeMaxDynamicSharedMemorySize, DF_SMEM) == cudaSuccess;
+            (void)cudaGetLastError();
+        }
+        if (opted && !((uintptr_t)w&15) && env_on("DS4_QWEN4_F16_PIPE"))
+            launch(dense_f16_pipe, dim3((M+DF_TILE-1)/DF_TILE,(T+DF_TILE-1)/DF_TILE), 256, DF_SMEM, out,hi,lo,w,scales,T,K,M);
+        else launch(dense_f16_components, dim3((M+63)/64,(T+63)/64), 256, 0, out,hi,lo,w,scales,T,K,M);
         return launched();
     }
     const float zero = 0, one = 1, low = 0x1p-12f;
@@ -3848,36 +4546,49 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
     }
 }
 
-static int dense_q8_blas(float *out, const float *x, const char *w,
-        unsigned T, unsigned K, unsigned M) {
+/* Q8 projections of one input: its components are packed once, then
+ * each weight's tiles take the three GEMMs and the rescale (a weight's
+ * tiling depends only on its own row count). */
+static int dense_q8_blas_n(float *const *out, const float *x, const char *const *w, const unsigned *M,
+        unsigned N, unsigned T, unsigned K) {
     const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(32)<<20)/((uint64_t)K*4));
-    const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
-    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)tile*K;
-    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+T+tile)*4,"Qwen Q8 projection scratch");
+    auto tile_of = [&](unsigned m) { return std::min(m,bound >= 64 ? bound/64*64 : bound); };
+    unsigned maxtile = 0;
+    for (unsigned i = 0; i < N; i++) maxtile = std::max(maxtile,tile_of(M[i]));
+    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)maxtile*K;
+    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+T+maxtile)*4,"Qwen Q8 projection scratch");
     if (!xh) return 0;
     __half *xl = xh+xn, *wh = xl+xn, *wl = wh+wn;
     float *xs = (float *)(wl+wn), *ws = xs+T;
-    launch(pack_half_components<0>, T, 256, 0, xs,xh,xl,(const char *)x,K,(uint64_t)K*4);
+    pack_rows(xs,xh,xl,x,T,K);
     if (!launched()) return 0;
     const float zero = 0, one = 1, low = 0x1p-12f;
     const uint64_t rb = row_bytes(8,K);
-    for (unsigned r = 0; r < M; r += tile) {
-        const unsigned n = std::min(tile,M-r);
-        launch(pack_half_components<8>, n, 256, 0, ws,wh,wl,w+(uint64_t)r*rb,K,rb);
-        if (!launched()) return 0;
-        if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 weight residual") ||
-            !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wh,CUDA_R_16F,K,xl,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 input residual") ||
-            !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 leading product")) return 0;
-        launch(dense_rescale2, ((uint64_t)n*T+255)/256, 256, 0, out+r,xs,ws,n,T,M);
-        if (!launched()) return 0;
+    for (unsigned i = 0; i < N; i++) {
+        const unsigned tile = tile_of(M[i]);
+        for (unsigned r = 0; r < M[i]; r += tile) {
+            const unsigned n = std::min(tile,M[i]-r);
+            launch(pack_half_components<8>, n, 256, 0, ws,wh,wl,w[i]+(uint64_t)r*rb,K,rb);
+            if (!launched()) return 0;
+            if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                    n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out[i]+r,CUDA_R_32F,M[i],
+                    CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 weight residual") ||
+                !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                    n,T,K,&low,wh,CUDA_R_16F,K,xl,CUDA_R_16F,K,&one,out[i]+r,CUDA_R_32F,M[i],
+                    CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 input residual") ||
+                !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                    n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,out[i]+r,CUDA_R_32F,M[i],
+                    CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 leading product")) return 0;
+            launch(dense_rescale2, ((uint64_t)n*T+255)/256, 256, 0, out[i]+r,xs,ws,n,T,M[i]);
+            if (!launched()) return 0;
+        }
     }
     return 1;
+}
+
+static int dense_q8_blas(float *out, const float *x, const char *w,
+        unsigned T, unsigned K, unsigned M) {
+    return dense_q8_blas_n(&out,x,&w,&M,1,T,K);
 }
 
 /* Bound the temporary weight expansion instead of retaining an FP32 copy
@@ -4599,6 +5310,46 @@ __global__ void conv(float *x, float *history, const float *w, unsigned T, unsig
     conv_body(x,history,w,T,C,K,activate,snap,snap_t,snap2,snap2_t);
 }
 
+/* Prefill: conv_body's arithmetic for every channel and token, with each
+ * channel's tokens split among the block's warps.  conv walks a chunk with
+ * one thread per channel, a dependent load per token (40 blocks for 8192
+ * tokens).  Each warp reads the K-1 inputs before its segment (or the
+ * history) ahead of the barrier, then convolves the segment in place,
+ * loading CONV_GROUP tokens before it stores any. */
+constexpr unsigned CONV_SEGS = 16, CONV_GROUP = 8;
+
+__global__ void __launch_bounds__(32*CONV_SEGS) conv_seg(float *x, float *history, const float *w,
+        unsigned T, unsigned C, unsigned K, bool activate) {
+    pdl_enter();
+    const unsigned c = blockIdx.x*32+threadIdx.x%32, L = (T+CONV_SEGS-1)/CONV_SEGS;
+    const unsigned t0 = min(T,threadIdx.x/32*L), t1 = min(T,t0+L);
+    const bool active = c < C && t0 < t1;
+    float win[3], taps[4];
+    if (active) {
+        for (unsigned i = 0; i < K-1; i++) {
+            const int p = (int)t0-(int)(K-1)+(int)i;
+            win[i] = p < 0 ? history[(uint64_t)(p+(int)K-1)*C+c] : x[(uint64_t)p*C+c];
+        }
+        for (unsigned i = 0; i < K; i++) taps[i] = w[c*K+i];
+    }
+    __syncthreads();
+    if (!active) return;
+    for (unsigned t = t0; t < t1; t += CONV_GROUP) {
+        float raw[CONV_GROUP];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) raw[g] = x[(uint64_t)(t+g)*C+c];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            float v = taps[K-1]*raw[g];
+            for (unsigned i = 0; i < K-1; i++) v += taps[i]*win[i];
+            for (unsigned i = 0; i+2 < K; i++) win[i] = win[i+1];
+            win[K-2] = raw[g];
+            x[(uint64_t)(t+g)*C+c] = activate ? silu(v) : v;
+        }
+    }
+    if (t1 == T) for (unsigned i = 0; i < K-1; i++) history[(uint64_t)i*C+c] = win[i];
+}
+
 __global__ void conv_rows(float *x, const float *w, const gdn_row *table,
         unsigned C, unsigned K, bool activate) {
     pdl_enter();
@@ -4683,6 +5434,125 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv, const float
         unsigned T, unsigned Hk, unsigned Hv, float *snap, unsigned st, float *snap2, unsigned st2) {
     pdl_enter_early();
     gdn_scan_body<ROWS,D>(out,state,qkv,a,b,T,Hk,Hv,snap,st,snap2,st2);
+}
+
+__device__ __forceinline__ void cp_async_4B(void *dst, const void *src) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(tt_smem_addr(dst)), "l"(src));
+#endif
+}
+
+/* Prefill (D = 128): the scan of gdn_scan<4,128>, every output and state
+ * element rounded the same way, with the steps' inputs staged in shared
+ * memory GDN_PIPE_STAGES-1 groups of GDN_PIPE_STEPS tokens ahead.
+ * gdn_scan_body reloads them after each output store, so every token
+ * waited on a memory latency.  A thread keeps the quarters of lanes l and
+ * l+16 of two rows: the butterfly's first level, lane l's partial plus
+ * lane l^16's, becomes one add in registers (the same sum either way
+ * round), and each half-warp finishes its rows over lanes l^8 .. l^1.
+ * 26 KB per block: the 384 blocks of a layer fit the GPU at once. */
+constexpr unsigned GDN_PIPE_STEPS = 8, GDN_PIPE_STAGES = 3;
+
+__global__ void __launch_bounds__(128) gdn_scan_pipe(float *out, float *state, const float *qkv,
+        const float *a, const float *b, unsigned T, unsigned Hk, unsigned Hv,
+        float *snap, unsigned st, float *snap2, unsigned st2) {
+    constexpr unsigned D = 128, S = GDN_PIPE_STEPS, NB = GDN_PIPE_STAGES;
+    struct stage { float q[S][D], k[S][D], v[S][16], ab[S][2]; };
+    __shared__ __align__(16) stage ring[NB];
+    pdl_enter_early();
+    const unsigned tid = threadIdx.x, l = tid%16, h = blockIdx.y, dv0 = blockIdx.x*16;
+    const unsigned rv = tid/32*4+tid%32/16*2, C = (2*Hk+Hv)*D, G = (T+S-1)/S;
+    const float *qs = qkv+(h%Hk)*D, *ks = qs+Hk*D, *vs = qkv+2*Hk*D+h*D+dv0;
+    /* group g: tokens g*S.. into ring[g%NB]; every thread commits a group */
+    auto load = [&](unsigned g) {
+        if (g < G) {
+            stage &sg = ring[g%NB];
+            for (unsigned i = tid; i < S*64; i += 128) {
+                const unsigned s = i/64, c = i%32*4, t = g*S+s;
+                if (t < T) tt_cp_async_16B(i/32%2 ? &sg.k[s][c] : &sg.q[s][c], (i/32%2 ? ks : qs)+(uint64_t)t*C+c, true);
+            }
+            if (tid < S*4) {
+                const unsigned s = tid/4, t = g*S+s;
+                if (t < T) tt_cp_async_16B(&sg.v[s][tid%4*4], vs+(uint64_t)t*C+tid%4*4, true);
+            } else if (tid < S*6) {
+                const unsigned s = (tid-S*4)/2, t = g*S+s;
+                if (t < T) cp_async_4B(&sg.ab[s][tid%2], (tid%2 ? b : a)+(uint64_t)t*Hv+h);
+            }
+        }
+        tt_cp_async_commit();
+    };
+    for (unsigned g = 0; g+1 < NB; g++) load(g);
+    /* rows dv0+rv and dv0+rv+1; elements l*4.. (e < 4) and 64+l*4.. */
+    const uint64_t base = ((uint64_t)h*D+dv0+rv)*D+l*4;
+    float s[2][8];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) s[j][e] = state[base+j*D+e/4*64+e%4];
+    /* a token's output partials (o0+o1 per row) finish their butterfly
+     * beside the next token's, off the state's dependency chain */
+    float op[2] = {0,0};
+    unsigned tp = UINT_MAX;
+    for (unsigned g = 0; g < G; g++) {
+        tt_cp_async_wait_group<NB-2>();
+        __syncthreads();
+        load(g+NB-1);
+        const stage &sg = ring[g%NB];
+        const unsigned n = min(S,T-g*S);
+        #pragma unroll
+        for (unsigned i = 0; i < S; i++) {
+            if (i >= n) break;
+            const unsigned t = g*S+i;
+            const float4 q0 = *(const float4 *)&sg.q[i][l*4], q1 = *(const float4 *)&sg.q[i][64+l*4];
+            const float4 k0 = *(const float4 *)&sg.k[i][l*4], k1 = *(const float4 *)&sg.k[i][64+l*4];
+            const float q[8] = {q0.x,q0.y,q0.z,q0.w,q1.x,q1.y,q1.z,q1.w};
+            const float k[8] = {k0.x,k0.y,k0.z,k0.w,k1.x,k1.y,k1.z,k1.w};
+            const float decay = sg.ab[i][0], beta = sg.ab[i][1];
+            float u[2], o[2] = {op[0],op[1]};
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++) {
+                float u0 = 0, u1 = 0;
+                #pragma unroll
+                for (unsigned e = 0; e < 4; e++) { s[j][e] *= decay; u0 += s[j][e]*k[e]; }
+                #pragma unroll
+                for (unsigned e = 4; e < 8; e++) { s[j][e] *= decay; u1 += s[j][e]*k[e]; }
+                u[j] = u0+u1;
+            }
+            for (int d = 8; d; d >>= 1)
+                #pragma unroll
+                for (unsigned j = 0; j < 2; j++) {
+                    u[j] += __shfl_xor_sync(0xffffffff,u[j],d);
+                    o[j] += __shfl_xor_sync(0xffffffff,o[j],d);
+                }
+            if (!l && tp != UINT_MAX) *(float2 *)(out+((uint64_t)tp*Hv+h)*D+dv0+rv) = make_float2(o[0],o[1]);
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++) {
+                const float delta = (sg.v[i][rv+j]-u[j])*beta;
+                float o0 = 0, o1 = 0;
+                #pragma unroll
+                for (unsigned e = 0; e < 4; e++) { s[j][e] += k[e]*delta; o0 += s[j][e]*q[e]; }
+                #pragma unroll
+                for (unsigned e = 4; e < 8; e++) { s[j][e] += k[e]*delta; o1 += s[j][e]*q[e]; }
+                op[j] = o0+o1;
+            }
+            tp = t;
+            #pragma unroll
+            for (unsigned j = 0; j < 2; j++)
+                #pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    if (snap && t == st) snap[base+j*D+e/4*64+e%4] = s[j][e];
+                    if (snap2 && t == st2) snap2[base+j*D+e/4*64+e%4] = s[j][e];
+                }
+        }
+    }
+    for (int d = 8; d; d >>= 1)
+        #pragma unroll
+        for (unsigned j = 0; j < 2; j++) op[j] += __shfl_xor_sync(0xffffffff,op[j],d);
+    if (!l && tp != UINT_MAX) *(float2 *)(out+((uint64_t)tp*Hv+h)*D+dv0+rv) = make_float2(op[0],op[1]);
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++)
+        #pragma unroll
+        for (unsigned e = 0; e < 8; e++) state[base+j*D+e/4*64+e%4] = s[j][e];
 }
 
 template<unsigned D>
@@ -4863,6 +5733,48 @@ __global__ void ngram_conv(float *R, const float *gated, const float *normed, fl
     for (unsigned i = 0; i < H; i++) history[(uint64_t)i * C + c] = hist[i];
 }
 
+/* Prefill: ngram_conv's arithmetic with each channel's tokens split among
+ * the block's warps, as conv_seg does: every warp reads the H inputs
+ * before its segment (or the history) ahead of the barrier that orders
+ * them before the history is rewritten. */
+__global__ void __launch_bounds__(32*CONV_SEGS) ngram_conv_seg(float *R, const float *gated, const float *normed,
+        float *history, const char *w, unsigned type, unsigned T, unsigned C, unsigned K,
+        unsigned dilation, float *snap, unsigned st, float *snap2, unsigned st2) {
+    pdl_enter();
+    const unsigned c = blockIdx.x*32+threadIdx.x%32, L = (T+CONV_SEGS-1)/CONV_SEGS, H = (K-1)*dilation;
+    const unsigned t0 = min(T,threadIdx.x/32*L), t1 = min(T,t0+L);
+    const bool active = c < C && t0 < t1;
+    float hist[9], taps[4];
+    if (active) {
+        for (unsigned i = 0; i < H; i++) {
+            const int p = (int)t0-(int)H+(int)i;
+            hist[i] = p < 0 ? history[(uint64_t)(p+(int)H)*C+c] : normed[(uint64_t)p*C+c];
+        }
+        for (unsigned i = 0; i < K; i++) taps[i] = scalar(w,c*K+i,type);
+    }
+    __syncthreads();
+    if (!active) return;
+    for (unsigned t = t0; t < t1; t += CONV_GROUP) {
+        float cur[CONV_GROUP], gt[CONV_GROUP], r[CONV_GROUP];
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            const uint64_t p = (uint64_t)(t+g)*C+c;
+            cur[g] = normed[p]; gt[g] = gated[p]; r[g] = R[p];
+        }
+        #pragma unroll
+        for (unsigned g = 0; g < CONV_GROUP; g++) if (t+g < t1) {
+            float v = taps[K-1]*cur[g];
+            for (unsigned i = 0; i < K-1; i++) v += taps[i]*hist[i*dilation];
+            for (unsigned i = 0; i+1 < H; i++) hist[i] = hist[i+1];
+            hist[H-1] = cur[g];
+            R[(uint64_t)(t+g)*C+c] = r[g]+(gt[g]+silu(v));
+            if (snap && t+g == st) for (unsigned i = 0; i < H; i++) snap[(uint64_t)i*C+c] = hist[i];
+            if (snap2 && t+g == st2) for (unsigned i = 0; i < H; i++) snap2[(uint64_t)i*C+c] = hist[i];
+        }
+    }
+    if (t1 == T) for (unsigned i = 0; i < H; i++) history[(uint64_t)i*C+c] = hist[i];
+}
+
 } // namespace qwen4_cuda
 
 extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *history,
@@ -4871,7 +5783,10 @@ extern "C" int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tenso
     if (!T || !C || K < 2 || K > 4 || !tensor(x, (uint64_t)T * C * 4) || !tensor(history, (uint64_t)(K - 1) * C * 4)) return 0;
     const char *w = weight(map, size, offset, (uint64_t)C * K * 4);
     if (!w) return 0;
-    launch(conv, (C + 255) / 256, 256, 0, (float *)x->ptr, (float *)history->ptr,
+    if (T > 8 && env_on("DS4_QWEN4_CONV_SEG"))
+        launch(conv_seg, (C + 31) / 32, 32 * CONV_SEGS, 0, (float *)x->ptr, (float *)history->ptr,
+            (const float *)w, T, C, K, activate);
+    else launch(conv, (C + 255) / 256, 256, 0, (float *)x->ptr, (float *)history->ptr,
         (const float *)w, T, C, K, activate, nullptr, UINT_MAX, nullptr, UINT_MAX);
     return launched();
 }
@@ -4904,6 +5819,14 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         !tensor(qkv, (uint64_t)T * (2 * Hk + Hv) * D * 4) ||
         !tensor(a, (uint64_t)T * Hv * 4) || !tensor(b, (uint64_t)T * Hv * 4) ||
         (snap && !tensor(snap, bytes)) || (snap2 && !tensor(snap2, bytes))) return 0;
+    const uintptr_t align = (uintptr_t)out->ptr | (uintptr_t)state->ptr | (uintptr_t)qkv->ptr |
+        (snap ? (uintptr_t)snap->ptr : 0) | (snap2 ? (uintptr_t)snap2->ptr : 0);
+    if (T > 8 && D == 128 && !(align & 15) && env_on("DS4_QWEN4_GDN_PIPE")) {
+        launch(gdn_scan_pipe, dim3(D / 16, Hv), 128, 0, (float *)out->ptr, (float *)state->ptr,
+            (const float *)qkv->ptr, (const float *)a->ptr, (const float *)b->ptr, T, Hk, Hv,
+            snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
+        return launched();
+    }
 #define QWEN_GDN(ROWS, DIM) launch(gdn_scan<ROWS,DIM>, dim3((DIM+4*ROWS-1)/(4*ROWS),Hv), 128, 0, (float *)out->ptr, \
         (float *)state->ptr,(const float *)qkv->ptr,(const float *)a->ptr,(const float *)b->ptr, \
         T,Hk,Hv,snap ? (float *)snap->ptr : nullptr,st,snap2 ? (float *)snap2->ptr : nullptr,st2)
@@ -4952,7 +5875,11 @@ extern "C" int ds4_gpu_qwen4_ple_conv_tensor(ds4_gpu_tensor *R, const ds4_gpu_te
         !tensor(history, hb) || (snap && !tensor(snap, hb)) || (snap2 && !tensor(snap2, hb))) return 0;
     const char *w = weight(map, size, off, row_bytes(type, (uint64_t)C * K));
     if (!w) return 0;
-    launch(ngram_conv, (C + 255) / 256, 256, 0, (float *)R->ptr,
+    if (T > 8 && env_on("DS4_QWEN4_CONV_SEG"))
+        launch(ngram_conv_seg, (C + 31) / 32, 32 * CONV_SEGS, 0, (float *)R->ptr,
+            (const float *)gated->ptr, (const float *)normed->ptr, (float *)history->ptr, w, type, T, C, K,
+            dilation, snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
+    else launch(ngram_conv, (C + 255) / 256, 256, 0, (float *)R->ptr,
         (const float *)gated->ptr, (const float *)normed->ptr, (float *)history->ptr, w, type, T, C, K,
         dilation, snap ? (float *)snap->ptr : nullptr, st, snap2 ? (float *)snap2->ptr : nullptr, st2);
     return launched();
@@ -5384,6 +6311,18 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t
         p.p[i] = {w,(float *)outs[i]->ptr,rows[i],(rows[i]+15)/16};
     }
     if (fuse) { p.n = N; return rows_tc_dispatch(p,(const float *)x->ptr,T,K,types[0],S); }
+    /* Q8 prefill projections, which dense_mm would each take to
+     * dense_q8_blas: the input packed once for all of them */
+    bool q8 = N > 1 && T > 32 && S >= 32 && g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32") &&
+              tensor(x,(uint64_t)T*K*4) && env_on("DS4_QWEN4_PACK_ONCE");
+    float *o[4] = {};
+    const char *w[4] = {};
+    for (unsigned i = 0; q8 && i < N; i++) {
+        q8 = types[i] == 8 && rows[i] && tensor(outs[i],(uint64_t)T*rows[i]*4) &&
+             (w[i] = weight(map,size,offsets[i],row_bytes(8,K)*rows[i])) != nullptr;
+        o[i] = q8 ? (float *)outs[i]->ptr : nullptr;
+    }
+    if (q8) return dense_q8_blas_n(o,(const float *)x->ptr,w,rows,N,T,K);
     for (unsigned i = 0; i < N; i++)
         if (!ds4_gpu_qwen4_dense_mm_tensor(outs[i], x, map, size, offsets[i], types[i], T, K, rows[i])) return 0;
     return 1;
