@@ -3691,6 +3691,51 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* CUDA only: NVFP4 routed experts (GGML type 40) with each expert's F32
+ * global scale, read from the [n_total_expert] tensors at the *_scale
+ * offsets; otherwise as ds4_gpu_qwen4_moe_mid_prefetch_tensor (gate/up),
+ * ds4_gpu_qwen4_moe_down_tensor and, for prefill,
+ * ds4_gpu_qwen4_moe_mm_mid/down_tensor with n_out == n_slots (selected
+ * serves the FP32 fallback). */
+int ds4_gpu_qwen4_moe_nvfp4_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type,
+        uint64_t shared_down_offset, uint32_t shared_down_type);
+int ds4_gpu_qwen4_moe_nvfp4_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_nvfp4_mm_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_scale_offset, uint64_t up_scale_offset,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap);
+int ds4_gpu_qwen4_moe_nvfp4_mm_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint64_t down_scale_offset,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* CUDA only: rows [0, rows) of a K-wide F32/F16/BF16 matrix in the model map
+ * as GGML Q8_0 blocks with ggml's reference rounding (quantize_row_q8_0_ref)
+ * into dst. */
+int ds4_gpu_qwen4_quantize_q8_0_tensor(
+        ds4_gpu_tensor *dst, const void *model_map, uint64_t model_size, uint64_t offset,
+        uint32_t type, uint32_t in_dim, uint32_t rows);
+/* CUDA only: out[n_tokens][out_dim] = rows [0, out_dim) of that Q8_0 form
+ * of a rows x in_dim matrix times x, the copy made on first use and kept
+ * with the model's derived weights.  1 when it ran, 0 when there is no copy
+ * (none can be made while a decode graph is captured, or the allocation
+ * failed: the caller uses the stored matrix), -1 on error.  For MTP drafts,
+ * which only need their argmax. */
+int ds4_gpu_qwen4_q8_copy_rows_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t offset,
+        uint32_t type, uint32_t in_dim, uint32_t rows, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tokens);
 /* weight_type covers both the alpha and the beta projection */
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
@@ -3700,11 +3745,11 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
-/* CUDA only.  Decode (n_tokens <= 3) GDN front: the qkv/gate Q8 projections
- * with alpha/beta and the causal conv folded into their launch, then the
- * q/k norm, in place of the qkv/gate pair plus gdn_front_tensor.  Returns 0
- * when it does not apply (nothing launched), 1 when the front ran, -1 on
- * error. */
+/* CUDA only.  Decode (n_tokens <= 3) GDN front: the qkv/gate Q8 (or MXFP8,
+ * qkv_type) projections with alpha/beta and the causal conv folded into
+ * their launch, then the q/k norm, in place of the qkv/gate pair plus
+ * gdn_front_tensor.  Returns 0 when it does not apply (nothing launched), 1
+ * when the front ran, -1 on error. */
 int ds4_gpu_qwen4_gdn_proj_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *z, ds4_gpu_tensor *conv_state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,
@@ -3712,7 +3757,7 @@ int ds4_gpu_qwen4_gdn_proj_tensor(
         uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset, uint32_t alpha_type,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
-        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok, uint32_t qkv_type);
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */

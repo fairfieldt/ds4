@@ -144,6 +144,78 @@ static void test_8bit(const char *path, const uint32_t *rows, size_t n, float *o
     }
 }
 
+/* NVFP4 rows: ten E4M3 scales, then 80 code bytes (low nibble first), with
+ * one F32 global scale in the metadata (kv: 0 none, 1 the scale, 2 zero). */
+static uint8_t scale4(size_t row, size_t g) { return (uint8_t)(g == 3 ? 1 + row % 7 : 0x20 + (row * 13 + g * 5) % 0x40); }
+static uint8_t code4(size_t row, size_t b) { return (uint8_t)((row * 37 + b * 11) % 256); }
+
+static void fixture4(const char *path, int kv, uint64_t width) {
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fwrite("GGUF", 4, 1, f) == 1);
+    u32(f, 3); u64(f, 2); u64(f, kv ? 3 : 2);
+    str(f, "general.architecture"); u32(f, 8); str(f, "qwen4exp");
+    str(f, "qwen4exp.ple.ngram_encoding"); u32(f, 8); str(f, "nvfp4_e4m3x16");
+    if (kv) {
+        const float g = kv == 1 ? 0x1p-7f * 1.375f : 0.0f;
+        str(f, "qwen4exp.ple.ngram_global_scale"); u32(f, 6); assert(fwrite(&g, 4, 1, f) == 1);
+    }
+    str(f, "token_embd.weight"); u32(f, 2); u64(f, 1); u64(f, 1); u32(f, 0); u64(f, 0);
+    str(f, "per_layer_token_embd.weight"); u32(f, 2); u64(f, width); u64(f, 1000); u32(f, 24);
+    uint64_t start = ((uint64_t)ftell(f) + 8 + 31) / 32 * 32;
+    u64(f, 65536 - start);
+    assert(!fseek(f, (long)start, SEEK_SET));
+    u32(f, 0x3f800000);
+    assert(!fseek(f, 65536, SEEK_SET));
+    for (size_t r = 0; r < 1000; r++) {
+        for (size_t g = 0; g < 10; g++) { uint8_t v = scale4(r, g); assert(fwrite(&v, 1, 1, f) == 1); }
+        for (size_t b = 0; b < 80; b++) { uint8_t v = code4(r, b); assert(fwrite(&v, 1, 1, f) == 1); }
+    }
+    assert(!ftruncate(fileno(f), 65536 + 100000));
+    assert(!fclose(f));
+}
+
+static void test_nvfp4(const char *path, const uint32_t *rows, size_t n, float *out) {
+    static const float e2m1[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    const float gscale = 0x1p-7f * 1.375f;
+    fixture4(path, 1, 90);
+    ds4_model m;
+    model_open(&m, path, false, false);
+    assert(m.size == 65536 && m.ngram_tensor && m.ngram_width == 160 && m.ngram_row_bytes == 90 &&
+           m.ngram_encoding == DS4_NGRAM_NVFP4_ROW && m.ngram_global_scale == gscale);
+    const size_t sizes[] = {1, 16, 4097, n};
+    for (size_t ni = 0; ni < sizeof(sizes)/sizeof(*sizes); ni++) {
+        memset(out, 0xff, sizes[ni] * 160 * sizeof(*out));
+        assert(qwen4_ngram_read(&m, rows, sizes[ni], out));
+        for (size_t i = 0; i < sizes[ni]; i++) {
+            for (size_t c = 0; c < 160; c++) {
+                const uint8_t b = code4(rows[i], c / 2);
+                const float scale = e4m3_ref(scale4(rows[i], c / 16)) * gscale;
+                assert(out[i*160+c] == e2m1[c & 1 ? b >> 4 : b & 15] * scale);
+            }
+        }
+    }
+    int fd = open(path, O_WRONLY);
+    assert(fd >= 0);
+    uint32_t first = 0;
+    const uint8_t bad[] = {0x7f, 0xff, 0xb8};
+    for (size_t bi = 0; bi < 3; bi++) {
+        assert(pwrite(fd, &bad[bi], 1, 65536 + 4) == 1);
+        assert(!qwen4_ngram_read(&m, &first, 1, out) && errno == EDOM);
+    }
+    close(fd);
+    model_close(&m);
+    /* no global scale, a zero one, and rows of the wrong size */
+    for (int b = 0; b < 3; b++) {
+        fixture4(path, b == 0 ? 0 : b == 1 ? 2 : 1, b == 2 ? 91 : 90);
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (!pid) { model_open(&m, path, false, false); _exit(0); }
+        int status;
+        assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    }
+}
+
 int main(void) {
     /* the fixture goes under TMPDIR when it is set */
     const char *dir = getenv("TMPDIR");
@@ -223,7 +295,8 @@ int main(void) {
         assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     }
     test_8bit(path, rows, N, out);
+    test_nvfp4(path, rows, N, out);
     free(rows); free(out); unlink(path);
-    puts("Qwen BF16 and 8-bit n-grams: disk-only mapping, exact reads, batches and errors OK");
+    puts("Qwen BF16, 8-bit and NVFP4 n-grams: disk-only mapping, exact reads, batches and errors OK");
     return 0;
 }
