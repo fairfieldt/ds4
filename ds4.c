@@ -58820,7 +58820,11 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS;
+           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS
+#ifndef DS4_HAS_QWEN4_METAL
+           || type == DS4_TENSOR_Q4_0
+#endif
+           ;
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
@@ -59958,7 +59962,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * chose it instead of once per row, each row's arithmetic unchanged.
      * On Metal, DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
     const bool grouped = shared_dense && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4
+        l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        (l->ffn_down_exps->type == DS4_TENSOR_MXFP4
+#ifndef DS4_HAS_QWEN4_METAL
+         || l->ffn_down_exps->type == DS4_TENSOR_Q4_0
+#endif
+        )
 #ifdef DS4_HAS_QWEN4_METAL
         && getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL
 #endif
