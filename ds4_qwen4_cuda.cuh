@@ -374,6 +374,52 @@ __global__ void idx_score(float *out, const float *q, const __half *key,
     idx_score_body(out,q,key,N,H,D,pos0,ratio,blockIdx.y);
 }
 
+/* Scores of eight consecutive blocks per warp, plus the largest key of
+ * those eight (max(score, 0) as bits) for the long-row selection.  Each
+ * score is computed as in idx_score_body, from queries held in registers
+ * and with all of the warp's key loads issued first.  At most four heads. */
+template<unsigned DPL>
+__global__ void __launch_bounds__(256) idx_score_tiles(float *out, unsigned *tiles, const float *q, const __half *key,
+        unsigned N, unsigned H, unsigned pos0, unsigned ratio, unsigned nt) {
+    pdl_enter_early();
+    constexpr unsigned D = DPL * 32;
+    const unsigned t = blockIdx.y, lane = threadIdx.x & 31, tile = blockIdx.x * 8 + threadIdx.x / 32, b0 = tile * 8;
+    if (b0 >= N) return;
+    float qv[4][DPL];
+    #pragma unroll
+    for (unsigned h = 0; h < 4; h++)
+        #pragma unroll
+        for (unsigned i = 0; i < DPL; i++) qv[h][i] = h < H ? q[((uint64_t)t * H + h) * D + lane + 32 * i] : 0;
+    __half kr[8][DPL];
+    #pragma unroll
+    for (unsigned j = 0; j < 8; j++)
+        #pragma unroll
+        for (unsigned i = 0; i < DPL; i++)
+            kr[j][i] = b0 + j < N ? key[(uint64_t)(b0 + j) * D + lane + 32 * i] : __float2half_rn(0);
+    const unsigned visible = (pos0 + t + 1) / ratio;
+    float mine = 0;
+    unsigned top = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < 8; j++) {
+        float score = 0;
+        if (b0 + j >= visible) score = -3e38f;
+        else {
+            #pragma unroll
+            for (unsigned h = 0; h < 4; h++) {
+                if (h >= H) break;
+                float a = 0;
+                #pragma unroll
+                for (unsigned i = 0; i < DPL; i++) a += qv[h][i] * __half2float(kr[j][i]);
+                score += fmaxf(sum(a), 0);
+            }
+        }
+        if (lane == j) mine = score;
+        if (b0 + j < N) top = max(top, __float_as_uint(fmaxf(score, 0)));
+    }
+    if (lane < 8 && b0 + lane < N) out[(uint64_t)t * N + b0 + lane] = mine;
+    if (!lane) tiles[(uint64_t)t * nt + tile] = top;
+}
+
 __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigned tiles) {
     pdl_enter();
     const unsigned tile = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -384,56 +430,386 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
     out[(uint64_t)t * tiles + tile] = v;
 }
 
+/* Inclusive prefix sums of a and b over the 256 threads of the block, in
+ * thread order: a warp shuffle scan, then the preceding warps' totals. */
+__device__ __forceinline__ void block_scan256(unsigned &a, unsigned &b, unsigned (*tot)[8]) {
+    const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    for (unsigned o = 1; o < 32; o <<= 1) {
+        const unsigned na = __shfl_up_sync(0xffffffffu, a, o), nb = __shfl_up_sync(0xffffffffu, b, o);
+        if (lane >= o) { a += na; b += nb; }
+    }
+    if (lane == 31) { tot[0][w] = a; tot[1][w] = b; }
+    __syncthreads();
+    for (unsigned i = 0; i < w; i++) { a += tot[0][i]; b += tot[1][i]; }
+    __syncthreads();
+}
+
 /* Exact radix threshold and stable gather, with the same greater-than then
- * equal-score ordering as Metal. No context-dependent candidate truncation. */
+ * equal-score ordering as Metal. No context-dependent candidate truncation.
+ * Block-parallel throughout: histogram increments are aggregated per warp
+ * (the first pass puts nearly all keys into two or three exponent bins),
+ * the digit walk is a suffix scan whose first bin reaching `need` is found
+ * with one __syncthreads_count, and the gather offsets are a block scan. */
 __device__ __forceinline__ void idx_select_body(int *out, const float *score, unsigned N, unsigned K, unsigned t) {
-    const unsigned tid = threadIdx.x;
-    __shared__ unsigned hist[256], gt[256], eq[256], threshold, need;
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    __shared__ unsigned hist[256], tot[2][8], threshold, need;
     const float *row = score + (uint64_t)t * N;
     if (!tid) { threshold = 0; need = K; }
-    __syncthreads();
     for (unsigned pass = 0; pass < 4; pass++) {
         const unsigned shift = 24 - 8 * pass, mask = pass ? (0xffffffffu << (shift + 8)) : 0;
         hist[tid] = 0;
         __syncthreads();
-        for (unsigned i = tid; i < N; i += 256) {
-            const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-            if ((key & mask) == threshold) atomicAdd(hist + ((key >> shift) & 255), 1u);
+        const unsigned thr = threshold;
+        for (unsigned base = w * 32; base < N; base += 256) {
+            const unsigned i = base + lane;
+            unsigned bin = 256;
+            if (i < N) {
+                const unsigned key = __float_as_uint(fmaxf(row[i], 0));
+                if ((key & mask) == thr) bin = (key >> shift) & 255;
+            }
+            const unsigned peers = __match_any_sync(0xffffffffu, bin);
+            if (bin < 256 && lane == (unsigned)__ffs(peers) - 1) atomicAdd(hist + bin, (unsigned)__popc(peers));
         }
         __syncthreads();
-        if (!tid) for (int d = 255; d >= 0; d--) {
-            if (hist[d] >= need) { threshold |= (unsigned)d << shift; break; }
-            need -= hist[d];
-        }
-        __syncthreads();
+        /* thread j holds digit 255 - j; incl counts the keys at digits >= it */
+        const unsigned h = hist[255 - tid], nd = need;
+        unsigned incl = h, unused = 0;
+        block_scan256(incl, unused, tot);
+        const unsigned first = __syncthreads_count(incl < nd);
+        if (first < 256) {
+            if (tid == first) { threshold = thr | (255 - tid) << shift; need = nd - (incl - h); }
+        } else if (tid == 255) need = nd - incl;
     }
+    __syncthreads();
+    const unsigned thr = threshold, nd = need;
     const unsigned chunk = (N + 255) / 256, begin = min(N, tid * chunk), end = min(N, begin + chunk);
     unsigned ng = 0, ne = 0;
     for (unsigned i = begin; i < end; i++) {
         const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        ng += key > threshold; ne += key == threshold;
+        ng += key > thr; ne += key == thr;
     }
-    gt[tid] = ng; eq[tid] = ne;
-    __syncthreads();
-    if (!tid) {
-        unsigned pg = 0, pe = 0;
-        for (unsigned i = 0; i < 256; i++) {
-            const unsigned g = gt[i], e = eq[i];
-            gt[i] = pg; eq[i] = pe; pg += g; pe += e;
-        }
-    }
-    __syncthreads();
-    unsigned g = gt[tid], e = eq[tid];
+    unsigned g = ng, e = ne;
+    block_scan256(g, e, tot);
+    g -= ng; e -= ne;
     for (unsigned i = begin; i < end; i++) {
         const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        if (key > threshold) out[(uint64_t)t * K + g++] = i;
-        else if (key == threshold) { if (e < need) out[(uint64_t)t * K + K - need + e] = i; e++; }
+        if (key > thr) out[(uint64_t)t * K + g++] = i;
+        else if (key == thr) { if (e < nd) out[(uint64_t)t * K + K - nd + e] = i; e++; }
     }
 }
 
 __global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
     pdl_enter_early();
     idx_select_body(out,score,N,K,blockIdx.x);
+}
+
+/* Long rows: the same selection in about one coalesced pass over the
+ * scores instead of six, which one 256-thread block made latency-bound
+ * (259 us a row at 200K tokens of context).  The largest key of each group
+ * of s scores (s the finest power of two leaving at most SEL_GMAX groups)
+ * comes from the scorer's 8-block tile maxima when given, else from a pass
+ * over the row.  At least k keys reach the k-th largest group maximum, so
+ * its 22-bit prefix tau bounds the threshold from below: the keys at or
+ * above tau are gathered from the groups whose maximum reaches it, and
+ * three radix rounds over them in shared memory find the threshold.  The
+ * output is written from two bitmaps in index order, so every slot matches
+ * idx_select_body.  More than SEL_CAP gathered keys (heavy ties), or fewer
+ * than k, resolve on the scores instead. */
+enum { SEL_CAP = 4096, SEL_GMAX = 8192, SEL_LOADS = 8, SEL_HIST = 4096 + 1024 + 1024 };
+
+/* Group size; 8-block tiles serve rows of more than SEL_GMAX scores. */
+__host__ __device__ __forceinline__ unsigned sel_group(unsigned N, bool tiles) {
+    unsigned s = 1;
+    while ((N + s - 1) / s > SEL_GMAX) s *= 2;
+    return tiles && s < 8 && N > SEL_GMAX ? 8 : s;
+}
+
+/* Dynamic shared memory: the group maxima (then the bitmap of keys above
+ * the threshold), the round counts (also the list of groups reaching tau,
+ * then the bitmap of keys equal to the threshold) and the gathered keys
+ * with their indices. */
+__host__ __device__ __forceinline__ unsigned sel_region_a(unsigned N, bool tiles) {
+    const unsigned s = sel_group(N, tiles);
+    return ((N + s - 1) / s * 4 + 15) & ~15u;
+}
+__host__ __device__ __forceinline__ unsigned sel_region_b(unsigned N) {
+    const unsigned words = (N + 31) / 32 * 4;
+    return ((words > SEL_HIST * 4 ? words : SEL_HIST * 4) + 15) & ~15u;
+}
+__host__ __device__ __forceinline__ unsigned idx_select_wide_smem(unsigned N, bool tiles) {
+    return sel_region_a(N, tiles) + sel_region_b(N) + SEL_CAP * 8;
+}
+
+/* The bin holding the need-th largest counted key, walking the NB bins from
+ * the top: res = {bin, keys of it still needed}.  Thread j sums bins
+ * [NB - BPT (j + 1), NB - BPT j); the counts must total at least need. */
+template<unsigned NT, unsigned NB>
+__device__ __forceinline__ void sel_find(const unsigned *hist, unsigned need, unsigned *tot, unsigned *res) {
+    constexpr unsigned BPT = NB / NT;
+    static_assert(BPT == 1 || BPT == 4, "sel_find reads one or four bins a thread");
+    const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5, top = NB - 1 - threadIdx.x * BPT;
+    unsigned h[BPT];
+    if constexpr (BPT == 4) {
+        const uint4 v = *(const uint4 *)(hist + NB - 4 * (threadIdx.x + 1));
+        h[0] = v.w; h[1] = v.z; h[2] = v.y; h[3] = v.x;
+    } else {
+        h[0] = hist[top];
+    }
+    unsigned s = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < BPT; i++) s += h[i];
+    unsigned incl = s;
+    for (unsigned o = 1; o < 32; o <<= 1) {
+        const unsigned v = __shfl_up_sync(~0u, incl, o);
+        if (lane >= o) incl += v;
+    }
+    if (lane == 31) tot[w] = incl;
+    __syncthreads();
+    incl += __reduce_add_sync(~0u, lane < w ? tot[lane] : 0);
+    if (incl >= need && incl - s < need) {
+        unsigned c = incl - s;
+        #pragma unroll
+        for (unsigned i = 0; i < BPT; i++) {
+            if (c + h[i] >= need) { res[0] = top - i; res[1] = need - c; break; }
+            c += h[i];
+        }
+    }
+    __syncthreads();
+}
+
+/* Keys of the 32-score chunks c0, c0 + NW, ... of one warp, SEL_LOADS
+ * coalesced loads in flight; lanes past N read key 0. */
+template<unsigned NW>
+__device__ __forceinline__ void sel_load(unsigned (&key)[SEL_LOADS], const float *row, unsigned N, unsigned c0) {
+    const unsigned lane = threadIdx.x & 31;
+    #pragma unroll
+    for (unsigned u = 0; u < SEL_LOADS; u++) {
+        const unsigned i = (c0 + NW * u) * 32 + lane;
+        key[u] = i < N ? __float_as_uint(fmaxf(row[i], 0)) : 0;
+    }
+}
+
+/* hist[bin] += 1 for each lane with bin < limit, one atomic per distinct bin */
+__device__ __forceinline__ void sel_count(unsigned *hist, unsigned bin, unsigned limit) {
+    const unsigned peers = __match_any_sync(~0u, bin);
+    if (bin < limit && (threadIdx.x & 31) == (unsigned)__ffs(peers) - 1) atomicAdd(hist + bin, (unsigned)__popc(peers));
+}
+
+/* One radix round over keys in shared memory (n of them, every stride-th
+ * word): count the digit at shift of the keys matching prefix/mask. */
+template<unsigned NT>
+__device__ __forceinline__ void sel_round_smem(unsigned *hist, const unsigned *keys, unsigned stride, unsigned n,
+        unsigned prefix, unsigned mask, unsigned shift, unsigned nb) {
+    for (unsigned c0 = 0; c0 < n; c0 += NT) {
+        const unsigned c = c0 + threadIdx.x, key = c < n ? keys[(uint64_t)c * stride] : 0;
+        sel_count(hist, c < n && (key & mask) == prefix ? (key >> shift) & (nb - 1) : nb, nb);
+    }
+}
+
+/* The same round over the whole row (the tie fallback). */
+template<unsigned NT>
+__device__ __forceinline__ void sel_round_row(unsigned *hist, const float *row, unsigned N,
+        unsigned prefix, unsigned mask, unsigned shift, unsigned nb) {
+    constexpr unsigned NW = NT / 32;
+    const unsigned lane = threadIdx.x & 31, W = (N + 31) / 32;
+    for (unsigned c0 = threadIdx.x >> 5; c0 < W; c0 += NW * SEL_LOADS) {
+        unsigned key[SEL_LOADS];
+        sel_load<NW>(key, row, N, c0);
+        #pragma unroll
+        for (unsigned u = 0; u < SEL_LOADS; u++)
+            sel_count(hist, (c0 + NW * u) * 32 + lane < N && (key[u] & mask) == prefix ?
+                            (key[u] >> shift) & (nb - 1) : nb, nb);
+    }
+}
+
+/* tiles: the row's 8-block tile maxima (ceil(N / 8) of them), or NULL */
+template<unsigned NT>
+__device__ __forceinline__ void idx_select_wide_body(int *out, const float *row, const unsigned *tiles,
+        unsigned N, unsigned K, unsigned char *smem) {
+    constexpr unsigned NW = NT / 32;
+    const unsigned tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const unsigned s = sel_group(N, tiles != nullptr), ls = 31 - __clz(s), G = (N + s - 1) >> ls, W = (N + 31) / 32;
+    unsigned *gmax = (unsigned *)smem, *gt = gmax;
+    unsigned *h12 = (unsigned *)(smem + sel_region_a(N, tiles != nullptr)), *h10 = h12 + 4096, *h10b = h10 + 1024;
+    unsigned *eq = h12;
+    unsigned short *hot = (unsigned short *)h12;
+    uint2 *cand = (uint2 *)(smem + sel_region_a(N, tiles != nullptr) + sel_region_b(N));
+    __shared__ unsigned tot[32], res[2], ncand, nhot;
+    for (unsigned i = tid; i < SEL_HIST; i += NT) h12[i] = 0;
+    if (!tid) { ncand = 0; nhot = 0; }
+    if (tiles && s >= 8) {
+        /* group maxima from the tiles: r = s / 8 tiles a group */
+        const unsigned lr = ls - 3, nt = (N + 7) / 8;
+        for (unsigned c0 = w; c0 * 32 < nt; c0 += NW * SEL_LOADS) {
+            unsigned v[SEL_LOADS];
+            #pragma unroll
+            for (unsigned u = 0; u < SEL_LOADS; u++) {
+                const unsigned x = (c0 + NW * u) * 32 + lane;
+                v[u] = x < nt ? tiles[x] : 0;
+            }
+            #pragma unroll
+            for (unsigned u = 0; u < SEL_LOADS; u++) {
+                const unsigned x = (c0 + NW * u) * 32 + lane;
+                unsigned m = v[u];
+                for (unsigned o = 1; o < (1u << lr); o <<= 1) m = max(m, __shfl_xor_sync(~0u, m, o));
+                if (x < nt && !(lane & ((1u << lr) - 1))) gmax[x >> lr] = m;
+            }
+        }
+    } else {
+        for (unsigned c0 = w; c0 < W; c0 += NW * SEL_LOADS) {
+            unsigned key[SEL_LOADS];
+            sel_load<NW>(key, row, N, c0);
+            #pragma unroll
+            for (unsigned u = 0; u < SEL_LOADS; u++) {
+                const unsigned i = (c0 + NW * u) * 32 + lane;
+                unsigned m = key[u];
+                if (s == 32) m = __reduce_max_sync(~0u, m);
+                else for (unsigned o = 1; o < s; o <<= 1) m = max(m, __shfl_xor_sync(~0u, m, o));
+                if (i < N && !(lane & (s - 1))) gmax[i >> ls] = m;
+            }
+        }
+    }
+    __syncthreads();
+    /* tau: the k-th largest group maximum, to 22 bits */
+    sel_round_smem<NT>(h12, gmax, 1, G, 0, 0, 20, 4096);
+    __syncthreads();
+    sel_find<NT, 4096>(h12, K, tot, res);
+    const unsigned b1 = res[0];
+    sel_round_smem<NT>(h10, gmax, 1, G, b1 << 20, 0xfff00000u, 10, 1024);
+    __syncthreads();
+    sel_find<NT, 1024>(h10, res[1], tot, res);
+    const unsigned tau = b1 << 20 | res[0] << 10;
+    /* the groups reaching tau */
+    for (unsigned g0 = w * 32; g0 < G; g0 += NT) {
+        const unsigned g = g0 + lane;
+        const bool h = g < G && gmax[g] >= tau;
+        const unsigned m = __ballot_sync(~0u, h);
+        if (m) {
+            unsigned base = 0;
+            if (!lane) base = atomicAdd(&nhot, (unsigned)__popc(m));
+            base = __shfl_sync(~0u, base, 0);
+            if (h) hot[base + __popc(m & ((1u << lane) - 1))] = (unsigned short)g;
+        }
+    }
+    __syncthreads();
+    /* their keys at or above tau: 32 / s groups a load */
+    const unsigned H = nhot, gl = 5 - min(ls, 5u);
+    for (unsigned c0 = w; c0 << gl < H; c0 += NW * SEL_LOADS) {
+        unsigned key[SEL_LOADS], idx[SEL_LOADS], ball[SEL_LOADS], n = 0;
+        #pragma unroll
+        for (unsigned u = 0; u < SEL_LOADS; u++) {
+            const unsigned e = ((c0 + NW * u) << gl) + (lane >> ls);
+            idx[u] = e < H ? ((unsigned)hot[e] << ls) + (lane & (s - 1)) : N;
+            key[u] = idx[u] < N ? __float_as_uint(fmaxf(row[idx[u]], 0)) : 0;
+        }
+        #pragma unroll
+        for (unsigned u = 0; u < SEL_LOADS; u++) {
+            ball[u] = __ballot_sync(~0u, idx[u] < N && key[u] >= tau);
+            n += __popc(ball[u]);
+        }
+        if (n) {
+            unsigned base = 0;
+            if (!lane) base = atomicAdd(&ncand, n);
+            base = __shfl_sync(~0u, base, 0);
+            #pragma unroll
+            for (unsigned u = 0; u < SEL_LOADS; u++) {
+                const unsigned p = base + __popc(ball[u] & ((1u << lane) - 1));
+                if (ball[u] >> lane & 1 && p < SEL_CAP) cand[p] = make_uint2(key[u], idx[u]);
+                base += __popc(ball[u]);
+            }
+        }
+    }
+    __syncthreads();
+    for (unsigned i = tid; i < SEL_HIST; i += NT) h12[i] = 0;
+    __syncthreads();
+    const unsigned M = ncand;
+    unsigned thr, nd;
+    if (M >= K && M <= SEL_CAP) {
+        const unsigned *ck = &cand[0].x;
+        sel_round_smem<NT>(h12, ck, 2, M, 0, 0, 20, 4096);
+        __syncthreads();
+        sel_find<NT, 4096>(h12, K, tot, res);
+        unsigned prefix = res[0] << 20;
+        sel_round_smem<NT>(h10, ck, 2, M, prefix, 0xfff00000u, 10, 1024);
+        __syncthreads();
+        sel_find<NT, 1024>(h10, res[1], tot, res);
+        prefix |= res[0] << 10;
+        sel_round_smem<NT>(h10b, ck, 2, M, prefix, 0xfffffc00u, 0, 1024);
+        __syncthreads();
+        sel_find<NT, 1024>(h10b, res[1], tot, res);
+        thr = prefix | res[0];
+        nd = res[1];
+        for (unsigned i = tid; i < W; i += NT) { gt[i] = 0; eq[i] = 0; }
+        __syncthreads();
+        for (unsigned c = tid; c < M; c += NT) {
+            const uint2 v = cand[c];
+            if (v.x > thr) atomicOr(gt + v.y / 32, 1u << (v.y & 31));
+            else if (v.x == thr) atomicOr(eq + v.y / 32, 1u << (v.y & 31));
+        }
+    } else {
+        sel_round_row<NT>(h12, row, N, 0, 0, 20, 4096);
+        __syncthreads();
+        sel_find<NT, 4096>(h12, K, tot, res);
+        unsigned prefix = res[0] << 20;
+        sel_round_row<NT>(h10, row, N, prefix, 0xfff00000u, 10, 1024);
+        __syncthreads();
+        sel_find<NT, 1024>(h10, res[1], tot, res);
+        prefix |= res[0] << 10;
+        sel_round_row<NT>(h10b, row, N, prefix, 0xfffffc00u, 0, 1024);
+        __syncthreads();
+        sel_find<NT, 1024>(h10b, res[1], tot, res);
+        thr = prefix | res[0];
+        nd = res[1];
+        for (unsigned c0 = w; c0 < W; c0 += NW * SEL_LOADS) {
+            unsigned key[SEL_LOADS];
+            sel_load<NW>(key, row, N, c0);
+            #pragma unroll
+            for (unsigned u = 0; u < SEL_LOADS; u++) {
+                const unsigned c = c0 + NW * u;
+                const bool ok = c * 32 + lane < N;
+                const unsigned a = __ballot_sync(~0u, ok && key[u] > thr), e = __ballot_sync(~0u, ok && key[u] == thr);
+                if (!lane && c < W) { gt[c] = a; eq[c] = e; }
+            }
+        }
+    }
+    __syncthreads();
+    /* index order: warp w takes words [a0, a1), 32 at a time; the slots
+     * are staged over the gathered keys and written out together */
+    int *slots = (int *)cand;
+    const unsigned per = (W + NW - 1) / NW, a0 = min(W, w * per), a1 = min(W, a0 + per);
+    unsigned ng = 0, ne = 0;
+    for (unsigned a = a0 + lane; a < a1; a += 32) { ng += __popc(gt[a]); ne += __popc(eq[a]); }
+    ng = __reduce_add_sync(~0u, ng);
+    ne = __reduce_add_sync(~0u, ne);
+    __shared__ unsigned wtot[2][32];
+    if (!lane) { wtot[0][w] = ng; wtot[1][w] = ne; }
+    __syncthreads();
+    unsigned g = __reduce_add_sync(~0u, lane < w ? wtot[0][lane] : 0);
+    unsigned e = __reduce_add_sync(~0u, lane < w ? wtot[1][lane] : 0);
+    for (unsigned a = a0; a < a1; a += 32) {
+        const unsigned bg = a + lane < a1 ? gt[a + lane] : 0, be = a + lane < a1 ? eq[a + lane] : 0;
+        unsigned pg = __popc(bg), pe = __popc(be);
+        for (unsigned o = 1; o < 32; o <<= 1) {
+            const unsigned vg = __shfl_up_sync(~0u, pg, o), ve = __shfl_up_sync(~0u, pe, o);
+            if (lane >= o) { pg += vg; pe += ve; }
+        }
+        unsigned og = g + pg - __popc(bg), oe = e + pe - __popc(be);
+        for (unsigned b = bg; b; b &= b - 1) slots[og++] = (a + lane) * 32 + __ffs(b) - 1;
+        for (unsigned b = be; b; b &= b - 1, oe++) if (oe < nd) slots[K - nd + oe] = (a + lane) * 32 + __ffs(b) - 1;
+        g += __shfl_sync(~0u, pg, 31);
+        e += __shfl_sync(~0u, pe, 31);
+    }
+    __syncthreads();
+    for (unsigned i = tid; i < K; i += NT) out[i] = slots[i];
+}
+
+__global__ void __launch_bounds__(1024) idx_select_wide(int *out, const float *score, const unsigned *tiles,
+        unsigned N, unsigned K) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    pdl_enter_early();
+    const unsigned t = blockIdx.x;
+    idx_select_wide_body<1024>(out + (uint64_t)t * K, score + (uint64_t)t * N,
+                               tiles ? tiles + (uint64_t)t * ((N + 7) / 8) : nullptr, N, K, wsm);
 }
 
 __device__ __forceinline__ void idx_expand_body(int *out, unsigned *count, const int *blocks,
@@ -3424,6 +3800,16 @@ __global__ void idx_select_rows(int *out, const float *score, const attn_row *ro
     idx_select_body(out+(uint64_t)r*K,score+(uint64_t)r*stride,(row.pos+1)/ratio,K,0);
 }
 
+__global__ void __launch_bounds__(1024) idx_select_wide_rows(int *out, const float *score, const attn_row *rows,
+                                                            unsigned stride, unsigned K, unsigned ratio) {
+    extern __shared__ __align__(16) unsigned char wsm[];
+    pdl_enter();
+    const unsigned r = blockIdx.x;
+    const attn_row row = rows[r];
+    if (!row.sparse) return;
+    idx_select_wide_body<1024>(out+(uint64_t)r*K,score+(uint64_t)r*stride,nullptr,(row.pos+1)/ratio,K,wsm);
+}
+
 __global__ void idx_expand_rows(int *out, unsigned *count, const int *blocks, const attn_row *rows,
                                unsigned K, unsigned ratio, unsigned stride) {
     pdl_enter();
@@ -4030,6 +4416,13 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    if (tiles && H <= 4 && D % 32 == 0 && D <= 128) {
+#define QWEN_SCORE_TILES(DPL) case DPL: launch(idx_score_tiles<DPL>, dim3((nt + 7) / 8, T), 256, 0, (float *)out->ptr, \
+        (unsigned *)tiles->ptr, (const float *)q->ptr, (const __half *)key->ptr, N, H, pos0, ratio, nt); break
+        switch (D / 32) { QWEN_SCORE_TILES(1); QWEN_SCORE_TILES(2); QWEN_SCORE_TILES(3); QWEN_SCORE_TILES(4); }
+#undef QWEN_SCORE_TILES
+        return launched();
+    }
     launch(idx_score, dim3((N + 3) / 4, T), 128, 0, (float *)out->ptr,
         (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
     if (!launched()) return 0;
@@ -4038,12 +4431,47 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     return launched();
 }
 
+namespace qwen4_cuda {
+/* Rows of at least this many scores take idx_select_wide (both kernels give
+ * the same slots).  For a token or a few rows that is from 2048 scores (8K
+ * tokens of context), where idx_select's latency starts to exceed it; a
+ * prefill chunk's many rows keep six idx_select blocks per SM busy against
+ * one wide block, so they switch only past SEL_GMAX scores.
+ * DS4_QWEN4_SELECT_WIDE_MIN overrides both, 0 for every row. */
+static unsigned sel_wide_min(unsigned rows) {
+    static long v = -2;
+    if (v == -2) {
+        const char *env = getenv("DS4_QWEN4_SELECT_WIDE_MIN");
+        v = env && env[0] ? atol(env) : -1;
+        if (v < -1) v = 0;
+    }
+    return v >= 0 ? (unsigned)v : rows <= 16 ? 2048u : SEL_GMAX + 1;
+}
+
+/* A block may opt in to the shared memory of up to 2^18 scores (a million
+ * tokens of context); longer rows keep idx_select. */
+static bool sel_wide_fits(unsigned smem) {
+    static int opted = -1;
+    if (smem > 96u * 1024u) return false;
+    if (opted < 0) {
+        opted = cudaFuncSetAttribute(idx_select_wide, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess &&
+                cudaFuncSetAttribute(idx_select_wide_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    return opted || smem + 512u <= 48u * 1024u;
+}
+}
+
 extern "C" int ds4_gpu_qwen4_idx_select_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *score,
         const ds4_gpu_tensor *tiles, uint32_t N, uint32_t T, uint32_t K) {
     using namespace qwen4_cuda;
-    (void)tiles;
-    if (!T || !K || K > N || !tensor(out, (uint64_t)T * K * 4) || !tensor(score, (uint64_t)T * N * 4)) return 0;
-    launch(idx_select, T, 256, 0, (int *)out->ptr, (const float *)score->ptr, N, K);
+    if (!T || !K || K > N || !tensor(out, (uint64_t)T * K * 4) || !tensor(score, (uint64_t)T * N * 4) ||
+        (tiles && !tensor(tiles, (uint64_t)T * ((N + 7) / 8) * 4))) return 0;
+    const unsigned smem = idx_select_wide_smem(N, tiles != NULL);
+    if (N >= sel_wide_min(T) && K <= SEL_CAP && sel_wide_fits(smem))
+        launch(idx_select_wide, T, 1024, smem, (int *)out->ptr, (const float *)score->ptr,
+               tiles ? (const unsigned *)tiles->ptr : (const unsigned *)NULL, N, K);
+    else launch(idx_select, T, 256, 0, (int *)out->ptr, (const float *)score->ptr, N, K);
     return launched();
 }
 
@@ -4844,11 +5272,18 @@ extern "C" int ds4_gpu_qwen4_idx_select_rows_tensor(
     if (!meta || !rows || !n_rows || n_rows > meta->n || !top_k ||
         !tensor(table,(entry0+n_rows)*sizeof(attn_row)) || !tensor(score,(uint64_t)n_rows*n_block_stride*4) ||
         !tensor(sel,(uint64_t)n_rows*top_k*4)) return 0;
+    unsigned min_n = ~0u, smem = 0;
     for (unsigned i = 0; i < n_rows; i++) if (rows[i].use_sel) {
-        const unsigned N = (rows[i].pos+1)/meta->ratio;
+        const unsigned N = (rows[i].pos+1)/meta->ratio, b = idx_select_wide_smem(N,false);
         if (top_k > N || N > n_block_stride) return 0;
+        min_n = N < min_n ? N : min_n;
+        smem = b > smem ? b : smem;
     }
-    launch(idx_select_rows,n_rows,256,0,(int *)sel->ptr,(const float *)score->ptr,
+    /* every row's layout fits the largest (it is not monotonic in N) */
+    if (smem && min_n >= sel_wide_min(n_rows) && top_k <= SEL_CAP && sel_wide_fits(smem))
+        launch(idx_select_wide_rows,n_rows,1024,smem,(int *)sel->ptr,
+        (const float *)score->ptr,(const attn_row *)table->ptr+entry0,n_block_stride,top_k,meta->ratio);
+    else launch(idx_select_rows,n_rows,256,0,(int *)sel->ptr,(const float *)score->ptr,
         (const attn_row *)table->ptr+entry0,n_block_stride,top_k,meta->ratio);
     return launched();
 }
