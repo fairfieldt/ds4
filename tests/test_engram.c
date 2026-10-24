@@ -271,6 +271,40 @@ static void test_reader(void) {
             assert(output[r][count] == 123456.0f);
         }
     }
+    /* Several rows per start, alternating with one-row starts on the same reader. */
+    enum { ROWS = 6 };
+    uint32_t row_ids[ROWS][2][DS4_ENGRAM_COLS];
+    float (*row_expected)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = malloc(ROWS * sizeof(*row_expected));
+    float (*row_output)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = malloc(ROWS * sizeof(*row_output));
+    float *row_out[ROWS];
+    assert(row_expected && row_output);
+    for (unsigned r = 0; r < ROWS; r++) {
+        for (unsigned t = 0; t < 2; t++) {
+            for (unsigned c = 0; c < DS4_ENGRAM_COLS; c++) row_ids[r][t][c] = (c * 3u + r + t) % 2;
+            assert(ds4_engram_read(&tables[t], row_ids[r][t], DS4_ENGRAM_COLS, row_expected[r][t]));
+        }
+        row_out[r] = &row_output[r][0][0];
+    }
+    for (unsigned repeat = 0; repeat < 100; repeat++) {
+        const unsigned n = 1u + repeat % ROWS;
+        memset(row_output, 0xff, ROWS * sizeof(*row_output));
+        assert(ds4_engram_reader_start_rows(readers[0], tables,
+            (const uint32_t (*)[2][DS4_ENGRAM_COLS])row_ids, n, row_out));
+        assert(ds4_engram_reader_wait(readers[0], 0));
+        for (unsigned r = 0; r < n; r++)
+            assert(!memcmp(row_output[r][0], row_expected[r][0], sizeof(row_expected[r][0])));
+        assert(ds4_engram_reader_wait(readers[0], 1));
+        assert(!memcmp(row_output, row_expected, n * sizeof(*row_expected)));
+        memset(output[0], 0xff, count * sizeof(float));
+        assert(ds4_engram_reader_start(readers[0], tables, ids, output[0]));
+        assert(ds4_engram_reader_wait(readers[0], 1));
+        assert(!memcmp(output[0], expected, sizeof(expected)));
+    }
+    assert(!ds4_engram_reader_start_rows(readers[0], tables,
+        (const uint32_t (*)[2][DS4_ENGRAM_COLS])row_ids, DS4_ENGRAM_READER_MAX_ROWS + 1u, row_out) &&
+        errno == EINVAL);
+    free(row_expected);
+    free(row_output);
     ids[1][23] = 2;
     assert(!ds4_engram_reader_start(readers[0], tables, ids, output[0]) && errno == EINVAL);
     ids[1][23] = 0;

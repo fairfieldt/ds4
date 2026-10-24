@@ -349,6 +349,19 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
 /* Cache appends beyond the accepted frontier are invisible. Only the six
  * overwritten raw-ring slots and pooling carries need rollback; no compressed
  * cache proportional to the context is copied. */
+/* The verifier's snapshot and restore copies, in one batched launch where the
+ * backend has one, else one by one in order. */
+static bool ds41_dspark_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n) {
+#ifndef DS4_ROCM_BUILD
+    const int rc = ds4_gpu_tensor_copy_spans(spans, n);
+    if (rc != 0) return rc > 0;
+#endif
+    for (uint32_t i = 0; i < n; i++)
+        if (!ds4_gpu_tensor_copy(spans[i].dst, spans[i].dst_offset, spans[i].src,
+                                 spans[i].src_offset, spans[i].bytes)) return false;
+    return true;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
@@ -362,6 +375,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         gates != 2)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    ds4_gpu_copy_span spans[DS41_VERIFY_ROWS * 43u + 11u];
+    uint32_t n_spans = 0;
+#define DS41_SPAN(d_, doff, s_, soff, n_) \
+    (spans[n_spans++] = (ds4_gpu_copy_span){(d_), (doff), (s_), (soff), (n_)}, true)
     bool ok = ds4_gpu_begin_commands();
     d->verify_start = g->pos;
     d->verify_count = 0;
@@ -370,11 +387,11 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         if (i >= count && i != DS41_VERIFY_ROWS) continue;
         const uint32_t slot = (g->pos + i) % DS41_DRAFT_WINDOW;
         for (uint32_t il = 0; ok && i < count && il < 40; il++)
-            ok = ds4_gpu_tensor_copy(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
+            ok = DS41_SPAN(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
                 g->window[il], slot * kv, kv);
         for (uint32_t stage = 0; ok && i < count && stage < 3; stage++) {
             d->old_positions[stage][i] = d->positions[stage][slot];
-            ok = ds4_gpu_tensor_copy(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
+            ok = DS41_SPAN(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
                 d->target[stage], slot * feature, feature);
         }
         ds41_gpu_graph *row = &d->verified[i];
@@ -409,14 +426,15 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         else {
             /* Keep the block start as well: exact sampling can change mode
              * at the first token, before any verified token is consumed. */
-            ok = ok && ds4_gpu_tensor_copy(row->residual, 0, g->residual, 0, DS4_N_HC * feature) &&
-                ds4_gpu_tensor_copy(row->pre, 0, g->pre, 0, DS4_N_HC * 4u) &&
-                ds4_gpu_tensor_copy(row->logits, 0, g->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+            ok = ok && DS41_SPAN(row->residual, 0, g->residual, 0, DS4_N_HC * feature) &&
+                DS41_SPAN(row->pre, 0, g->pre, 0, DS4_N_HC * 4u) &&
+                DS41_SPAN(row->logits, 0, g->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
             for (uint32_t owner = 0; ok && owner < 4; owner++)
-                ok = ds4_gpu_tensor_copy(row->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, kv) &&
-                    ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
+                ok = DS41_SPAN(row->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, kv) &&
+                    DS41_SPAN(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
+    if (ok) ok = ds41_dspark_copy_spans(spans, n_spans);
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
@@ -440,24 +458,28 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     const uint32_t row = keep ? keep - 1u : DS41_VERIFY_ROWS;
     ds41_gpu_graph *last = &d->verified[row];
+    ds4_gpu_copy_span spans[DS41_VERIFY_ROWS * 43u + 11u];
+    uint32_t n_spans = 0;
     bool ok = ds4_gpu_begin_commands();
     for (uint32_t i = keep; ok && i < d->verify_count; i++) {
         const uint32_t slot = (d->verify_start + i) % DS41_DRAFT_WINDOW;
         for (uint32_t il = 0; ok && il < 40; il++)
-            ok = ds4_gpu_tensor_copy(g->window[il], slot * kv,
+            ok = DS41_SPAN(g->window[il], slot * kv,
                 d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv, kv);
         for (uint32_t stage = 0; ok && stage < 3; stage++) {
-            ok = ds4_gpu_tensor_copy(d->target[stage], slot * feature,
+            ok = DS41_SPAN(d->target[stage], slot * feature,
                 d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature, feature);
             d->positions[stage][slot] = d->old_positions[stage][i];
         }
     }
     for (uint32_t owner = 0; ok && owner < 4; owner++)
-        ok = ds4_gpu_tensor_copy(g->previous_kv[owner], 0, last->verify_previous_kv[owner], 0, kv) &&
-            ds4_gpu_tensor_copy(g->previous_score[owner], 0, last->verify_previous_score[owner], 0, kv);
-    if (ok) ok = ds4_gpu_tensor_copy(g->residual, 0, last->residual, 0, DS4_N_HC * feature) &&
-        ds4_gpu_tensor_copy(g->pre, 0, last->pre, 0, DS4_N_HC * 4u) &&
-        ds4_gpu_tensor_copy(g->logits, 0, last->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+        ok = DS41_SPAN(g->previous_kv[owner], 0, last->verify_previous_kv[owner], 0, kv) &&
+            DS41_SPAN(g->previous_score[owner], 0, last->verify_previous_score[owner], 0, kv);
+    if (ok) ok = DS41_SPAN(g->residual, 0, last->residual, 0, DS4_N_HC * feature) &&
+        DS41_SPAN(g->pre, 0, last->pre, 0, DS4_N_HC * 4u) &&
+        DS41_SPAN(g->logits, 0, last->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+    if (ok) ok = ds41_dspark_copy_spans(spans, n_spans);
+#undef DS41_SPAN
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok) {
         g->pos = last->pos;
