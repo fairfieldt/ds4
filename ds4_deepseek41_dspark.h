@@ -352,7 +352,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
 /* The verifier's snapshot and restore copies, in one batched launch where the
  * backend has one, else one by one in order. */
 static bool ds41_dspark_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
     const int rc = ds4_gpu_tensor_copy_spans(spans, n);
     if (rc != 0) return rc > 0;
 #endif
