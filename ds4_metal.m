@@ -9376,6 +9376,54 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+/* Several device copies in one blit encoder (the DSpark verifier's snapshot
+ * and restore). Declines (0) without copying when no batch is open, a span is
+ * out of range, or a destination overlaps another span; the caller then
+ * copies them one by one. */
+int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n) {
+    if (!spans || n == 0 || n > DS4_GPU_COPY_SPANS_MAX) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const ds4_gpu_copy_span *sp = &spans[i];
+        if (!sp->dst || !sp->src) return 0;
+        const DS4MetalTensor *d = ds4_gpu_tensor_obj(sp->dst);
+        const DS4MetalTensor *t = ds4_gpu_tensor_const_obj(sp->src);
+        if (sp->dst_offset > d.bytes || sp->bytes > d.bytes - sp->dst_offset ||
+            sp->src_offset > t.bytes || sp->bytes > t.bytes - sp->src_offset) return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const DS4MetalTensor *di = ds4_gpu_tensor_obj(spans[i].dst);
+        const uint64_t lo = di.offset + spans[i].dst_offset, hi = lo + spans[i].bytes;
+        for (uint32_t j = 0; j < n; j++) {
+            if (!spans[j].bytes || (i == j)) continue;
+            const DS4MetalTensor *dj = ds4_gpu_tensor_obj(spans[j].dst);
+            const DS4MetalTensor *sj = ds4_gpu_tensor_const_obj(spans[j].src);
+            const uint64_t dlo = dj.offset + spans[j].dst_offset, slo = sj.offset + spans[j].src_offset;
+            if ((dj.buffer == di.buffer && dlo < hi && lo < dlo + spans[j].bytes) ||
+                (sj.buffer == di.buffer && slo < hi && lo < slo + spans[j].bytes)) return 0;
+        }
+    }
+    @autoreleasepool {
+        ds4_gpu_close_batch_encoder();
+        g_batch_has_work = YES;
+        id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy_spans", 1u);
+        if (!blit) return -1;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!spans[i].bytes) continue;
+            const DS4MetalTensor *d = ds4_gpu_tensor_obj(spans[i].dst);
+            const DS4MetalTensor *t = ds4_gpu_tensor_const_obj(spans[i].src);
+            [blit copyFromBuffer:t.buffer
+                    sourceOffset:(NSUInteger)(t.offset + spans[i].src_offset)
+                        toBuffer:d.buffer
+               destinationOffset:(NSUInteger)(d.offset + spans[i].dst_offset)
+                            size:(NSUInteger)spans[i].bytes];
+        }
+        [blit endEncoding];
+    }
+    return 1;
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {
