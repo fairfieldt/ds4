@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-Q2 = "DeepSeek-V4.1-Flash-Q2.gguf"
+Q2 = "DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
 Q4 = "DeepSeek-V4.1-Flash-Q4.gguf"
 PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
