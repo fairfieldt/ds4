@@ -7305,6 +7305,19 @@ __global__ static void grouped_q8_0_a_preq_rows_kernel(
     }
 }
 
+/* The short-row kernels read each weight block once for all rows and keep
+ * every row's result bitwise equal to the one-row kernel's. They were tuned
+ * on Spark; on a discrete GPU they save the same weight traffic per verify. */
+extern "C" bool ds4_gpu_discrete_memory(void);
+static bool cuda_q8_short_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_CUDA_NO_Q8_SHORT_ROWS") == NULL &&
+            (ds4_gpu_device_is_spark() || (g_n_gpus == 1 && ds4_gpu_discrete_memory()));
+    }
+    return enabled != 0;
+}
+
 static void cuda_grouped_q8_short_launch(
         float *low, const unsigned char *w, const int8_t *xq,
         const float *scale, uint64_t rank, uint32_t groups,
@@ -17443,6 +17456,17 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
         in_dim, out_dim, n_rows, blocks, blocks, out_dim, 32u);
     if (mma_rc) return mma_rc > 0;
+    /* The prequant above ran on the legacy stream; the short launcher uses
+     * the decode stream, so only take it when they are the same. */
+    if (cuda_q8_short_rows_enabled() && cuda_q8_use_dp4a() &&
+        cuda_decode_stream() == (cudaStream_t)0 &&
+        n_rows >= 2u && n_rows <= 6u && in_dim % 32u == 0u &&
+        ((uintptr_t)xq & 15u) == 0u) {
+        cuda_grouped_q8_short_launch((float *)out->ptr,
+                                    reinterpret_cast<const unsigned char *>(wptr),
+                                    xq, xscale, out_dim, 1u, n_rows, blocks);
+        return cuda_ok(cudaGetLastError(), "q8_0 decode rows exact short rows");
+    }
     dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_preq_warp8_kernel<<<grid, 256>>>(
             (float *)out->ptr,
@@ -20740,7 +20764,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             group_cnt);
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
-    if (ds4_gpu_device_is_spark() && use_dp4a &&
+    if (cuda_q8_short_rows_enabled() && use_dp4a &&
         n_rows >= 2u && n_rows <= 6u && group_dim % 32u == 0u &&
         ((uintptr_t)xq & 15u) == 0u) {
         cuda_grouped_q8_short_launch((float *)low->ptr, out_a, xq, xscale,
