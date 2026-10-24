@@ -330,7 +330,8 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     return ok;
 }
 
-enum { TOKEN_READERS = 4 };
+/* One token keeps four workers; verifier blocks of several rows use them all. */
+enum { TOKEN_READERS = 4, ROW_READERS = 8 };
 
 typedef struct {
     pthread_t thread;
@@ -339,8 +340,8 @@ typedef struct {
 } engram_read_worker;
 
 struct ds4_engram_reader {
-    engram_read_worker workers[TOKEN_READERS];
-    unsigned threads;
+    engram_read_worker workers[ROW_READERS];
+    unsigned threads, readers;
     pthread_mutex_t mutex;
     pthread_cond_t work, done;
     bool active, shutdown;
@@ -348,8 +349,9 @@ struct ds4_engram_reader {
     unsigned completed[2];
     int errors[2];
     ds4_engram_table tables[2];
-    uint32_t ids[2][DS4_ENGRAM_COLS];
-    float *out;
+    unsigned n_rows;
+    uint32_t ids[DS4_ENGRAM_READER_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    float *out[DS4_ENGRAM_READER_MAX_ROWS];
 };
 
 static void *read_token_thread(void *context) {
@@ -362,16 +364,29 @@ static void *read_token_thread(void *context) {
         while (r->generation == seen && !r->shutdown) pthread_cond_wait(&r->work, &r->mutex);
         if (r->shutdown) break;
         seen = r->generation;
+        const unsigned readers = r->readers, n_rows = r->n_rows;
+        /* Workers beyond this request's count sit it out without touching the
+         * completion counts, so a late one cannot leak into the next start. */
+        if (index >= readers) continue;
         pthread_mutex_unlock(&r->mutex);
         for (unsigned table = 0; table < 2; table++) {
-            const unsigned first = index * DS4_ENGRAM_COLS / TOKEN_READERS;
-            const unsigned end = (index + 1u) * DS4_ENGRAM_COLS / TOKEN_READERS;
-            const bool ok = ds4_engram_read(&r->tables[table], r->ids[table] + first,
-                end - first, r->out + (table * DS4_ENGRAM_COLS + first) * DS4_ENGRAM_DIM);
+            /* Each worker reads a contiguous span of the row-major (row, column)
+             * list, each request into its own output slot. */
+            const unsigned total = n_rows * DS4_ENGRAM_COLS;
+            const unsigned first = index * total / readers;
+            const unsigned end = (index + 1u) * total / readers;
+            bool ok = true;
+            for (unsigned i = first; ok && i < end;) {
+                const unsigned row = i / DS4_ENGRAM_COLS, col = i % DS4_ENGRAM_COLS;
+                const unsigned span = end - i < DS4_ENGRAM_COLS - col ? end - i : DS4_ENGRAM_COLS - col;
+                ok = ds4_engram_read(&r->tables[table], r->ids[row][table] + col, span,
+                    r->out[row] + (table * DS4_ENGRAM_COLS + col) * DS4_ENGRAM_DIM);
+                i += span;
+            }
             const int error = ok ? 0 : errno ? errno : EIO;
             pthread_mutex_lock(&r->mutex);
             if (!r->errors[table]) r->errors[table] = error;
-            if (++r->completed[table] == TOKEN_READERS) {
+            if (++r->completed[table] == readers) {
                 if (table == 1) r->active = false;
                 pthread_cond_broadcast(&r->done);
             }
@@ -392,7 +407,7 @@ ds4_engram_reader *ds4_engram_reader_create(void) {
     if (error) goto mutex;
     error = pthread_cond_init(&r->done, NULL);
     if (error) goto work;
-    for (unsigned i = 0; i < TOKEN_READERS; i++) {
+    for (unsigned i = 0; i < ROW_READERS; i++) {
         r->workers[i].reader = r;
         r->workers[i].index = i;
         error = pthread_create(&r->workers[i].thread, NULL, read_token_thread, &r->workers[i]);
@@ -419,11 +434,23 @@ fail:
 
 bool ds4_engram_reader_start(ds4_engram_reader *r,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
-    if (!r || !tables || !ids || !out) { errno = EINVAL; return false; }
-    for (unsigned t = 0; t < 2; t++) {
-        if (tables[t].fd < 0) { errno = EINVAL; return false; }
-        for (unsigned col = 0; col < DS4_ENGRAM_COLS; col++)
-            if (ids[t][col] >= tables[t].rows) { errno = EINVAL; return false; }
+    return ds4_engram_reader_start_rows(r, tables, (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids,
+        1, &out);
+}
+
+bool ds4_engram_reader_start_rows(ds4_engram_reader *r, const ds4_engram_table tables[2],
+    const uint32_t ids[][2][DS4_ENGRAM_COLS], unsigned n_rows, float *const *out) {
+    if (!r || !tables || !ids || !out || !n_rows || n_rows > DS4_ENGRAM_READER_MAX_ROWS) {
+        errno = EINVAL;
+        return false;
+    }
+    for (unsigned row = 0; row < n_rows; row++) {
+        if (!out[row]) { errno = EINVAL; return false; }
+        for (unsigned t = 0; t < 2; t++) {
+            if (tables[t].fd < 0) { errno = EINVAL; return false; }
+            for (unsigned col = 0; col < DS4_ENGRAM_COLS; col++)
+                if (ids[row][t][col] >= tables[t].rows) { errno = EINVAL; return false; }
+        }
     }
     pthread_mutex_lock(&r->mutex);
     if (r->active || r->shutdown) {
@@ -432,9 +459,11 @@ bool ds4_engram_reader_start(ds4_engram_reader *r,
         return false;
     }
     memcpy(r->tables, tables, sizeof(r->tables));
-    memcpy(r->ids, ids, sizeof(r->ids));
+    memcpy(r->ids, ids, n_rows * sizeof(r->ids[0]));
+    memcpy(r->out, out, n_rows * sizeof(r->out[0]));
+    r->n_rows = n_rows;
+    r->readers = n_rows == 1 ? TOKEN_READERS : r->threads;
     memset(r->errors, 0, sizeof(r->errors));
-    r->out = out;
     memset(r->completed, 0, sizeof(r->completed));
     r->generation++;
     r->active = true;
@@ -451,7 +480,7 @@ bool ds4_engram_reader_wait(ds4_engram_reader *r, unsigned table) {
         errno = EINVAL;
         return false;
     }
-    while (r->completed[table] < TOKEN_READERS) pthread_cond_wait(&r->done, &r->mutex);
+    while (r->completed[table] < r->readers) pthread_cond_wait(&r->done, &r->mutex);
     const int error = r->errors[table];
     pthread_mutex_unlock(&r->mutex);
     if (error) errno = error;

@@ -42970,17 +42970,35 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    uint32_t ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    float *disk_out[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
-        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
-        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-            engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[i][0][0]);
+        disk_out[i] = engram && (uint32_t)i < prefill_rows ? &engram[i][0][0] : &s->rows[0][0];
+    }
+    /* Read every row's Engram entries in the background, as single-token
+     * decode does, and wait for each table only before its layer. The rows,
+     * order and values are those of the serial reads. */
+    ds4_engram_reader *reader = graphs[0]->engram_reader;
+    bool overlap_engram = ok && reader && count <= DS4_ENGRAM_READER_MAX_ROWS &&
+        !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
+    for (int i = 1; overlap_engram && i < count; i++)
+        overlap_engram = graphs[i]->table[0].fd == graphs[0]->table[0].fd &&
+            graphs[i]->table[1].fd == graphs[0]->table[1].fd;
+    if (overlap_engram)
+        overlap_engram = ds4_engram_reader_start_rows(reader, graphs[0]->table,
+            (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, (unsigned)count, disk_out);
+    if (!overlap_engram) {
+        for (int i = 0; ok && i < count; i++)
+            for (unsigned table = 0; ok && table < 2; table++)
+                ok = ds4_engram_read(&graphs[i]->table[table], ids[i][table], DS4_ENGRAM_COLS,
+                    disk_out[i] + table * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM);
+    }
+    for (int i = 0; ok && i < count; i++) {
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
@@ -42991,6 +43009,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         const ds4_layer_weights *l = &weights->layer[il];
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            if (overlap_engram && !ds4_engram_reader_wait(reader, table)) ok = false;
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
@@ -43077,6 +43096,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    /* Even a failed batch must finish the reader before its row buffers are reused. */
+    if (overlap_engram && !ds4_engram_reader_wait(reader, 1)) ok = false;
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
