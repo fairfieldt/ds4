@@ -40949,7 +40949,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(index_k, DS4_N_INDEXER_HEAD_DIM) X(index_weights, DS4_N_INDEXER_HEAD) \
     X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
-    X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
+    X(selected_kv, DS4_TP_BATCH_MAX_ROWS * DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
@@ -42053,7 +42053,34 @@ static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs
         if (!index_here && !ds41_attention_pick(&row, il)) return false;
     }
     if (index_here && !ds41_index_batch(g, m, l, il, count)) return false;
-    for (uint32_t t = 0; t < count; t++) {
+    /* Past the first window every row attends the same number of raw and
+     * compressed rows; then one launch covers the block, one grid slice per row. */
+    const uint32_t raw_first = start + 1u < 128u ? start + 1u : 128u;
+    const uint32_t raw_last = start + count < 128u ? start + count : 128u;
+    const uint32_t comp_first = ratio ? (start + 1u) / ratio : 0u;
+    const uint32_t comp_last = ratio ? (start + count) / ratio : 0u;
+    const uint32_t att_first = comp_first < DS4_N_INDEXER_TOP_K ? comp_first : DS4_N_INDEXER_TOP_K;
+    const uint32_t att_last = comp_last < DS4_N_INDEXER_TOP_K ? comp_last : DS4_N_INDEXER_TOP_K;
+    const uint64_t comp_slot = (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM;
+    bool rows_done = false;
+    if (raw_first == raw_last && att_first == att_last &&
+        !getenv("DS4_DISABLE_V41_ROW_ATTENTION_KERNEL")) {
+        bool ok = true;
+        for (uint32_t t = 0; ok && att_first && t < count; t++) {
+            const uint32_t n_comp = (start + t + 1u) / ratio;
+            ds4_gpu_tensor *dst = ds4_gpu_tensor_view(g->selected_kv,
+                t * comp_slot * sizeof(float), comp_slot * sizeof(float));
+            ok = dst && ds4_gpu_dsv41_gather_kv(dst, g->compressed[owner],
+                g->rows_view[t].selected_comp, n_comp, att_first);
+            ds4_gpu_tensor_free(dst);
+        }
+        if (!ok) return false;
+        rows_done = ds4_gpu_attention_decode_heads_rows_tensor(b->heads, m->map, m->size,
+            l->attn_sinks->abs_offset, b->q, g->raw_prefill, raw_first,
+            g->prefill_cap + 128u, previous + 1u - raw_first, g->selected_kv,
+            comp_slot, att_first, count, nh, DS4_N_HEAD_DIM) == 1;
+    }
+    for (uint32_t t = 0; !rows_done && t < count; t++) {
         const uint32_t pos = start + t;
         const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
         const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
