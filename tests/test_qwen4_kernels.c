@@ -1534,6 +1534,7 @@ static void test_attention_rows(arena_t *a) {
 
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
+    if (wtype == 2u) return arena_q4_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
            wtype == 10u ? arena_q2_K(a, rows, cols, shadow, 0.05f) :
            wtype == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8_0(a, rows, cols, shadow, 0.05f);
@@ -1787,7 +1788,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : dtype == 2u ? "q4_0" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
@@ -1823,7 +1824,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         free(cnt);
         snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: mid", tier_name, E, F, slots, T);
         check_tensor(name, gmid2, mid_r, (uint64_t)T * slots * F, 3e-3);
-        snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: down", tier_name, E, F, slots, T);
+        snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: down", dname, E, F, slots, T);
         check_tensor(name, gpart2, part_r, (uint64_t)T * slots * E, 3e-3);
         free(part_r); free(mid_r);
         ds4_gpu_tensor_free(gpart2); ds4_gpu_tensor_free(gmid2); ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists);
@@ -2047,13 +2048,14 @@ static void test_mv_ext_groups(arena_t *a) {
 
 #ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
- * for bit under heavy expert reuse (sixteen rows over eight experts). */
-static void test_moe_grouped(arena_t *a) {
+ * for bit under heavy expert reuse (sixteen rows over eight experts), with
+ * MXFP4 (39) or Q4_0 (2) down rows. */
+static void test_moe_grouped(arena_t *a, uint32_t dtype) {
     const uint32_t NE = 8, slots = 6, E = 2560, F = 640, T = 16, cap = 64;
     double *gate_w, *up_w, *down_w;
     const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
     const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
-    const uint64_t down_off = arena_mxfp4(a, (uint64_t)NE * E, F, &down_w);
+    const uint64_t down_off = arena_tier(a, dtype, (uint64_t)NE * E, F, &down_w);
     free(gate_w); free(up_w); free(down_w);
     float *x = rand_vec((uint64_t)T * E, 1.0f);
     int32_t *sel = malloc((uint64_t)T * slots * 4);
@@ -2068,19 +2070,20 @@ static void test_moe_grouped(arena_t *a) {
     require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "grouped sel");
     require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid[0], gx, gsel, a->base, a->size, gate_off, up_off, 12u, NE, T, slots, E, F,
                                             0, 0, UINT32_MAX), "grouped: per-token mid");
-    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart[0], gmid[0], gsel, a->base, a->size, down_off, 39u, NE, T, slots, F, E,
+    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart[0], gmid[0], gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              0, UINT32_MAX), "grouped: per-token down");
     require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, cap), "grouped: lists");
     require_ok(ds4_gpu_qwen4_moe_mid_grouped_tensor(gmid[1], gx, gsel, glists, gcounts, cap, a->base, a->size, gate_off,
                                                     up_off, 12u, NE, T, slots, E, F), "grouped: mid");
     require_ok(ds4_gpu_qwen4_moe_down_grouped_tensor(gpart[1], gmid[0], gsel, glists, gcounts, cap, a->base, a->size,
-                                                     down_off, 39u, NE, T, slots, F, E), "grouped: down");
+                                                     down_off, dtype, NE, T, slots, F, E), "grouped: down");
     const uint64_t nm = (uint64_t)T * slots * F, np = (uint64_t)T * slots * E;
     float *am = download(gmid[0], nm), *bm = download(gmid[1], nm);
     float *ap = download(gpart[0], np), *bp = download(gpart[1], np);
     check_exact_f32("grouped Q4_K mid", bm, am, nm);
-    check_exact_f32("grouped MXFP4 down", bp, ap, np);
-    printf("  MoE grouped kernels: mid and down byte-exact against the per-token kernels under expert reuse\n");
+    check_exact_f32(dtype == 2u ? "grouped Q4_0 down" : "grouped MXFP4 down", bp, ap, np);
+    printf("  MoE grouped kernels: mid and %s down byte-exact against the per-token kernels under expert reuse\n",
+           dtype == 2u ? "Q4_0" : "MXFP4");
     free(bp); free(ap); free(bm); free(am);
     for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gpart[i]); ds4_gpu_tensor_free(gmid[i]); }
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
@@ -2562,7 +2565,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     require_ok(counts[0] == (int32_t)T && counts[1] == (int32_t)((T + 1u) / 2u) && counts[2] == (int32_t)(T / 2u) && counts[3] == 0,
                "MoE tile caps hot, partial, and empty experts");
     double *mid_exact = NULL, *part_exact = NULL;
-    if (down_type == 39u) {
+    if (down_type == 39u || down_type == 2u) {
         /* full-precision reference: double products of the dequantized weights
          * and the float activations, accumulated in double; part takes the
          * exact mid, so mid and down tile paths are judged end to end */
@@ -2661,7 +2664,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         unsetenv("DS4_QWEN4_MOE_MID_NT");
         unsetenv("DS4_QWEN4_MOE_TAILS");
     }
-    if (down_type == 39u) for (uint32_t nax = 1; nax <= 5; nax++) {
+    if (down_type == 39u || down_type == 2u) for (uint32_t nax = 1; nax <= 5; nax++) {
         /* tensor-op tiles of 32/64 tokens, half (1/2), float (3/4) or
          * compensated (5) activation operands: cooperative accumulation;
          * bound the drift against the simdgroup tiles and print the
@@ -2775,7 +2778,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         free(dmid); free(dgs); free(dus);
     }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
-           T, down_type == 39u ? "mxfp4" : "q8_0");
+           T, down_type == 39u ? "mxfp4" : down_type == 2u ? "q4_0" : "q8_0");
     for (uint32_t i = 0; i < 3; i++) {
         if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
         free(saved_env[i]);
@@ -3554,6 +3557,8 @@ int main(void) {
         test_half_expert_tiles(&arena,33,12,39,64);
         test_half_expert_tiles(&arena,2049,16,10,192);
         test_half_expert_tiles(&arena,2049,12,39,192);
+        test_half_expert_tiles(&arena,33,12,2,64);
+        test_half_expert_tiles(&arena,2049,12,2,192);
         return 0;
     }
 #endif
@@ -3601,7 +3606,8 @@ int main(void) {
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
 #ifdef __APPLE__
-    test_moe_grouped(&arena);
+    test_moe_grouped(&arena, 39u);
+    test_moe_grouped(&arena, 2u);
 #endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
@@ -3652,6 +3658,11 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 3, 12u, 2u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 37, 12u, 2u);
+    test_moe_types(&arena, 8, 6, 256, 256, 9, 12u, 2u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
@@ -3668,6 +3679,7 @@ int main(void) {
     test_q4k_ordered_exact(&arena, 2, 641, true);
     test_moe_mm_tiles_exact(&arena, 8u);
     test_moe_mm_tiles_exact(&arena, 39u);
+    test_moe_mm_tiles_exact(&arena, 2u);
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
@@ -3688,6 +3700,10 @@ int main(void) {
     test_half_expert_tiles(&arena,8193,12,39,64);
     test_half_expert_tiles(&arena,2049,16,10,192);
     test_half_expert_tiles(&arena,2049,12,39,192);
+    test_half_expert_tiles(&arena,33,12,2,64);
+    test_half_expert_tiles(&arena,2049,12,2,64);
+    test_half_expert_tiles(&arena,8193,12,2,64);
+    test_half_expert_tiles(&arena,2049,12,2,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
     test_dense_mm_large(&arena, 1u);

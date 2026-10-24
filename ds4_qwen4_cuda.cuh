@@ -486,6 +486,16 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         const uint16_t *q = (const uint16_t *)(b+2+i%32);
         out = make_float4((float)(int8_t)q[0]*scale,(float)(int8_t)(q[0]>>8)*scale,
                          (float)(int8_t)q[1]*scale,(float)(int8_t)(q[1]>>8)*scale);
+    } else if (TYPE == 2) {
+        /* Q4_0 has MXFP4's code layout behind an fp16 scale. */
+        const uint8_t *b = (const uint8_t *)row+(i/32)*18;
+        const float scale = __half2float(*(const __half *)b);
+        unsigned packed;
+        memcpy(&packed,b+2+i%16,4);
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            v[k] = scale*(float)((int)((packed>>(k*8+(i%32/16)*4))&15)-8);
+        }
     } else if (TYPE == 39) {
         const uint8_t *b = (const uint8_t *)row+(i/32)*17;
         const float scale = b[0] == 0 ? 0x1p-127f : __uint_as_float((unsigned)b[0]<<23);
@@ -1030,7 +1040,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
-        if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
+        if (lists && !g_quality_mode && (type == 2 || type == 16 || type == 10 || type == 12 || type == 39)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
             unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
             if (!tiles) return 0;
@@ -1044,7 +1054,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             if (nt == 64) matrix_half_tile<TYPE,DOWN,64,(TYPE == 10 ? 64 : 128)><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
-            switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
+            switch (type) { QWEN_HALF_TYPE(2); QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
 #undef QWEN_HALF_TYPE
 #undef QWEN_HALF
             return launched();
