@@ -61246,6 +61246,8 @@ struct ds4_session {
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
     uint32_t dspark_sched_skip;
+    uint32_t ds41_miss_run;       /* V4.1: consecutive cycles without an accepted draft */
+    uint32_t ds41_backoff;        /* V4.1: tokens skipped after the latest miss */
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
     double dspark_sched_life_saved_ms;
@@ -61481,6 +61483,8 @@ static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
     ds4_session_dspark_scheduler_reset(s);
     s->dspark_sched_skip = 0;
+    s->ds41_miss_run = 0;
+    s->ds41_backoff = 0;
     s->dspark_sched_lifetime_accepted = 0;
     s->dspark_sched_life_extra_ms = 0.0;
     s->dspark_sched_life_saved_ms = 0.0;
@@ -86069,6 +86073,26 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
     return 0;
 }
 #endif
+/* V4.1 backoff: after three cycles in a row without an accepted draft, decode
+ * the next 1, 2, 4, then up to DS4_DSPARK_V41_BACKOFF_MAX (8) tokens without
+ * drafting. Low-acceptance text then stops paying the drafter on every token;
+ * the drafter catches up on skipped rows at its next draft. Count-based, so
+ * greedy output stays reproducible. DS4_DSPARK_SCHEDULER=0 disables it. */
+static void ds41_backoff_note(ds4_session *s, bool miss) {
+    if (!ds4_dspark_scheduler_enabled(s) || s->engine->tp.active) return;
+    if (!miss) {
+        s->ds41_miss_run = 0;
+        s->ds41_backoff = 0;
+        return;
+    }
+    if (++s->ds41_miss_run < 3u) return;
+    const uint32_t max = ds4_dspark_env_u32("DS4_DSPARK_V41_BACKOFF_MAX", 8);
+    if (!max) return;
+    s->ds41_backoff = s->ds41_backoff ? s->ds41_backoff * 2u : 1u;
+    if (s->ds41_backoff > max) s->ds41_backoff = max;
+    s->dspark_sched_skip = s->ds41_backoff;
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -86098,6 +86122,13 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[0] = first_token;
         return 1;
     }
+    if (s->dspark_sched_skip && !e->tp.active && ds4_dspark_scheduler_enabled(s)) {
+        s->dspark_sched_skip--;
+        if (stats) s->dspark_stats.scheduler_skips++;
+        if (ds4_session_eval(s, first_token, err, errlen)) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
     const double started = now_sec();
     if (!ds41_session_draft(s, first_token))
@@ -86121,6 +86152,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         if (tokens[count] == eos) { count++; break; }
     }
     if (count == 1) {
+        ds41_backoff_note(s, true);
         if (stats) {
             s->dspark_stats.no_draft++;
             s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
@@ -86162,6 +86194,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
+    ds41_backoff_note(s, accepted_drafts == 0);
     if (stats) {
         s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
         s->dspark_stats.accepted_draft_tokens += accepted_drafts;
