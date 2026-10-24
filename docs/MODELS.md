@@ -107,6 +107,16 @@ interrupted merge; existing files and the previous default model are preserved
 if verification fails. Q2 and MXFP4 use the 1017 checkpoint; Q4 remains the
 previous release.
 
+To merge with one shard (46 GiB) of extra disk space and reuse Engram tables
+from a local 1017 Q2 file, run:
+
+```sh
+python3 gguf-tools/merge_split_gguf.py antirez/deepseek-v4.1-flash-gguf \
+  DeepSeek-V4.1-Flash-1017-MXFP4-experts 9 \
+  gguf/DeepSeek-V4.1-Flash-1017-MXFP4.gguf gguf/mxfp4-parts \
+  --donor gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf
+```
+
 Large SSD prefills process layers in wide batches. Metal overlaps computation
 with the next layer's reads; CUDA stages experts into its bounded device cache.
 Short appends keep using the expert cache.
