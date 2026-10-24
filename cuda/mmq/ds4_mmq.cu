@@ -3772,7 +3772,7 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     }
 }
 
-template <ggml_type type>
+template <ggml_type type, int RR = 4>
 static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         const void       * __restrict__ W_gate,
         const void       * __restrict__ W_up,
@@ -3814,8 +3814,8 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = row_block * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < (uint32_t)RR; ++rr) {
+        const uint32_t row = row_block * (16u * RR) + row_lane + rr * 16u;
         if (row >= nrows_x) continue;
         const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
         float gate = 0.0f;
@@ -3997,7 +3997,10 @@ static bool ds4_mmq_mxfp4_staged_ok(int dev, const void *w0, const void *w1, int
     const uint32_t blocks_per_row = (uint32_t)K / 32u;
     const size_t smem = (size_t)(DS4_MXFP4_STAGED_THREADS / 16) *
         (2u * blocks_per_row * sizeof(block_mxfp4) + DS4_STAGE_PAD_U4 * 16u);
-    return ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
+    /* Read per call: the exactness test switches between variants. */
+    if (getenv("DS4_CUDA_MXFP4_DECODE_REF")) return false;
+    return (getenv("DS4_CUDA_MXFP4_STAGED") ||
+            ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK) &&
            (((uintptr_t)w0 | (uintptr_t)w1) & 15u) == 0 &&
            blocks_per_row % 16u == 0 && stride_row_x % 16u == 0 &&
            stride_channel_x % 16u == 0 && stride_row_x >= blocks_per_row &&
@@ -4155,12 +4158,23 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     /* Short Flash blocks need more CTAs to fill Spark, especially at one
      * token. The dot products and ordered six-expert sum stay unchanged. */
     bool small_tiles = false;
+    int down_rows = 8;
 #ifndef GGML_USE_HIP
     small_tiles = type == GGML_TYPE_MXFP4 &&
         ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
         M == 4096 && (K == 1024 || K == 2048) && n_tokens <= 8;
+    if (small_tiles) down_rows = 1;
+    /* One row per half-warp on discrete GPUs too: eight rows ran 80 CTAs on
+     * 188 SMs (RTX PRO 6000, V4.1 down 2304 -> 5120: 266 -> 104 us per decode
+     * MoE). DS4_CUDA_MXFP4_DOWN_ROWS=1|2|4|8 overrides; the reference keeps 8. */
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        if (ggml_cuda_info().devices[dev].cc != GGML_CUDA_CC_DGX_SPARK && n_tokens <= 8) down_rows = 1;
+        if (const char *env = getenv("DS4_CUDA_MXFP4_DOWN_ROWS")) down_rows = atoi(env);
+        if (getenv("DS4_CUDA_MXFP4_DECODE_REF")) down_rows = small_tiles ? 1 : 8;
+        if (down_rows != 1 && down_rows != 2 && down_rows != 4) down_rows = 8;
+    }
 #endif
-    const uint32_t tile_rows = small_tiles ? 8u : 64u;
+    const uint32_t tile_rows = 8u * (uint32_t)down_rows;
     const uint32_t row_blocks = ((uint32_t)M + tile_rows - 1u) / tile_rows;
     if (ds4_mmq_vec_assignment_major<type>::value && row_blocks > 65535u) {
         fprintf(stderr, "%s: M=%d exceeds the assignment-major grid\n", tag, M);
@@ -4177,7 +4191,9 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         stride_row_x, stride_col_y, stride_channel_x)
 #ifndef GGML_USE_HIP
     if constexpr (type == GGML_TYPE_MXFP4) {
-        if (small_tiles) { DS4_LAUNCH_DOWN_ROWS(1); }
+        if (down_rows == 1) { DS4_LAUNCH_DOWN_ROWS(1); }
+        else if (down_rows == 2) { DS4_LAUNCH_DOWN_ROWS(2); }
+        else if (down_rows == 4) { DS4_LAUNCH_DOWN_ROWS(4); }
         else { DS4_LAUNCH_DOWN_ROWS(8); }
     } else
 #endif
@@ -4459,13 +4475,31 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         }
     }
 #endif
+    /* Rows per half-warp. One row puts six times more CTAs and four times
+     * more loads in flight (RTX PRO 6000, V4.1: 104 -> 81 us per decode MoE
+     * with one-row down); each row's dot products, reduction and epilogue are
+     * unchanged. DS4_CUDA_MXFP4_GATE_RR=1|2|4 overrides; the reference keeps 4. */
+    int rr = 4;
+#ifndef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        if (ggml_cuda_info().devices[dev].cc != GGML_CUDA_CC_DGX_SPARK) rr = 1;
+        if (const char *env = getenv("DS4_CUDA_MXFP4_GATE_RR")) rr = atoi(env);
+        if (getenv("DS4_CUDA_MXFP4_DECODE_REF") || (rr != 1 && rr != 2)) rr = 4;
+    }
+#endif
+    const uint32_t rr_blocks = (uint32_t)((M + 16 * rr - 1) / (16 * rr));
     const dim3 block_nums = ds4_mmq_vec_assignment_major<type>::value ?
-        dim3(assignments, row_blocks) : dim3(row_blocks, assignments);
+        dim3(assignments, rr_blocks) : dim3(rr_blocks, assignments);
     const dim3 block_dims(256);
-    ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
-        W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
-        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
-        stride_row_x, stride_col_y, stride_channel_x, clamp);
+#define DS4_LAUNCH_GATE_RR(R) \
+    ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type, R><<<block_nums, block_dims, 0, stream>>>( \
+        W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32, \
+        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts, \
+        stride_row_x, stride_col_y, stride_channel_x, clamp)
+    if (rr == 1) { DS4_LAUNCH_GATE_RR(1); }
+    else if (rr == 2) { DS4_LAUNCH_GATE_RR(2); }
+    else { DS4_LAUNCH_GATE_RR(4); }
+#undef DS4_LAUNCH_GATE_RR
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {

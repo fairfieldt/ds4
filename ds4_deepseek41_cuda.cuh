@@ -35,8 +35,12 @@ extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     const float *w = (const float *)cuda_resolve_weight_ptr(map, offset,
         (uint64_t)width * 4u, ds4_tensor_device_idx(out), "V4.1 norm");
     if (!w) return 0;
-    rms_norm_weight_kernel<true><<<rows, 256, 0, cuda_decode_stream()>>>(
-        (float *)out->ptr, (const float *)x->ptr, w, width, rows, eps);
+    if (width <= RMS_NORM_REG_MAX * 256u && cuda_norm_reg_enabled())
+        rms_norm_weight_reg_kernel<true><<<rows, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr, w, width, rows, eps);
+    else
+        rms_norm_weight_kernel<true><<<rows, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr, w, width, rows, eps);
     return cuda_ok(cudaGetLastError(), "V4.1 BF16 norm");
 }
 
