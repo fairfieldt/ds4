@@ -4361,7 +4361,7 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
     cudaError_t err = cudaMalloc(&device, (size_t)map_size);
     if (err != cudaSuccess) {
         fprintf(stderr,
-                "ds4: CUDA vision map allocation failed (%.2f GiB): %s\n",
+                "ds4: CUDA auxiliary model allocation failed (%.2f GiB): %s\n",
                 (double)map_size / 1073741824.0,
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -4376,7 +4376,7 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
                          (size_t)bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             fprintf(stderr,
-                    "ds4: CUDA vision map copy failed at %.2f/%.2f GiB: %s\n",
+                    "ds4: CUDA auxiliary model copy failed at %.2f/%.2f GiB: %s\n",
                     (double)copied / 1073741824.0,
                     (double)map_size / 1073741824.0,
                     cudaGetErrorString(err));
