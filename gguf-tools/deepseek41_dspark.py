@@ -163,12 +163,12 @@ def build_plan(db, config, weights):
     return plan
 
 
-def metadata(config, revision):
+def metadata(config, revision, repo="deepseek-ai/DeepSeek-V4.1-Flash"):
     c = config["text_config"]
     records = [
         kv_string("general.architecture", "deepseek41-dspark"),
         kv_string("general.name", "DeepSeek V4.1 Flash DSpark"),
-        kv_string("general.source.url", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"),
+        kv_string("general.source.url", f"https://huggingface.co/{repo}"),
         kv_string("general.source.revision", revision),
         kv_u32("general.alignment", ALIGNMENT),
         kv_string("dspark.target_architecture", "deepseek41"),
@@ -279,6 +279,8 @@ def main():
     parser.add_argument("--hf", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--source-repo", default="deepseek-ai/DeepSeek-V4.1-Flash",
+                        help="Hugging Face repository of the source checkpoint")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify", action="store_true", help="audit an existing --out file without writing it")
@@ -292,7 +294,7 @@ def main():
     try:
         weights = LosslessWeights()
         plan = build_plan(db, config, weights)
-        records = metadata(config, args.source_revision)
+        records = metadata(config, args.source_revision, args.source_repo)
         if args.verify:
             verify_gguf(args.out, db, weights, plan, records)
         elif args.dry_run:

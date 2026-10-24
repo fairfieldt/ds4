@@ -55,6 +55,7 @@ For the tested Strix Halo coding configuration, use `--dspark --dspark-confidenc
 
 V4.1 has its own 8.04 GiB support GGUF. It retains the native MXFP4 experts
 and uses a different draft graph from V4 Flash. Do not interchange the files.
+The 1017 checkpoint has its own drafter too; convert it from the 1017 shards.
 See [conversion](../gguf-tools/README.md#convert-v41-dspark) to build it.
 
 ```sh

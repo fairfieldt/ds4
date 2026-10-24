@@ -268,6 +268,18 @@ dense weights expand losslessly to F16 or F32. Add `--dry-run` to inspect the
 layout, or `--verify` to compare every tensor in an existing output against
 the source. This file works only with the V4.1 Flash target.
 
+The 1017 checkpoint (`deepseek-ai/DeepSeek-V4.1-Flash-1017`) ships its own
+drafter: shards 44-46 differ from the pinned checkpoint's. Convert it from
+those shards for the 1017 target:
+
+```sh
+python3 gguf-tools/deepseek41_dspark.py \
+  --hf models/DeepSeek-V4.1-Flash-1017 \
+  --source-repo deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --source-revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+  --out gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf
+```
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores
