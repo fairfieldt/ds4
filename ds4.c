@@ -42012,6 +42012,73 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Attention for a short block of consecutive rows of one session (a DSpark
+ * verify block or a short prefill). RoPE, KV quantization, the indexer and the
+ * final head transforms run once for the block; the compressor still advances
+ * row by row (verify keeps each row's pooling state for partial commits), and
+ * each row attends over its own raw window in a chronological copy of the ring,
+ * so the per-row arithmetic is the one-row path's. */
+static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs,
+                                ds4_gpu_tensor *const *queries, ds4_gpu_tensor *const *heads,
+                                const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il, uint32_t count) {
+    const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t previous = start < 127u ? start : 127u;
+    const uint32_t raw_start = (start - previous) % 128u;
+    const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
+    const uint32_t n_raw = previous + count;
+    const uint64_t row_bytes = DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t nh = DS4_N_HEAD;
+    ds41_prefill_row *b = &g->batch;
+    if (!ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, nh, count, start, ratio != 0, false) ||
+        !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, count, start, ratio != 0, false) ||
+        !ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0)) return false;
+    if (first && !ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il],
+                                     raw_start * row_bytes, first * row_bytes)) return false;
+    if (previous > first && !ds4_gpu_tensor_copy(g->raw_prefill, first * row_bytes,
+            g->window[il], 0, (previous - first) * row_bytes)) return false;
+    if (!ds4_gpu_tensor_copy(g->raw_prefill, previous * row_bytes, b->kv, 0, count * row_bytes))
+        return false;
+    const bool index_here = ratio && ds41_index_source(il);
+    for (uint32_t t = 0; t < count; t++) {
+        ds41_gpu_graph row = *graphs[t];
+        row.pos = start + t;
+#define DS41_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
+        DS41_PREFILL_ROWS(DS41_ATTN_ROW)
+#undef DS41_ATTN_ROW
+        if (!ds41_attention_publish(&row, m, l, il)) return false;
+        /* Below the batched indexer's threshold each row picks as decode does. */
+        if (!index_here && !ds41_attention_pick(&row, il)) return false;
+    }
+    if (index_here && !ds41_index_batch(g, m, l, il, count)) return false;
+    for (uint32_t t = 0; t < count; t++) {
+        const uint32_t pos = start + t;
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+        const uint32_t n_row_raw = pos + 1u < 128u ? pos + 1u : 128u;
+        ds41_gpu_graph *s = graphs[t];
+        if (n_comp && !ds4_gpu_dsv41_gather_kv(s->selected_kv, g->compressed[owner],
+                g->rows_view[t].selected_comp, n_comp, attended)) return false;
+        if (!ds4_gpu_attention_decode_heads_tensor(heads[t], m->map, m->size,
+                l->attn_sinks->abs_offset, queries[t], g->raw_prefill, n_row_raw,
+                g->prefill_cap + 128u, previous + t + 1u - n_row_raw,
+                s->selected_kv, 0, attended, NULL, 0, nh, DS4_N_HEAD_DIM)) return false;
+    }
+    if (!ds4_gpu_dsv41_quantize(b->heads, nh * DS4_N_HEAD_DIM, count, DS4_V41_BF16) ||
+        !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, nh, count, start, ratio != 0, true))
+        return false;
+    const uint32_t kept = n_raw < 128u ? n_raw : 128u;
+    const uint32_t slot = (start + count - kept) % 128u;
+    const uint32_t part = kept < 128u - slot ? kept : 128u - slot;
+    return ds4_gpu_tensor_copy(g->window[il], slot * row_bytes, g->raw_prefill,
+            (n_raw - kept) * row_bytes, part * row_bytes) &&
+        (kept == part || ds4_gpu_tensor_copy(g->window[il], 0, g->raw_prefill,
+            (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
+}
+#endif
+
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
     return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
@@ -43004,6 +43071,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    bool row_attention = prefill_rows == rows && g->tp_world == 1 && !g->image_count &&
+        !getenv("DS4_DISABLE_V41_ROW_ATTENTION");
+    for (int i = 0; row_attention && i < count; i++)
+        row_attention = positions[i] == g->pos + (uint32_t)i;
+    (void)row_attention;
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -43029,7 +43101,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
-        for (int i = 0; ok && i < count; i++) {
+        bool rows_done = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Consecutive rows of one session share the ring and caches. */
+        if (ok && row_attention && batch_output) {
+            ok = ds41_attention_rows(g, graphs, queries, heads, model, l, il, rows);
+            rows_done = true;
+        }
+#endif
+        for (int i = 0; ok && !rows_done && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
