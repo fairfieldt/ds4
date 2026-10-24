@@ -2751,18 +2751,28 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
+#ifndef DS4_ROCM_BUILD
+/* CUDA (Spark or one discrete GPU) and Metal: the spans as one batched launch
+ * or blit pass, ordered like the tensor copies around it.  Returns 1 when
+ * queued; 0 when declined without copying anything (another device, more
+ * than DS4_GPU_COPY_SPANS_MAX spans, a span outside its tensors or over
+ * 4 GiB, spans on different devices, or any destination overlapping another
+ * span): the caller then copies them one by one; -1 on a launch error. */
+int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n);
+#endif
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
-/* Spark: the spans as batched launches on the decode stream, ordered like
- * the asynchronous tensor copies.  Returns 1 when queued; 0 when declined
- * without copying anything (another device, more than
- * DS4_GPU_COPY_SPANS_MAX spans, a span outside its tensors or over 4 GiB,
- * spans on different devices, or any destination overlapping another span):
- * the caller then copies them one by one; -1 on a launch error. */
-int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n);
+/* CUDA: attention for ROWS rows with equal n_raw and n_comp in one launch,
+ * row r at raw_start + r and comp_kv + r * comp_stride floats. 0 = not taken. */
+int ds4_gpu_attention_decode_heads_rows_tensor(ds4_gpu_tensor *heads,
+        const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, const ds4_gpu_tensor *comp_kv,
+        uint64_t comp_stride, uint32_t n_comp, uint32_t rows, uint32_t n_head,
+        uint32_t head_dim);
 #endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(

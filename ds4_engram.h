@@ -65,9 +65,14 @@ bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
  * free, even if wait(reader, 0) reports an error. No table data is cached.
  * One caller owns the reader. Creation failure permits synchronous fallback. */
 typedef struct ds4_engram_reader ds4_engram_reader;
+enum { DS4_ENGRAM_READER_MAX_ROWS = 8 };
 ds4_engram_reader *ds4_engram_reader_create(void);
 bool ds4_engram_reader_start(ds4_engram_reader *reader,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out);
+/* The same for up to DS4_ENGRAM_READER_MAX_ROWS rows: ids[row] into out[row],
+ * each laid out as the one-token output. */
+bool ds4_engram_reader_start_rows(ds4_engram_reader *reader, const ds4_engram_table tables[2],
+    const uint32_t ids[][2][DS4_ENGRAM_COLS], unsigned n_rows, float *const *out);
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
 

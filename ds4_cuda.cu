@@ -3455,8 +3455,12 @@ static bool cuda_copy_spans_disjoint(const ds4_gpu_copy_span *spans, uint32_t n)
     return true;
 }
 
+extern "C" bool ds4_gpu_discrete_memory(void);
 extern "C" int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n) {
-    if (!spans || n == 0 || n > DS4_GPU_COPY_SPANS_MAX || !ds4_gpu_device_is_spark()) return 0;
+    /* One device only: Spark, or a single discrete GPU, where the small
+     * frontier copies would otherwise be one memcpy call each. */
+    if (!spans || n == 0 || n > DS4_GPU_COPY_SPANS_MAX ||
+        !(ds4_gpu_device_is_spark() || (g_n_gpus == 1 && ds4_gpu_discrete_memory()))) return 0;
     int d = -1;
     for (uint32_t i = 0; i < n; i++) {
         const ds4_gpu_copy_span *sp = &spans[i];
@@ -7305,6 +7309,18 @@ __global__ static void grouped_q8_0_a_preq_rows_kernel(
     }
 }
 
+/* The short-row kernels read each weight block once for all rows and keep
+ * every row's result bitwise equal to the one-row kernel's. They were tuned
+ * on Spark; on a discrete GPU they save the same weight traffic per verify. */
+static bool cuda_q8_short_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_CUDA_NO_Q8_SHORT_ROWS") == NULL &&
+            (ds4_gpu_device_is_spark() || (g_n_gpus == 1 && ds4_gpu_discrete_memory()));
+    }
+    return enabled != 0;
+}
+
 static void cuda_grouped_q8_short_launch(
         float *low, const unsigned char *w, const int8_t *xq,
         const float *scale, uint64_t rank, uint32_t groups,
@@ -8873,7 +8889,16 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint64_t q_stride,
+        uint64_t score_stride,
+        uint64_t comp_stride,
+        uint32_t raw_step) {
+    /* blockIdx.z selects one of several independent rows (strides 0 for one). */
+    q += blockIdx.z * q_stride;
+    score_out += blockIdx.z * score_stride;
+    if (comp_kv) comp_kv += blockIdx.z * comp_stride;
+    raw_start += blockIdx.z * raw_step;
     const bool single_all = (ratio == 0u);
     const uint32_t qpos = pos0;
     const uint32_t first_raw_pos = pos0 + 1u - n_raw;
@@ -9353,7 +9378,15 @@ __global__ static void attention_decode_score_split_finalize_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint64_t out_stride,
+        uint64_t score_stride,
+        uint64_t comp_stride,
+        uint32_t raw_step) {
+    heads += blockIdx.z * out_stride;
+    score_in += blockIdx.z * score_stride;
+    if (comp_kv) comp_kv += blockIdx.z * comp_stride;
+    raw_start += blockIdx.z * raw_step;
     const uint32_t h = blockIdx.y;
     if (h >= n_head) return;
     const bool single_all = (ratio == 0u);
@@ -9946,9 +9979,12 @@ static int attention_decode_score_split_graph_launch(
     score_params.kernelParams = score_args;
     score_params.extra = NULL;
 
+    uint64_t final_out_stride = 0, final_score_stride = 0, final_comp_stride = 0;
+    uint32_t final_raw_step = 0;
     void *final_args[] = {
         &heads, &sinks, &scores, &raw_kv, &comp_kv, &pos0, &n_raw,
-        &raw_cap, &raw_start, &n_comp, &window, &ratio, &n_head, &head_dim
+        &raw_cap, &raw_start, &n_comp, &window, &ratio, &n_head, &head_dim,
+        &final_out_stride, &final_score_stride, &final_comp_stride, &final_raw_step
     };
     cudaKernelNodeParams final_params;
     memset(&final_params, 0, sizeof(final_params));
@@ -10074,7 +10110,12 @@ static int attention_decode_score_split_launch(
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t final_threads,
-        const cuda_attention_inv_rope_params *inv_rope) {
+        const cuda_attention_inv_rope_params *inv_rope,
+        uint32_t rows = 1,
+        uint64_t q_stride = 0,
+        uint64_t out_stride = 0,
+        uint64_t comp_stride = 0,
+        uint32_t raw_step = 0) {
     if (cuda_env_flag_enabled("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE", 0)) return 0;
     const int explicit_exact =
         cuda_env_flag_enabled("DS4_CUDA_EXACT_SCORE_SPLIT_DECODE", 0);
@@ -10144,8 +10185,17 @@ static int attention_decode_score_split_launch(
         (inv_rope->n_rot & 1u) == 0u;
 
     const uint64_t score_count = (uint64_t)n_head * n_score;
+    /* Several rows take only the default tile + finalize kernels, one grid
+     * slice each; any other variant declines so the caller runs row by row. */
+    if (rows > 1 &&
+        (g_cuda_exact_score_split_graph || graph_inv_rope ||
+         g_cuda_exact_score_split_ldg || g_cuda_exact_score_split_vec4_plain ||
+         g_cuda_exact_score_split_vec4 || g_decode_score_vec4 ||
+         (g_cuda_exact_score_split_dim2 && head_dim == 512u && final_threads >= 512u) ||
+         head_dim != 512u || getenv("DS4_CUDA_NO_SCORE_TILE") != NULL))
+        return 0;
     float *scores = (float *)cuda_tmp_alloc_on(logical_tier,
-                                               score_count * sizeof(float),
+                                               score_count * rows * sizeof(float),
                                                "attention exact score split");
     if (!scores) return 0;
     const bool use_ldg_scores = g_cuda_exact_score_split_ldg;
@@ -10211,13 +10261,14 @@ static int attention_decode_score_split_launch(
         }
         dim3 tile_grid((n_score + DS4_SCORE_TILE_ROWS - 1u) / DS4_SCORE_TILE_ROWS,
                        (n_head + DS4_SCORE_TILE_HEADS - 1u) / DS4_SCORE_TILE_HEADS,
-                       1);
+                       rows);
         attention_decode_score_split_scores_tile512_kernel<<<tile_grid, 256, tile_shmem>>>(
                 scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim);
+                n_head, head_dim, q_stride, score_count, comp_stride, raw_step);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split tile launch")) return -1;
     } else {
+    if (rows > 1) return 0;
     dim3 score_grid(1, n_head, S);
     if (use_ldg_scores) {
         attention_decode_score_split_scores_ldg_kernel<<<score_grid, 256>>>(
@@ -10250,11 +10301,11 @@ static int attention_decode_score_split_launch(
                 n_head, head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split dim2 finalize launch")) return -1;
     } else {
-        dim3 final_grid(1, n_head, 1);
+        dim3 final_grid(1, n_head, rows);
         attention_decode_score_split_finalize_kernel<<<final_grid, final_threads>>>(
                 heads, sinks, scores, raw_kv, comp_kv,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim);
+                n_head, head_dim, out_stride, score_count, comp_stride, raw_step);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split finalize launch")) return -1;
     }
     return 1;
@@ -17443,6 +17494,17 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
         in_dim, out_dim, n_rows, blocks, blocks, out_dim, 32u);
     if (mma_rc) return mma_rc > 0;
+    /* The prequant above ran on the legacy stream; the short launcher uses
+     * the decode stream, so only take it when they are the same. */
+    if (cuda_q8_short_rows_enabled() && cuda_q8_use_dp4a() &&
+        cuda_decode_stream() == (cudaStream_t)0 &&
+        n_rows >= 2u && n_rows <= 6u && in_dim % 32u == 0u &&
+        ((uintptr_t)xq & 15u) == 0u) {
+        cuda_grouped_q8_short_launch((float *)out->ptr,
+                                    reinterpret_cast<const unsigned char *>(wptr),
+                                    xq, xscale, out_dim, 1u, n_rows, blocks);
+        return cuda_ok(cudaGetLastError(), "q8_0 decode rows exact short rows");
+    }
     dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_preq_warp8_kernel<<<grid, 256>>>(
             (float *)out->ptr,
@@ -19220,6 +19282,59 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
+/* ds4_gpu_attention_decode_heads_tensor for ROWS rows with the same n_raw and
+ * n_comp: row r reads q and writes heads at r * n_head * head_dim, attends raw
+ * rows starting at raw_start + r, and compressed rows at comp_kv + r * comp_stride
+ * floats. Each row's arithmetic is the one-row call's. Returns 0 without
+ * launching anything when the one-row call would take another kernel, so the
+ * caller can run the rows one by one. */
+extern "C" int ds4_gpu_attention_decode_heads_rows_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint64_t                comp_stride,
+        uint32_t                n_comp,
+        uint32_t                rows,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    const uint64_t row_floats = (uint64_t)n_head * head_dim;
+    if (!heads || !q || !raw_kv || !model_map || rows < 2u || n_raw == 0 ||
+        raw_cap < n_raw || raw_start + rows - 1u >= raw_cap ||
+        (n_comp != 0 && !comp_kv) || head_dim != 512u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < rows * row_floats * sizeof(float) ||
+        q->bytes < rows * row_floats * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        (n_comp && comp_kv->bytes < ((rows - 1u) * comp_stride + n_comp * head_dim) * sizeof(float)))
+        return 0;
+    if (!cuda_attention_score_buffer_fits(n_comp) ||
+        (g_cuda_decode_heads8_online && !g_cuda_no_window_attention) ||
+        g_cuda_decode_score4 || g_cuda_decode_score8)
+        return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
+    if (!sinks) return 0;
+    const uint32_t threads = !g_cuda_no_decode_value512 ? 512u : 256u;
+    const int rc = attention_decode_score_split_launch(
+            logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            NULL, 0, 0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
+            n_head, head_dim, threads, NULL,
+            rows, row_floats, row_floats, n_comp ? comp_stride : 0, 1u);
+    if (rc != 1) return 0;
+    return cuda_ok(cudaGetLastError(), "attention decode rows launch");
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -20740,7 +20855,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             group_cnt);
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
-    if (ds4_gpu_device_is_spark() && use_dp4a &&
+    if (cuda_q8_short_rows_enabled() && use_dp4a &&
         n_rows >= 2u && n_rows <= 6u && group_dim % 32u == 0u &&
         ((uintptr_t)xq & 15u) == 0u) {
         cuda_grouped_q8_short_launch((float *)low->ptr, out_a, xq, xscale,
