@@ -2763,6 +2763,14 @@ int ds4_gpu_device_is_spark(void);
  * spans on different devices, or any destination overlapping another span):
  * the caller then copies them one by one; -1 on a launch error. */
 int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n);
+/* CUDA: attention for ROWS rows with equal n_raw and n_comp in one launch,
+ * row r at raw_start + r and comp_kv + r * comp_stride floats. 0 = not taken. */
+int ds4_gpu_attention_decode_heads_rows_tensor(ds4_gpu_tensor *heads,
+        const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, const ds4_gpu_tensor *comp_kv,
+        uint64_t comp_stride, uint32_t n_comp, uint32_t rows, uint32_t n_head,
+        uint32_t head_dim);
 #endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
