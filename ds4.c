@@ -42010,7 +42010,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
 }
 
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
 /* Attention for a short block of consecutive rows of one session (a DSpark
  * verify block or a short prefill). RoPE, KV quantization, the indexer and the
  * final head transforms run once for the block; the compressor still advances
@@ -42040,6 +42040,13 @@ static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs
     if (!ds4_gpu_tensor_copy(g->raw_prefill, previous * row_bytes, b->kv, 0, count * row_bytes))
         return false;
     const bool index_here = ratio && ds41_index_source(il);
+#ifdef __APPLE__
+    /* Metal decode scores the indexer with its one-row kernel; keep that per
+     * row (causal by each row's n_comp) so verify rows match decode. */
+    const bool index_batch = false;
+#else
+    const bool index_batch = index_here;
+#endif
     for (uint32_t t = 0; t < count; t++) {
         ds41_gpu_graph row = *graphs[t];
         row.pos = start + t;
@@ -42050,7 +42057,17 @@ static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs
         /* Below the batched indexer's threshold each row picks as decode does. */
         if (!index_here && !ds41_attention_pick(&row, il)) return false;
     }
-    if (index_here && !ds41_index_batch(g, m, l, il, count)) return false;
+    for (uint32_t t = 0; index_here && !index_batch && t < count; t++) {
+        ds41_gpu_graph row = *graphs[t];
+        row.pos = start + t;
+#define DS41_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
+        DS41_PREFILL_ROWS(DS41_ATTN_ROW)
+#undef DS41_ATTN_ROW
+        if (!ds41_attention_select_published(&row, m, l, il)) return false;
+    }
+    if (index_batch && !ds41_index_batch(g, m, l, il, count)) return false;
+    bool rows_done = false;
+#ifndef __APPLE__
     /* Past the first window every row attends the same number of raw and
      * compressed rows; then one launch covers the block, one grid slice per row. */
     const uint32_t raw_first = start + 1u < 128u ? start + 1u : 128u;
@@ -42060,7 +42077,6 @@ static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs
     const uint32_t att_first = comp_first < DS4_N_INDEXER_TOP_K ? comp_first : DS4_N_INDEXER_TOP_K;
     const uint32_t att_last = comp_last < DS4_N_INDEXER_TOP_K ? comp_last : DS4_N_INDEXER_TOP_K;
     const uint64_t comp_slot = (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM;
-    bool rows_done = false;
     if (raw_first == raw_last && att_first == att_last &&
         !getenv("DS4_DISABLE_V41_ROW_ATTENTION_KERNEL")) {
         bool ok = true;
@@ -42078,6 +42094,7 @@ static bool ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs
             g->prefill_cap + 128u, previous + 1u - raw_first, g->selected_kv,
             comp_slot, att_first, count, nh, DS4_N_HEAD_DIM) == 1;
     }
+#endif
     for (uint32_t t = 0; !rows_done && t < count; t++) {
         const uint32_t pos = start + t;
         const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -43127,7 +43144,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
         bool rows_done = false;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
         /* Consecutive rows of one session share the ring and caches. */
         if (ok && row_attention && batch_output) {
             ok = ds41_attention_rows(g, graphs, queries, heads, model, l, il, rows);
