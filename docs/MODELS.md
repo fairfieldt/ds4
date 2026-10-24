@@ -46,7 +46,8 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 ## DeepSeek V4.1 Flash
 
 V4.1 Flash text and vision inference work on Metal. CUDA supports text with
-Q2 SSD streaming on one Spark or resident shards across two Sparks. ROCm
+Q2 SSD streaming on one Spark or one discrete GPU, the 1017 MXFP4 experts with
+SSD streaming on one discrete GPU, or resident shards across two Sparks. ROCm
 supports single-host text inference with SSD streaming. It needs its own
 GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
 are not interchangeable with it.
@@ -73,6 +74,9 @@ On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
 
 Use `ds4-agent` or `ds4-server` with the same model and memory options.
 On a DGX Spark, add `--cuda`; see the [Spark guide](DGX_SPARK.md#deepseek-v41-flash).
+On a discrete NVIDIA GPU, also add `--cuda`. If the host has RAM to spare for
+the routed experts (142 GiB for Q2), set `DS4_CUDA_SSD_HOST_GB=auto` to keep
+them in memory; see [discrete CUDA GPUs](SSD_STREAMING.md#discrete-cuda-gpus).
 `--think-level 25` sets reasoning effort explicitly; the range is 1 to 100,
 with 0 disabling thinking. `/think 25` changes it in the CLI or native agent.
 `--think` selects 75 and `--think-max` selects 100.
