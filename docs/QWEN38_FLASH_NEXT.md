@@ -21,6 +21,7 @@ BF16 n-grams, and updates `ds4flash.gguf`:
 | --- | ---: | ---: |
 | `qwen38-q2` | 137.10 GiB | 41.73 GiB |
 | `qwen38-q4k` | 165.11 GiB | 69.74 GiB |
+| `qwen38-q4-q4_0down` | 166.30 GiB | 70.92 GiB |
 
 The 95.37 GiB n-gram table stays on disk. The runtime reads selected rows
 directly from the GGUF, without mapping or preloading the table. Keep the
@@ -37,7 +38,10 @@ as much.
 
 The Q2 model uses IQ2_XXS gate/up experts and Q2_K down projections padded
 from 640 to 768 columns, calibrated with an imatrix. Q4 uses calibrated
-Q4_K gate/up and MXFP4 down experts. Context and runtime buffers still need
+Q4_K gate/up and MXFP4 down experts. `qwen38-q4-q4_0down` is the same Q4 with
+Q4_0 down experts quantized straight from BF16: NLL 0.2863 instead of 0.2904
+on the short fixtures and 0.1228 instead of 0.1256 on the long ones, at the
+same CUDA speed. Context and runtime buffers still need
 RAM beyond the resident weights; start Q2 with the context and chunk above
 on a 64 GB machine. Q4 needs a larger machine.
 

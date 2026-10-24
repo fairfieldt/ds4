@@ -7,6 +7,7 @@ GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
 QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
+QWEN38_Q4_0DOWN_REPO="fairfieldt/Qwen3.8-Flash-Next-Q4-Q4_0down-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
@@ -38,6 +39,7 @@ GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
+QWEN38_Q4_0DOWN_FILE="Qwen3.8-Flash-Next-Q4-Q4_0down.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -81,6 +83,7 @@ Usage:
   ./download_model.sh glm53-vision [--token TOKEN]
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
+  ./download_model.sh qwen38-q4-q4_0down [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
 
 Targets:
@@ -211,6 +214,11 @@ Targets:
        occupy 69.74 GiB; original BF16 n-grams stay on disk.
        Imatrix Q4_K gate/up and MXFP4 down routed experts. Fits 128 GB
        Macs with room for context buffers. Add --mtp for speculation.
+
+  qwen38-q4-q4_0down
+       qwen38-q4k with Q4_0 down routed experts quantized from BF16: one
+       166.30 GiB GGUF, 70.92 GiB main/MTP weights. More accurate than
+       qwen38-q4k at the same speed. Add --mtp for speculation.
 
   qwen38-vision
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
@@ -371,6 +379,11 @@ case "$MODEL" in
         MODEL_FILE=$QWEN38_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
+    qwen38-q4-q4_0down)
+        REPO=$QWEN38_Q4_0DOWN_REPO
+        MODEL_FILE=$QWEN38_Q4_0DOWN_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
     qwen38-vision)
         REPO=$QWEN38_MMPROJ_REPO
         MODEL_FILE=$QWEN38_VISION_FILE
@@ -456,6 +469,10 @@ artifact_identity() {
         "$QWEN38_Q4_FILE")
             expected_bytes=177280286720
             expected_sha=680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a
+            ;;
+        "$QWEN38_Q4_0DOWN_FILE")
+            expected_bytes=178564792320
+            expected_sha=951121e2cd69862a4b59f532b3b026ff2e7011e56ba94fba5e7a1efa47de9a90
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
@@ -705,7 +722,7 @@ if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
     echo "Run with an 8K starting context:"
     echo "  ./ds4 --ctx 8192 --prefill-chunk 1024"
     echo "Add --mtp to enable speculation."
-elif [ "$MODEL" = qwen38-q4k ]; then
+elif [ "$MODEL" = qwen38-q4k ] || [ "$MODEL" = qwen38-q4-q4_0down ]; then
     echo "Run ./ds4. Add --mtp to enable speculation."
 fi
 if [ "$MODEL" = qwen38-vision ]; then

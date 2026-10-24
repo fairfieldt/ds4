@@ -186,7 +186,8 @@ from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K cont
 
 The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
 Add `--mtp` for speculative decoding. The larger
-`qwen38-q4k` target is also available. Download the optional vision encoder
+`qwen38-q4k` target and its more accurate Q4_0-down variant
+`qwen38-q4-q4_0down` are also available. Download the optional vision encoder
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
 

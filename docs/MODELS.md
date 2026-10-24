@@ -148,7 +148,8 @@ For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; runtime
 allocations add to the main weights, but the n-gram table is not mapped or
 preloaded. Keep the GGUF on a fast local SSD.
 The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
-resident weights, before runtime buffers.
+resident weights, before runtime buffers. `qwen38-q4-q4_0down` is the same Q4
+with more accurate Q4_0 down experts: 166.30 GiB on disk, 70.92 GiB resident.
 This model runs on Metal and single-GPU CUDA, including DGX Spark.
 The script links `ds4flash.gguf` to the combined GGUF:
 
