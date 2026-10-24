@@ -75,7 +75,7 @@ MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
@@ -467,6 +467,24 @@ tests/test_cuda_ssd_repack: tests/test_cuda_ssd_repack.o ds4_cuda.o ds4_image.o 
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 tests/test_cuda_ssd_cache: tests/test_cuda_ssd_cache.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_cuda_v41_projection_rows.o: tests/test_cuda_v41_projection_rows.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_v41_projection_rows: tests/test_cuda_v41_projection_rows.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_cuda_v41_index_scores.o: tests/test_cuda_v41_index_scores.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_v41_index_scores: tests/test_cuda_v41_index_scores.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_cuda_q8_mma_groups.o: tests/test_cuda_q8_mma_groups.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_q8_mma_groups: tests/test_cuda_q8_mma_groups.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 .PHONY: test-cuda-ssd-cache
@@ -1405,6 +1423,9 @@ clean:
 	rm -f tests/test_cuda_shared_side
 	rm -f tests/test_cuda_grouped_q8
 	rm -f tests/test_cuda_v41_fusion
+	rm -f tests/test_cuda_v41_projection_rows
+	rm -f tests/test_cuda_v41_index_scores
+	rm -f tests/test_cuda_q8_mma_groups
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
