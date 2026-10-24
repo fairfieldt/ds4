@@ -19687,6 +19687,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.nb13 = args.nb12;
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
+        /* Up to 8 rows read each weight block once for all of them, with the
+         * one-row kernel's arithmetic per row (bitwise equal). */
+        static int rows_disabled = -1;
+        if (rows_disabled < 0) rows_disabled = getenv("DS4_METAL_NO_Q8_ROWS") != NULL;
+        const bool rows_kernel = !rows_disabled && n_rows >= 2u && n_rows <= 8u;
+        if (rows_kernel) dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows8";
 
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
@@ -19706,7 +19712,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            rows_kernel ? 1u : (NSUInteger)n_rows,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
