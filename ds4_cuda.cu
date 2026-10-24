@@ -3455,8 +3455,12 @@ static bool cuda_copy_spans_disjoint(const ds4_gpu_copy_span *spans, uint32_t n)
     return true;
 }
 
+extern "C" bool ds4_gpu_discrete_memory(void);
 extern "C" int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n) {
-    if (!spans || n == 0 || n > DS4_GPU_COPY_SPANS_MAX || !ds4_gpu_device_is_spark()) return 0;
+    /* One device only: Spark, or a single discrete GPU, where the small
+     * frontier copies would otherwise be one memcpy call each. */
+    if (!spans || n == 0 || n > DS4_GPU_COPY_SPANS_MAX ||
+        !(ds4_gpu_device_is_spark() || (g_n_gpus == 1 && ds4_gpu_discrete_memory()))) return 0;
     int d = -1;
     for (uint32_t i = 0; i < n; i++) {
         const ds4_gpu_copy_span *sp = &spans[i];
@@ -7308,7 +7312,6 @@ __global__ static void grouped_q8_0_a_preq_rows_kernel(
 /* The short-row kernels read each weight block once for all rows and keep
  * every row's result bitwise equal to the one-row kernel's. They were tuned
  * on Spark; on a discrete GPU they save the same weight traffic per verify. */
-extern "C" bool ds4_gpu_discrete_memory(void);
 static bool cuda_q8_short_rows_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
